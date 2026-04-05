@@ -77,27 +77,43 @@ MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
 PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
 OPENROUTER_API_KEY = ""
 
-# ─── قراءة مفاتيح Gemini من Railway Environment Variables ───
+# ─── مفاتيح Gemini: config أولاً (يدمج secrets.toml + env)؛ إن فارغ استخدم env فقط ───
 import os as _os
-def _load_gemini_keys():
+
+
+def _load_gemini_keys_from_env():
     keys = []
-    # طريقة 1: GEMINI_API_KEYS مفصولة بفاصلة
     v = _os.environ.get("GEMINI_API_KEYS", "")
     if v:
-        keys += [k.strip() for k in v.split(",") if k.strip()]
-    # طريقة 2: مفاتيح منفردة GEMINI_KEY_1, GEMINI_KEY_2 ...
+        v = v.strip()
+        if v.startswith("["):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    keys = [str(k).strip() for k in parsed if k]
+            except Exception:
+                keys += [k.strip() for k in v.split(",") if k.strip()]
+        else:
+            keys += [k.strip() for k in v.split(",") if k.strip()]
     for i in range(1, 10):
         k = _os.environ.get(f"GEMINI_KEY_{i}", "")
         if k.strip():
             keys.append(k.strip())
-    # طريقة 3: أسماء بديلة
     for env_name in ["GEMINI_API_KEY", "GEMINI_KEY"]:
         k = _os.environ.get(env_name, "")
         if k.strip():
             keys.append(k.strip())
-    return list(dict.fromkeys(keys))  # إزالة التكرار مع الحفاظ على الترتيب
+    out = list(dict.fromkeys(keys))
+    return [k for k in out if k and len(k) > 20]
 
-GEMINI_API_KEYS = _load_gemini_keys()
+
+try:
+    GEMINI_API_KEYS
+except NameError:
+    GEMINI_API_KEYS = []
+
+if not GEMINI_API_KEYS:
+    GEMINI_API_KEYS = _load_gemini_keys_from_env()
 
 # ─── مرادفات ذكية للعطور ────────────────────
 _SYN = {
@@ -600,44 +616,89 @@ def _detect_double_header(df):
 
 
 def _smart_rename_columns(df):
-    """تخمين ذكي لأسماء الأعمدة إذا كانت غير معروفة (Unnamed أو أسماء CSS)"""
+    """تخمين ذكي لأسماء الأعمدة بناءً على محتوى البيانات لمواجهة ملفات الكشط الخام (عناوين CSS)."""
+    if df is None or df.empty:
+        return df
     cols = list(df.columns)
-    # حالة 1: أعمدة Unnamed (ملف بدون عناوين)
-    unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed'))
-    # حالة 2: أعمدة CSS (مثل styles_productCard__name)
-    css_count = sum(1 for c in cols if 'style' in str(c).lower() or '__' in str(c))
-    
-    if unnamed_count >= len(cols) - 1 or css_count >= 1:
-        new_cols = {}
-        for col in cols:
-            sample = df[col].dropna().head(25)
-            if sample.empty:
-                continue
-            vs = [str(v) for v in sample]
-            url_n = sum(1 for v in vs if "http://" in v.lower() or "https://" in v.lower())
-            img_n = sum(1 for v in vs if _IMG_URL_RE.search(v.lower()))
-            if img_n >= len(vs) * 0.35:
+
+    is_dirty = any(
+        "__" in str(c)
+        or "style" in str(c).lower()
+        or "text-" in str(c).lower()
+        or "href" in str(c).lower()
+        or "src" in str(c).lower()
+        or str(c).lower().startswith("unnamed")
+        for c in cols
+    )
+
+    def _clean_arabic_headers():
+        blob = " ".join(str(c) for c in cols).lower()
+        return ("اسم" in blob or "منتج" in blob) and ("سعر" in blob or "price" in blob)
+
+    # أربعة أعمدة بعناوين عربية/منطقية — لا تعيد التسمية
+    if len(cols) == 4 and not is_dirty and _clean_arabic_headers():
+        return df
+
+    if not is_dirty and len(cols) != 4:
+        return df
+
+    new_cols = {}
+    used = set()
+
+    for col in cols:
+        sample = df[col].dropna().astype(str).head(30)
+        if sample.empty:
+            continue
+        vs = [v.strip() for v in sample.tolist()]
+        n = len(vs)
+
+        url_count = sum(1 for v in vs if v.startswith("http"))
+        if url_count >= n * 0.5:
+            img_count = sum(
+                1
+                for v in vs
+                if ("cdn.salla" in v or "cdn." in v.lower())
+                or ".jpg" in v.lower()
+                or ".png" in v.lower()
+                or ".webp" in v.lower()
+                or ".jpeg" in v.lower()
+                or _IMG_URL_RE.search(v.lower())
+            )
+            if img_count >= max(1, n * 0.4) and "صورة المنتج" not in used:
                 new_cols[col] = "صورة المنتج"
-                continue
-            if url_n >= len(vs) * 0.55 and img_n < len(vs) * 0.4:
+                used.add("صورة المنتج")
+            elif "رابط المنتج" not in used:
                 new_cols[col] = "رابط المنتج"
-                continue
-            numeric_count = 0
-            for v in sample:
-                try:
-                    float(str(v).replace(',', ''))
+                used.add("رابط المنتج")
+            continue
+
+        numeric_count = 0
+        for v in vs:
+            try:
+                x = float(
+                    v.replace(",", "")
+                    .replace("ر.س", "")
+                    .replace("﷼", "")
+                    .replace("SAR", "")
+                    .strip()
+                )
+                if 0 <= x <= 10_000_000:
                     numeric_count += 1
-                except Exception:
-                    pass
-            if numeric_count >= len(sample) * 0.7:
-                new_cols[col] = "سعر المنتج"
-            else:
-                if "اسم المنتج" not in new_cols.values() and "المنتج" not in new_cols.values():
-                    new_cols[col] = "اسم المنتج"
-                else:
-                    new_cols[col] = col
-        if new_cols:
-            df = df.rename(columns=new_cols)
+            except (ValueError, TypeError):
+                pass
+        if numeric_count >= n * 0.6 and "سعر المنتج" not in used:
+            new_cols[col] = "سعر المنتج"
+            used.add("سعر المنتج")
+            continue
+
+        if "اسم المنتج" not in used:
+            new_cols[col] = "اسم المنتج"
+            used.add("اسم المنتج")
+        else:
+            new_cols[col] = col
+
+    if new_cols:
+        df = df.rename(columns=new_cols)
     return df
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
