@@ -3006,6 +3006,40 @@ elif page == "🕷️ كشط المنافسين":
     _is_running = bool(_prog_now.get("running", False))
 
     # ══════════════════════════════════════════════════════════════════════
+    # ملخص سريع: قائمة المنافسين المُعرَّفة (تظهر دائماً فوق التبويبات)
+    # ══════════════════════════════════════════════════════════════════════
+    _quick_stores = _load_stores()
+    if _quick_stores:
+        _qs_html_items = "".join(
+            f'<span style="display:inline-flex;align-items:center;gap:4px;'
+            f'background:#1a1a3a;border:1px solid #2d2d5a;border-radius:20px;'
+            f'padding:3px 10px;font-size:.78rem;color:#aaa;white-space:nowrap">'
+            f'<span style="color:#6C63FF;font-weight:700">{_qi+1}</span> '
+            f'{_qu.replace("https://","").replace("http://","").rstrip("/").split("/")[0]}'
+            f'</span>'
+            for _qi, _qu in enumerate(_quick_stores)
+        )
+        _running_badge = (
+            '<span style="background:#0a3a1a;border:1px solid #00C853;border-radius:12px;'
+            'padding:2px 10px;font-size:.75rem;color:#00C853">⚡ يعمل الآن</span>'
+            if _is_running else
+            '<span style="background:#1a1a2a;border:1px solid #444;border-radius:12px;'
+            'padding:2px 10px;font-size:.75rem;color:#888">● متوقف</span>'
+        )
+        st.markdown(
+            f'<div style="background:#0d0d1f;border:1px solid #2a2a4a;border-radius:10px;'
+            f'padding:10px 14px;margin-bottom:10px">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+            f'<b style="color:#6C63FF">🏪 المنافسون ({len(_quick_stores)} متجر)</b>'
+            f'{_running_badge}</div>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:5px">{_qs_html_items}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("لا توجد متاجر منافسين بعد — أضفها من تبويب «🌐 المتاجر» أدناه")
+
+    # ══════════════════════════════════════════════════════════════════════
     # تقسيم الصفحة إلى تبويبات منظمة
     # ══════════════════════════════════════════════════════════════════════
     _tab_stores, _tab_run, _tab_monitor, _tab_log, _tab_sched = st.tabs([
@@ -3083,7 +3117,8 @@ elif page == "🕷️ كشط المنافسين":
                     disabled=bool(st.session_state.get("sc_all_products", True)),
                 )
             with _sc_col3:
-                st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="sc_concurrency")
+                st.number_input("طلبات متزامنة", 1, 30, 3, step=1, key="sc_concurrency",
+                                help="3 هو الأنسب لمعظم المتاجر المحمية")
 
             _limit    = int(st.session_state.get("sc_max_prod", 0) or 0)
             _all_flag = bool(st.session_state.get("sc_all_products", True))
@@ -3127,8 +3162,11 @@ elif page == "🕷️ كشط المنافسين":
             except ImportError:
                 st.caption("نصيحة: ثبّت `streamlit-autorefresh` للتحديث التلقائي")
 
-        if not _os_scraper.path.exists(_PROGRESS_FILE):
-            st.info("لم تبدأ أي عملية كشط بعد.")
+        _sl_mon = _load_stores()
+        if not _sl_mon:
+            st.warning("لا توجد متاجر — أضف متاجر من تبويب «🌐 المتاجر» أولاً")
+        elif not _os_scraper.path.exists(_PROGRESS_FILE):
+            st.info(f"لم تبدأ أي عملية كشط بعد. ({len(_sl_mon)} متجر جاهز في القائمة)")
         else:
             _prog      = _load_progress()
             _running   = bool(_prog.get("running", False))
@@ -3138,7 +3176,8 @@ elif page == "🕷️ كشط المنافسين":
             _current   = str(_prog.get("current_store", ""))
             _last_err  = str(_prog.get("last_error", ""))
             _s_done    = int(_prog.get("stores_done", 0))
-            _s_tot     = max(int(_prog.get("stores_total", 1)), 1)
+            # استخدم عدد المتاجر الفعلي من الملف (لا من progress القديم)
+            _s_tot     = max(int(_prog.get("stores_total", 0)), len(_load_stores()), 1)
             _u_done    = int(_prog.get("store_urls_done", 0))
             _u_tot     = max(int(_prog.get("store_urls_total", 1)), 1)
             _s_res     = dict(_prog.get("stores_results") or {})
