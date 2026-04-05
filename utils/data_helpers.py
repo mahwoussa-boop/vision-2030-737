@@ -132,10 +132,18 @@ def row_media_urls_from_analysis(row) -> tuple:
     comp_name = str(d.get("منتج_المنافس", "—"))
     for c in all_c:
         if str(c.get("name", "")).strip() == str(comp_name).strip():
-            comp_img = first_image_url_string(str(c.get("image_url") or c.get("thumb") or "").strip())
+            # لا نكتب فوق الصورة الصحيحة الموجودة بقيمة فارغة
+            candidate_img = first_image_url_string(
+                str(c.get("image_url") or c.get("thumb") or c.get("صورة_المنافس") or "").strip()
+            )
+            if candidate_img:
+                comp_img = candidate_img
             break
+    # fallback: أول منافس في القائمة إن لم تُوجد صورة بعد
     if not comp_img and all_c:
-        comp_img = first_image_url_string(str(all_c[0].get("image_url") or all_c[0].get("thumb") or "").strip())
+        comp_img = first_image_url_string(
+            str(all_c[0].get("image_url") or all_c[0].get("thumb") or "").strip()
+        )
     return (our_img, comp_img)
 
 

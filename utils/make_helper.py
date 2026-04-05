@@ -206,6 +206,11 @@ def send_single_product(product: Dict) -> Dict:
         return {"success": False, "message": "❌ اسم المنتج مطلوب"}
     if price <= 0:
         return {"success": False, "message": f"❌ السعر غير صحيح: {price}"}
+    if not product_id:
+        return {
+            "success": False,
+            "message": f"❌ رقم المنتج (ID) مطلوب لتحديث سلة — «{name}» لا يملك رقماً. أضف عمود رقم المنتج في ملف كتالوجك.",
+        }
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
     _prod = {
@@ -285,7 +290,7 @@ def send_price_updates(products: List[Dict]) -> Dict:
         price      = _safe_float(p.get("price", 0))
         product_id = _clean_pid(p.get("product_id", ""))
 
-        if not name or price <= 0:
+        if not name or price <= 0 or not product_id:
             skipped += 1
             continue
 
