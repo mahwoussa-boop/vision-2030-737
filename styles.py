@@ -127,9 +127,9 @@ def get_styles():
 
 def get_main_css():
     return """<style>
-@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;900&display=swap');
-*{font-family:'Tajawal',sans-serif!important}
-.main .block-container{max-width:1400px;padding:1rem 2rem}
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&family=Tajawal:wght@400;700;900&display=swap');
+*{font-family:'Cairo','Tajawal',sans-serif!important}
+.main .block-container{max-width:1400px;padding:.75rem 1.5rem}
 .stat-card{background:#1A1A2E;border-radius:12px;padding:16px;text-align:center;border:1px solid #333344}
 .stat-card:hover{box-shadow:0 4px 16px rgba(108,99,255,.15);border-color:#6C63FF}
 .stat-card .num{font-size:2.2rem;font-weight:900;margin:4px 0}
@@ -147,8 +147,13 @@ def get_main_css():
 .b-low{background:rgba(0,200,83,.15);color:#00C853;border:1px solid #00C853}
 .conf-bar{width:100%;height:6px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden}
 .conf-fill{height:100%;border-radius:3px}
+/* ── منطقة الفلاتر المكشوفة ── */
+.filter-inline-wrap{background:#12121f;border:1px solid #2a2a3d;border-radius:10px;padding:10px 12px;margin:6px 0 10px}
+.filter-inline-title{font-size:.78rem;font-weight:700;color:#9e9e9e;margin-bottom:8px;letter-spacing:.02em}
 /* ── بطاقة VS المحسنة مع المنافسين ── */
 .vs-row{display:grid;grid-template-columns:1fr 36px 1fr;gap:10px;align-items:center;padding:12px;background:#1A1A2E;border-radius:8px 8px 0 0;margin:5px 0 0 0;border:1px solid #333344;border-bottom:none}
+.vs-row.vs-compact{gap:8px;padding:8px;margin:3px 0 0 0}
+.vs-row.vs-compact .vs-badge{width:28px;height:28px;font-size:.65rem}
 .vs-badge{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.7rem}
 .our-s{text-align:right;padding:8px;background:rgba(108,99,255,.04);border-radius:6px;border-right:3px solid #6C63FF}
 .comp-s{text-align:left;padding:8px;background:rgba(255,152,0,.04);border-radius:6px;border-left:3px solid #ff9800}
@@ -231,46 +236,52 @@ def stat_card(icon, label, value, color="#6C63FF"):
 
 def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", product_id="",
             our_img="", comp_img="", comp_url="", our_url="",
-            accent_border=None, row_bg=None):
+            accent_border=None, row_bg=None, compact=False):
     """بطاقة VS الأساسية — المنافس الرئيسي (الأقل سعراً). our_img/comp_img/comp_url/our_url اختياريان.
-    accent_border/row_bg: تنسيق اختياري لصفوف «مستبعد» (رمادي)."""
+    accent_border/row_bg: تنسيق اختياري لصفوف «مستبعد» (رمادي).
+    compact: وضع أصغر لقسم «سعر أعلى» (فرصة خفض)."""
     dc = "#FF1744" if diff > 0 else "#00C853" if diff < 0 else "#FFD600"
     src = f'<div style="font-size:.65rem;color:#666">{comp_source}</div>' if comp_source else ""
     pid = str(product_id) if product_id and str(product_id) not in ("", "nan", "None", "0") else ""
     pid_html = f'<div style="font-size:.65rem;color:#6C63FF99;margin-top:1px">#{pid}</div>' if pid else ""
-    our_thumb = _lazy_img_tag(our_img, width=90, height=90, alt="منتجنا")
-    comp_thumb = _lazy_img_tag(comp_img, width=90, height=90, alt="المنافس")
+    _iw = _ih = (56 if compact else 90)
+    _fs_our = ".82rem" if compact else ".9rem"
+    _fs_price = "1rem" if compact else "1.1rem"
+    our_thumb = _lazy_img_tag(our_img, width=_iw, height=_ih, alt="منتجنا")
+    comp_thumb = _lazy_img_tag(comp_img, width=_iw, height=_ih, alt="المنافس")
     # السعر المقترح = أقل من أقل منافس بريال
     suggested = comp_price - 1 if comp_price > 0 else 0
     sugg_html = ""
     if suggested > 0 and diff > 10:
         sugg_html = f'<div style="font-size:.7rem;color:#4caf50;margin-top:2px">مقترح: {suggested:,.0f} ر.س</div>'
     our_title_html = _linked_product_title(
-        our_name, our_url, color="#B8B4FF", font_size=".9rem",
+        our_name, our_url, color="#B8B4FF", font_size=_fs_our,
     )
     our_block = (
         f'<div class="our-s" style="display:flex;align-items:flex-start;gap:10px;flex-direction:row-reverse">'
         f'{our_thumb}<div style="flex:1;min-width:0">'
         f'<div style="font-size:.7rem;color:#8B8B8B">منتجنا</div>'
         f'<div style="line-height:1.35">{our_title_html}</div>{pid_html}'
-        f'<div style="font-size:1.1rem;font-weight:900;color:#6C63FF;margin-top:2px">{our_price:.0f} ر.س</div>{sugg_html}</div></div>'
+        f'<div style="font-size:{_fs_price};font-weight:900;color:#6C63FF;margin-top:2px">{our_price:.0f} ر.س</div>{sugg_html}</div></div>'
     )
     comp_title_html = _linked_product_title(
-        comp_name, comp_url, color="#FFD180", font_size=".9rem",
+        comp_name, comp_url, color="#FFD180", font_size=_fs_our,
     )
     comp_block = (
         f'<div class="comp-s" style="display:flex;align-items:flex-start;gap:10px">'
         f'{comp_thumb}<div style="flex:1;min-width:0">'
         f'<div style="font-size:.7rem;color:#8B8B8B">المنافس المتصدر</div>'
         f'<div style="line-height:1.35">{comp_title_html}</div>'
-        f'<div style="font-size:1.1rem;font-weight:900;color:#ff9800;margin-top:2px">{comp_price:.0f} ر.س</div>{src}</div></div>'
+        f'<div style="font-size:{_fs_price};font-weight:900;color:#ff9800;margin-top:2px">{comp_price:.0f} ر.س</div>{src}</div></div>'
     )
     _foot = _comp_url_footer(comp_url)
-    inner = f'''<div class="vs-row">
+    _vs_cls = "vs-row vs-compact" if compact else "vs-row"
+    _diff_fs = ".82rem" if compact else ".9rem"
+    inner = f'''<div class="{_vs_cls}">
 {our_block}
 <div class="vs-badge">VS</div>
 {comp_block}
-</div><div style="text-align:center;background:#1A1A2E;padding:4px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:.9rem">الفرق: {diff:+.0f} ر.س</span></div>{_foot}'''
+</div><div style="text-align:center;background:#1A1A2E;padding:3px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:{_diff_fs}">الفرق: {diff:+.0f} ر.س</span></div>{_foot}'''
     if accent_border:
         bg = row_bg if row_bg is not None else "rgba(158,158,158,.10)"
         return (

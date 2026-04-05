@@ -113,7 +113,7 @@ WEBHOOK_NEW_PRODUCTS = (
 #  ألوان
 # ══════════════════════════════════════════════
 COLORS = {
-    "raise": "#dc3545", "lower": "#ffc107", "approved": "#28a745",
+    "raise": "#dc3545", "lower": "#00C853", "approved": "#28a745",
     "missing": "#007bff", "review": "#ff9800", "excluded": "#9e9e9e",
     "primary": "#6C63FF",
 }

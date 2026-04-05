@@ -30,7 +30,7 @@ except ImportError:
         def add_script_run_ctx(t): return t
 
 from config import *
-from styles import (get_styles, stat_card, vs_card, comp_strip, miss_card,
+from styles import (get_styles, vs_card, comp_strip, miss_card,
                     get_sidebar_toggle_js, lazy_img_tag, linked_product_title)
 from engines.mahwous_core import validate_export_product_dataframe
 from engines.engine import (read_file, run_full_analysis, find_missing_products,
@@ -113,6 +113,8 @@ _defaults = {
     "decisions_pending": {},   # {product_name: action}
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
+    "nav_flash": None,  # رسالة قصيرة بعد الانتقال من أزرار لوحة التحكم
+    "last_audit_stats": None,  # آخر عدادات تدقيق من run_full_analysis
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -365,6 +367,53 @@ def _render_column_mapping_expander(df: pd.DataFrame, key_prefix: str):
         st.json(detect_input_columns(df))
 
 
+def _validate_uploaded_catalog(df, label: str):
+    """حارس أعمدة: اسم + سعر مطلوبان قبل التحليل (بعد read_file + التعرف العميق)."""
+    if df is None or df.empty:
+        st.error(f"⚠️ ملف فارغ أو غير مقروء: {label}")
+        st.stop()
+    m = resolve_catalog_columns(df)
+    if not m.get("name") or not m.get("price"):
+        st.error(
+            f"⚠️ فشل التعرف الذكي على الأعمدة المطلوبة (**اسم المنتج** + **سعر**) في: **{label}**"
+        )
+        st.warning("معاينة خام — أول 10 صفوف:")
+        st.dataframe(df.head(10), use_container_width=True)
+        st.stop()
+
+
+def _render_audit_bar(audit_stats: dict):
+    """شريط تدقيق Zero Data Loss — يطابق المدخلات مع المخرجات المحاسَبة."""
+    if not audit_stats:
+        return
+    ti = int(audit_stats.get("total_input") or 0)
+    pr = int(audit_stats.get("processed") or 0)
+    nc = int(audit_stats.get("no_competitor_found") or 0)
+    sk = int(audit_stats.get("skipped_samples") or 0)
+    tot = pr + nc + sk
+    st.markdown(
+        f"""
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
+        background:#2c3e50;color:#fff;padding:15px;border-radius:8px;margin-bottom:16px;">
+        <div style="text-align:center;flex:1;min-width:100px;"><strong>📦 إجمالي المدخلات</strong><br>
+            <span style="font-size:1.5rem;">{ti}</span></div>
+        <div style="text-align:center;flex:1;min-width:100px;"><strong>✅ وُجد منافس (مطابقة)</strong><br>
+            <span style="font-size:1.5rem;color:#4caf50;">{pr}</span></div>
+        <div style="text-align:center;flex:1;min-width:100px;"><strong>⚪ لم يُعثر على منافس</strong><br>
+            <span style="font-size:1.5rem;color:#ff9800;">{nc}</span></div>
+        <div style="text-align:center;flex:1;min-width:100px;"><strong>🚫 مستبعد (عينة / حجم &lt;10مل)</strong><br>
+            <span style="font-size:1.5rem;color:#e53935;">{sk}</span></div>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+    if ti > 0 and tot != ti:
+        st.error(
+            f"🚨 تحذير تدقيق: المدخلات ({ti}) لا تساوي مجموع الحالات ({tot}) — "
+            f"معالج={pr} + بدون منافس={nc} + مستبعد={sk}."
+        )
+
+
 def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
     """تعمل في thread منفصل — تحفظ النتائج كل 10 منتجات مع حماية شاملة من الأخطاء"""
     total     = len(our_df)
@@ -392,10 +441,11 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
 
     analysis_df = pd.DataFrame()
     missing_df  = pd.DataFrame()
+    audit_stats = {}
 
     # ── المرحلة 1: التحليل الرئيسي ──────────────────────────────────
     try:
-        analysis_df = run_full_analysis(
+        analysis_df, audit_stats = run_full_analysis(
             our_df, comp_dfs,
             progress_callback=progress_cb
         )
@@ -445,7 +495,8 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
             safe_records,
             "done",
             our_file_name, comp_names,
-            missing=safe_missing
+            missing=safe_missing,
+            audit_stats=audit_stats,
         )
         log_analysis(
             our_file_name, comp_names, total,
@@ -462,7 +513,8 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
                 safe_results_for_json(analysis_df.to_dict("records")),
                 "done",
                 our_file_name, comp_names,
-                missing=[]
+                missing=[],
+                audit_stats=audit_stats,
             )
         except Exception:
             save_job_progress(
@@ -634,10 +686,11 @@ def _processed_row_url_chips_html(our_url: str, comp_url: str) -> str:
 # ════════════════════════════════════════════════
 #  مكوّن جدول المقارنة البصري (مشترك)
 # ════════════════════════════════════════════════
-def render_pro_table(df, prefix, section_type="update", show_search=True):
+def render_pro_table(df, prefix, section_type="update", show_search=True,
+                     compact_cards=False, inline_filters=True):
     """
     جدول احترافي بصري مع:
-    - فلاتر ذكية
+    - فلاتر ذكية (مكشوفة في شبكة أو داخل Expander)
     - أزرار AI + قرار لكل منتج
     - تصدير Make
     - Pagination
@@ -648,16 +701,32 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
 
     # ── فلاتر ─────────────────────────────────
     opts = get_filter_options(df)
-    with st.expander("🔍 فلاتر متقدمة", expanded=False):
-        c1, c2, c3, c4 = st.columns(4)
-        search   = c1.text_input("🔎 بحث",    key=f"{prefix}_s")
-        brand_f  = c2.selectbox("🏷️ الماركة", opts["brands"],      key=f"{prefix}_b")
-        comp_f   = c3.selectbox("🏪 المنافس", opts["competitors"], key=f"{prefix}_c")
-        type_f   = c4.selectbox("🧴 النوع",   opts["types"],       key=f"{prefix}_t")
-        c5, c6, c7 = st.columns(3)
-        match_min  = c5.slider("أقل تطابق%", 0, 100, 0, key=f"{prefix}_m")
-        price_min  = c6.number_input("سعر من", 0.0, key=f"{prefix}_p1")
-        price_max  = c7.number_input("سعر لـ", 0.0, key=f"{prefix}_p2")
+    if inline_filters:
+        st.markdown(
+            '<div class="filter-inline-wrap">'
+            '<div class="filter-inline-title">🔍 فلاتر — بحث، ماركة، منافس، نوع</div></div>',
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3, c4 = st.columns([1.15, 1, 1, 1])
+        search = c1.text_input("🔎 بحث", key=f"{prefix}_s")
+        brand_f = c2.selectbox("🏷️ الماركة", opts["brands"], key=f"{prefix}_b")
+        comp_f = c3.selectbox("🏪 المنافس", opts["competitors"], key=f"{prefix}_c")
+        type_f = c4.selectbox("🧴 النوع", opts["types"], key=f"{prefix}_t")
+        c5, c6, c7 = st.columns([1.2, 1, 1])
+        match_min = c5.slider("أقل تطابق %", 0, 100, 0, key=f"{prefix}_m")
+        price_min = c6.number_input("سعر من", 0.0, key=f"{prefix}_p1")
+        price_max = c7.number_input("سعر إلى", 0.0, key=f"{prefix}_p2")
+    else:
+        with st.expander("🔍 فلاتر متقدمة", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            search = c1.text_input("🔎 بحث", key=f"{prefix}_s")
+            brand_f = c2.selectbox("🏷️ الماركة", opts["brands"], key=f"{prefix}_b")
+            comp_f = c3.selectbox("🏪 المنافس", opts["competitors"], key=f"{prefix}_c")
+            type_f = c4.selectbox("🧴 النوع", opts["types"], key=f"{prefix}_t")
+            c5, c6, c7 = st.columns(3)
+            match_min = c5.slider("أقل تطابق%", 0, 100, 0, key=f"{prefix}_m")
+            price_min = c6.number_input("سعر من", 0.0, key=f"{prefix}_p1")
+            price_max = c7.number_input("سعر لـ", 0.0, key=f"{prefix}_p2")
 
     filters = {
         "search": search, "brand": brand_f, "competitor": comp_f,
@@ -756,7 +825,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
     st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
 
     # ── Pagination ─────────────────────────────
-    PAGE_SIZE = 25
+    PAGE_SIZE = 20 if (compact_cards and prefix == "raise") else 25
     total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
     if total_pages > 1:
         page_num = st.number_input("الصفحة", 1, total_pages, 1, key=f"{prefix}_pg")
@@ -805,12 +874,14 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         _comp_url_v = competitor_product_url_from_row(row)
         _our_url_v = our_product_url_from_row(row)
 
-        # بطاقة VS مع رقم المنتج + صور (lazy) عند توفرها
+        # بطاقة VS مع رقم المنتج + صور (lazy) عند توفرها — وضع مضغوط لقسم «سعر أعلى»
+        _vs_compact = bool(compact_cards and prefix == "raise")
         _vs_html = vs_card(our_name, our_price, comp_name,
                            comp_price, diff, comp_src, _pid_str,
                            our_img=_our_img_v, comp_img=_comp_img_v,
                            comp_url=_comp_url_v, our_url=_our_url_v,
-                           accent_border=_vs_border, row_bg=_vs_row_bg)
+                           accent_border=_vs_border, row_bg=_vs_row_bg,
+                           compact=_vs_compact)
         st.markdown(_vs_html, unsafe_allow_html=True)
 
         # شريط المعلومات
@@ -915,7 +986,13 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     st.rerun()
             with col_btn3:
                 st.empty()
-            st.markdown("---")
+            if _vs_compact:
+                st.markdown(
+                    '<hr style="border:none;border-top:1px solid #2a2a3d;margin:4px 0 8px">',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown("---")
 
         if prefix in ("raise", "lower"):
             b1, b2, b3, b4, b8, b9 = st.columns([1, 1, 1, 1, 1, 1])
@@ -1134,7 +1211,11 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     else:
                         st.info("لا يوجد تاريخ بعد")
 
-        st.markdown('<hr style="border:none;border-top:1px solid #1a1a2e;margin:6px 0">', unsafe_allow_html=True)
+        _hr_m = "3px 0" if (compact_cards and prefix == "raise") else "6px 0"
+        st.markdown(
+            f'<hr style="border:none;border-top:1px solid #1a1a2e;margin:{_hr_m}">',
+            unsafe_allow_html=True,
+        )
 
 
 # ════════════════════════════════════════════════
@@ -1239,6 +1320,7 @@ with st.sidebar:
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
+                st.session_state.last_audit_stats = job.get("audit") or {}
                 st.session_state.job_running = False
                 st.balloons()
                 st.rerun()
@@ -1246,7 +1328,7 @@ with st.sidebar:
                 st.error(f"❌ فشل: {job['status'][7:80]}")
                 st.session_state.job_running = False
 
-    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed")
+    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed", key="main_nav")
 
     st.markdown("---")
     if st.session_state.results:
@@ -1281,12 +1363,24 @@ with st.sidebar:
                     unsafe_allow_html=True)
 
 
+# إشعار خفيف بعد الانتقال من أزرار لوحة التحكم
+if st.session_state.get("nav_flash"):
+    _nf = st.session_state.pop("nav_flash", None)
+    if _nf:
+        if hasattr(st, "toast"):
+            st.toast(_nf, icon="⏳")
+        else:
+            st.info(_nf)
+
+
 # ════════════════════════════════════════════════
 #  1. لوحة التحكم
 # ════════════════════════════════════════════════
 if page == "📊 لوحة التحكم":
     st.header("📊 لوحة التحكم")
     db_log("dashboard", "view")
+    if st.session_state.get("last_audit_stats"):
+        _render_audit_bar(st.session_state.last_audit_stats)
 
     # تغييرات الأسعار
     changes = get_price_changes(7)
@@ -1303,17 +1397,27 @@ if page == "📊 لوحة التحكم":
 
     if st.session_state.results:
         r = st.session_state.results
-        cols = st.columns(6)
-        data = [
-            ("🔴","سعر أعلى",  len(r.get("price_raise", pd.DataFrame())), COLORS["raise"]),
-            ("🟢","سعر أقل",   len(r.get("price_lower", pd.DataFrame())), COLORS["lower"]),
-            ("✅","موافق",     len(r.get("approved", pd.DataFrame())),     COLORS["approved"]),
-            ("🔍","مفقود",     len(r.get("missing", pd.DataFrame())),      COLORS["missing"]),
-            ("⚠️","مراجعة",   len(r.get("review", pd.DataFrame())),       COLORS["review"]),
-            ("⚪","مستبعد",   len(r.get("excluded", pd.DataFrame())),     COLORS["excluded"]),
+        _dash_nav = [
+            ("🔴 سعر أعلى", "🔴", "سعر أعلى", "price_raise"),
+            ("🟢 سعر أقل", "🟢", "سعر أقل", "price_lower"),
+            ("✅ موافق عليها", "✅", "موافق", "approved"),
+            ("🔍 منتجات مفقودة", "🔍", "مفقود", "missing"),
+            ("⚠️ تحت المراجعة", "⚠️", "مراجعة", "review"),
+            ("⚪ مستبعد (لا يوجد تطابق)", "⚪", "مستبعد", "excluded"),
         ]
-        for col, (icon, label, val, color) in zip(cols, data):
-            col.markdown(stat_card(icon, label, val, color), unsafe_allow_html=True)
+        cols = st.columns(6)
+        for col, (sec_title, icon, short_lbl, rkey) in zip(cols, _dash_nav):
+            val = len(r.get(rkey, pd.DataFrame()))
+            with col:
+                if st.button(
+                    f"{icon} {val}\n{short_lbl}",
+                    key=f"dash_go_{rkey}",
+                    use_container_width=True,
+                    help=f"انتقل إلى {sec_title}",
+                ):
+                    st.session_state.main_nav = sec_title
+                    st.session_state.nav_flash = f"➡️ {sec_title}"
+                    st.rerun()
 
         # ملخص الثقة للمفقودات في لوحة التحكم
         _miss_dash = r.get("missing", pd.DataFrame())
@@ -1493,6 +1597,9 @@ if page == "📊 لوحة التحكم":
                         _prep_ok = True
 
             if _prep_ok and our_df is not None and comp_dfs:
+                _validate_uploaded_catalog(our_df, "ملف منتجاتنا")
+                for _cfn, _cdf in comp_dfs.items():
+                    _validate_uploaded_catalog(_cdf, f"ملف منافس: {_cfn}")
                 if bg_mode:
                     t = threading.Thread(
                         target=_run_analysis_background,
@@ -1510,7 +1617,9 @@ if page == "📊 لوحة التحكم":
                     def upd(p, _r=None):
                         prog.progress(min(float(p), 0.99), f"{float(p)*100:.0f}%")
 
-                    df_all = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
+                    df_all, audit_stats = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
+                    st.session_state.last_audit_stats = audit_stats
+                    _render_audit_bar(audit_stats)
                     raw_missing_df = find_missing_products(our_df, comp_dfs)
                     missing_df = smart_missing_barrier(raw_missing_df, our_df)
 
@@ -1546,12 +1655,24 @@ if page == "📊 لوحة التحكم":
 #  2. سعر أعلى
 # ════════════════════════════════════════════════
 elif page == "🔴 سعر أعلى":
-    st.header("🔴 منتجات سعرنا أعلى — فرصة خفض")
+    st.markdown(
+        '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 4px 0">'
+        '<span class="b-high" style="display:inline-block;padding:6px 12px;border-radius:10px;'
+        'font-weight:800;font-size:.95rem">🔴 فرصة خفض</span>'
+        '<span style="color:#9e9e9e;font-size:.82rem;font-weight:600">مقارنة مع أقل سعر منافس</span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.header("منتجات سعرنا أعلى")
     db_log("price_raise", "view")
     if st.session_state.results and "price_raise" in st.session_state.results:
         df = st.session_state.results["price_raise"]
         if not df.empty:
-            st.error(f"⚠️ {len(df)} منتج سعرنا أعلى من المنافسين")
+            st.markdown(
+                f'<p style="margin:4px 0 8px;font-size:1.05rem;font-weight:700;color:#FF5252">'
+                f"{len(df)} منتج — سعرنا أعلى من المنافس (بيانات التحليل الحالي)</p>",
+                unsafe_allow_html=True,
+            )
             # AI تدريب لهذا القسم
             with st.expander("🤖 نصيحة AI لهذا القسم", expanded=False):
                 if st.button("📡 احصل على تحليل شامل للقسم", key="ai_section_raise"):
@@ -1569,7 +1690,7 @@ elif page == "🔴 سعر أعلى":
                                    f"3. استراتيجية تسعير مخصصة لكل ماركة")
                         r = call_ai(_prompt, "price_raise")
                         st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
-            render_pro_table(df, "raise", "raise")
+            render_pro_table(df, "raise", "raise", compact_cards=True)
         else:
             st.success("✅ ممتاز! لا توجد منتجات بسعر أعلى")
     else:
