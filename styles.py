@@ -243,7 +243,16 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     dc = "#FF1744" if diff > 0 else "#00C853" if diff < 0 else "#FFD600"
     src = f'<div style="font-size:.65rem;color:#666">{comp_source}</div>' if comp_source else ""
     pid = str(product_id) if product_id and str(product_id) not in ("", "nan", "None", "0") else ""
-    pid_html = f'<div style="font-size:.65rem;color:#6C63FF99;margin-top:1px">#{pid}</div>' if pid else ""
+    pid_html = (
+        f'<div style="display:inline-block;margin-top:3px;padding:1px 6px;'
+        f'background:rgba(108,99,255,.18);border:1px solid rgba(108,99,255,.45);'
+        f'border-radius:4px;font-size:.7rem;color:#a09dff;font-weight:600;'
+        f'letter-spacing:.4px">#{pid}</div>'
+    ) if pid else (
+        f'<div style="display:inline-block;margin-top:3px;padding:1px 6px;'
+        f'background:rgba(255,71,87,.12);border:1px solid rgba(255,71,87,.35);'
+        f'border-radius:4px;font-size:.65rem;color:#ff6b6b88">لا يوجد رقم</div>'
+    )
     _iw = _ih = (56 if compact else 90)
     _fs_our = ".82rem" if compact else ".9rem"
     _fs_price = "1rem" if compact else "1.1rem"

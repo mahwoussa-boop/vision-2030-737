@@ -755,6 +755,14 @@ def _cb_send_make(
             "error", "❌ السعر يجب أن يكون أكبر من صفر"
         )
         return
+    _clean = str(pid).strip() if pid else ""
+    if not _clean or _clean in ("nan", "None", "NaN", "0", "0.0"):
+        st.session_state[f"_act_{prefix}_{idx}"] = (
+            "error",
+            f"❌ لا يمكن إرسال «{our_name}» — رقم المنتج (ID) مفقود. "
+            "تأكد أن ملف كتالوجك يحتوي على عمود رقم المنتج.",
+        )
+        return
 
     _ok = trigger_price_update(
         pid, _tp, comp_url,
@@ -1314,6 +1322,12 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                     if _pid in ("nan", "None", "NaN", ""):
                         _pid = ""
                     _final_price = _custom_price if _custom_price > 0 else _auto_price_row
+                    if not _pid:
+                        st.error(
+                            f"❌ رقم المنتج (ID) مفقود — «{our_name}»\n"
+                            "تأكد أن ملف كتالوجك يحتوي على عمود رقم المنتج (No. أو معرف المنتج)."
+                        )
+                        st.stop()
                     res = send_single_product({
                         "product_id": _pid,
                         "name": our_name, "price": _final_price,
