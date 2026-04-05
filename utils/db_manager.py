@@ -76,6 +76,7 @@ def init_db():
         processed INTEGER DEFAULT 0,
         results_json TEXT DEFAULT '[]',
         missing_json TEXT DEFAULT '[]',
+        audit_json TEXT DEFAULT '{}',
         our_file TEXT, comp_files TEXT
     )""")
     # إضافة عمود missing_json إذا لم يكن موجوداً (للتوافق مع قواعد البيانات القديمة)
@@ -83,6 +84,10 @@ def init_db():
         c.execute("ALTER TABLE job_progress ADD COLUMN missing_json TEXT DEFAULT '[]'")
     except:
         pass  # العمود موجود بالفعل
+    try:
+        c.execute("ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'")
+    except:
+        pass
 
     # تاريخ التحليلات
     c.execute("""CREATE TABLE IF NOT EXISTS analysis_history (
@@ -269,21 +274,23 @@ def get_price_changes(days=7):
 
 # ─── المعالجة الخلفية ──────────────────────
 def save_job_progress(job_id, total, processed, results, status="running",
-                      our_file="", comp_files="", missing=None):
+                      our_file="", comp_files="", missing=None, audit_stats=None):
     missing_data = json.dumps(missing if missing else [], ensure_ascii=False, default=str)
     results_data = json.dumps(results, ensure_ascii=False, default=str)
+    audit_data = json.dumps(audit_stats if audit_stats is not None else {},
+                            ensure_ascii=False, default=str)
     with sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute(
             """INSERT OR REPLACE INTO job_progress
                (job_id,started_at,updated_at,status,total,processed,
-                results_json,missing_json,our_file,comp_files)
+                results_json,missing_json,our_file,comp_files,audit_json)
                VALUES (?,
                    COALESCE((SELECT started_at FROM job_progress WHERE job_id=?), ?),
-                   ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, job_id, _ts(), _ts(), status, total, processed,
-             results_data, missing_data, our_file, comp_files)
+             results_data, missing_data, our_file, comp_files, audit_data)
         )
         conn.commit()
 
@@ -301,6 +308,8 @@ def get_job_progress(job_id):
             except: d["results"] = []
             try: d["missing"] = json.loads(d.get("missing_json", "[]"))
             except: d["missing"] = []
+            try: d["audit"] = json.loads(d.get("audit_json") or "{}")
+            except: d["audit"] = {}
             return d
     except: pass
     return None
@@ -319,6 +328,8 @@ def get_last_job():
             except: d["results"] = []
             try: d["missing"] = json.loads(d.get("missing_json", "[]"))
             except: d["missing"] = []
+            try: d["audit"] = json.loads(d.get("audit_json") or "{}")
+            except: d["audit"] = {}
             return d
     except: pass
     return None
@@ -778,6 +789,11 @@ def migrate_db_v26():
                 """UPDATE comp_catalog SET comp_product_key = competitor || '::' || IFNULL(norm_name, '')
                    WHERE comp_product_key IS NULL OR TRIM(comp_product_key) = ''"""
             )
+        except Exception:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'")
         except Exception:
             pass
 
