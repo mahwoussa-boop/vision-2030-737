@@ -23,5 +23,5 @@ COPY . .
 
 EXPOSE 8501
 
-# Python يفرض STREAMLIT_SERVER_PORT رقماً (Railway قد يضع النص '$PORT' في المتغير)
-ENTRYPOINT ["python3", "docker_entrypoint.py"]
+# تشغيل افتراضي؛ railway.json يضبط نفس الأمر في deploy.startCommand
+CMD ["python3", "docker_entrypoint.py"]

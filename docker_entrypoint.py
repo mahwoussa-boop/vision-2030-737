@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""تشغيل Streamlit على Railway رغم STREAMLIT_SERVER_PORT='$PORT' كنص في المتغيرات."""
+"""
+تشغيل Streamlit على Railway.
+Railway قد يضع STREAMLIT_SERVER_PORT على النص الحرفي '$PORT' — نزيله ثم نمرّر المنفذ رقماً.
+"""
 import os
-import sys
 
 
 def _port() -> int:
@@ -15,13 +17,16 @@ def _port() -> int:
     return 8501
 
 
+def _strip_broken_streamlit_server_env() -> None:
+    for key in list(os.environ):
+        if key.startswith("STREAMLIT_SERVER_"):
+            os.environ.pop(key, None)
+
+
 def main() -> None:
     p = _port()
-    # يطابق سلوك Streamlit ويستبدل أي قيمة خاطئة من لوحة Railway
-    os.environ["STREAMLIT_SERVER_PORT"] = str(p)
-    os.environ["STREAMLIT_SERVER_ADDRESS"] = "0.0.0.0"
-    os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
-
+    _strip_broken_streamlit_server_env()
+    # لا نضبط STREAMLIT_SERVER_* هنا — الاعتماد على سطر الأوامر فقط يتفادى تعارض القيم النصية '$PORT'
     os.execvp(
         "streamlit",
         [
