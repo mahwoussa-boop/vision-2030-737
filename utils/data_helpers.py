@@ -120,7 +120,7 @@ def row_media_urls_from_analysis(row) -> tuple:
     d = row.to_dict() if hasattr(row, "to_dict") else dict(row)
     normalize_result_media_keys(d)
     our_img = first_image_url_string(str(d.get("صورة_منتجنا", "") or "").strip())
-    comp_img = ""
+    comp_img = first_image_url_string(str(d.get("صورة_المنافس", "") or "").strip())
     all_c = d.get("جميع_المنافسين", d.get("جميع المنافسين", [])) or []
     if isinstance(all_c, str):
         try:
@@ -271,3 +271,57 @@ def pid_from_row(row, col):
     except (ValueError, TypeError):
         pass
     return str(v).strip()
+
+
+def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
+    """تحويل المنتجات المفقودة إلى قالب سلة الشامل المعتمد."""
+    if missing_df is None or missing_df.empty:
+        return pd.DataFrame()
+
+    n = len(missing_df)
+    salla_df = pd.DataFrame(index=missing_df.index)
+
+    def _series_or_blank(col_name: str):
+        if col_name in missing_df.columns:
+            return missing_df[col_name].fillna("").astype(str)
+        return pd.Series([""] * n, index=missing_df.index)
+
+    # 1) بيانات أساسية إجبارية (بعناوين سلة الحرفية)
+    salla_df["النوع "] = ["منتج"] * n
+    salla_df["أسم المنتج"] = _series_or_blank("منتج_المنافس")
+    salla_df["تصنيف المنتج"] = ""
+    salla_df["صورة المنتج"] = _series_or_blank("صورة_المنافس")
+    salla_df["وصف صورة المنتج"] = ""
+    salla_df["نوع المنتج"] = ["منتج جاهز"] * n
+    salla_df["سعر المنتج"] = _series_or_blank("سعر_المنافس")
+    salla_df["الكمية المتوفرة"] = [0] * n
+    salla_df["الوصف"] = ""
+    salla_df["هل يتطلب شحن؟"] = ["نعم"] * n
+    salla_df["رمز المنتج sku"] = ""
+
+    # 2) أعمدة مالية/إدارية
+    salla_df["سعر التكلفة"] = ""
+    salla_df["السعر المخفض"] = ""
+    salla_df["تاريخ بداية التخفيض"] = ""
+    salla_df["تاريخ نهاية التخفيض"] = ""
+    salla_df["اقصي كمية لكل عميل"] = ""
+    salla_df["إخفاء خيار تحديد الكمية"] = ""
+    salla_df["اضافة صورة عند الطلب"] = ""
+    salla_df["الوزن"] = ""
+    salla_df["وحدة الوزن"] = ""
+
+    # 3) الماركة/الحالة
+    salla_df["حالة المنتج"] = ""
+    salla_df["الماركة"] = _series_or_blank("الماركة")
+
+    # 4) بقية الأعمدة القياسية
+    salla_df["العنوان الترويجي"] = ""
+    salla_df["تثبيت المنتج"] = ""
+    salla_df["الباركود"] = ""
+    salla_df["السعرات الحرارية"] = ""
+    salla_df["MPN"] = ""
+    salla_df["GTIN"] = ""
+    salla_df["خاضع للضريبة ؟"] = ["نعم"] * n
+    salla_df["سبب عدم الخضوع للضريبة"] = ""
+
+    return salla_df.reset_index(drop=True)

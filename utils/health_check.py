@@ -107,16 +107,22 @@ def _check_competitors_file(rep: DiagnosticReport) -> None:
 
 
 def _check_progress_writable(rep: DiagnosticReport) -> None:
-    """التأكد من إمكانية الكتابة في scraper_progress.json."""
+    """التأكد من إمكانية الكتابة في scraper_progress.json.
+    لا يُعيد الكتابة إذا كان الملف موجوداً — يحافظ على بيانات الكاشط الجارية."""
     path = os.path.join(_data_dir(), "scraper_progress.json")
     try:
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"running": False, "health_init": True}, f)
-        rep.pass_("progress_file", "scraper_progress.json قابل للكتابة")
+            rep.pass_("progress_file", "scraper_progress.json أُنشئ")
+        else:
+            # تحقق من إمكانية القراءة دون الكتابة (لا نمحو بيانات الكاشط)
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            rep.pass_("progress_file", "scraper_progress.json موجود وقابل للقراءة")
     except Exception as exc:
-        rep.warn(f"تعذّر الكتابة في scraper_progress.json: {exc}", "progress_file")
+        rep.warn(f"تعذّر التحقق من scraper_progress.json: {exc}", "progress_file")
 
 
 def _check_gemini_api(rep: DiagnosticReport) -> None:
