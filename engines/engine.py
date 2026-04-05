@@ -11,7 +11,7 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
   4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, os, hashlib, sqlite3, time
+import re, io, json, os, hashlib, sqlite3, time, gc
 from datetime import datetime
 import pandas as pd
 from utils.data_helpers import first_image_url_string, pid_from_row as _pid
@@ -982,6 +982,18 @@ def classify_product(name):
     # بودرة/كريم/لوشن
     if re.search(r'بودرة|بودره|powder|كريم|cream|لوشن|lotion|ديودرنت|deodorant', nl):
         return 'other'
+    # ─── الجدار الفئوي — أجهزة التجميل وغير العطور ───────────────────────
+    # هذه المنتجات لا تدخل المطابقة مع العطور مطلقاً
+    if re.search(
+        r'استشوار|استشواره|مكواة|مكواه|سترتنر|straightener|dryer|hair\s*dryer'
+        r'|ماسكرا|mascara|ايلاينر|eyeliner|ظل\s*عيون|eyeshadow|ايشادو'
+        r'|روج|أحمر\s*شفاه|lipstick|lip\s*gloss'
+        r'|بلاشر|blush|كونتور|contour|فونديشن|foundation'
+        r'|فرشاة|makeup\s*brush|مرطب\s*شفاه|lip\s*balm'
+        r'|طلاء\s*اظافر|nail\s*polish|nail\s*color',
+        nl
+    ):
+        return 'other'
     return 'retail'
 
 def _price(row):
@@ -1807,6 +1819,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     audit_stats = {
         "total_input": int(len(our_df)) if our_df is not None else 0,
         "processed": 0,
+        "skipped_empty": 0,
         "skipped_samples": 0,
         "no_competitor_found": 0,
     }
@@ -1906,7 +1919,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     for i, (_, row) in enumerate(our_df.iterrows()):
         product = str(row.get(our_col, "")).strip()
         if not product:
-            audit_stats["skipped_samples"] += 1
+            audit_stats["skipped_empty"] += 1
             if progress_callback:
                 progress_callback((i + 1) / total, results)
             continue
@@ -2003,7 +2016,15 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             progress_callback((i + 1) / total, results)
 
     _flush()
-    return pd.DataFrame(results), audit_stats
+
+    # ── تنظيف الذاكرة بعد المعالجة الثقيلة ──────────────────────────────
+    _out = pd.DataFrame(results)
+    del results
+    del indices
+    del pending
+    gc.collect()
+
+    return _out, audit_stats
 
 
 # ═══════════════════════════════════════════════════════

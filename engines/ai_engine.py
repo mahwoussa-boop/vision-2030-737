@@ -949,3 +949,238 @@ def chat_with_ai(msg, history=None, ctx=""): return gemini_chat(msg, history, ct
 def analyze_product(p, price=0): return call_ai(f"حلل: {p} ({price:.0f}ريال)", "general")
 def suggest_price(p, comp_price): return call_ai(f"اقترح سعرا لـ {p} بدلا من {comp_price:.0f}ريال", "general")
 def process_paste(text): return analyze_paste(text)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  محرك إثراء المحتوى التسويقي (Content Enrichment Engine)
+#  يولّد وصفاً Markdown مع ربط الماركة والقسم من ملفات المتجر الفعلية
+# ══════════════════════════════════════════════════════════════════════════
+import pandas as _pd
+import os as _os
+
+from engines.prompts import (
+    SEO_CONTENT_PROMPT,
+    SALLA_BRANDS_FILE, SALLA_BRANDS_COL,
+    SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL,
+    BRANDS_CSV_FILE, BRANDS_CSV_COL,
+    CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL,
+)
+
+
+def _load_catalog_by_colname(csv_path: str, col_name: str) -> list[str]:
+    """
+    يقرأ عمود CSV باسمه الصريح (للملفات الرسمية من سلة).
+    يدعم الترميزات العربية الشائعة.
+    """
+    for enc in ("utf-8-sig", "utf-8", "cp1256"):
+        try:
+            df = _pd.read_csv(csv_path, header=0, encoding=enc)
+            if col_name in df.columns:
+                return [str(v).strip() for v in df[col_name].dropna().tolist()
+                        if str(v).strip() and str(v) not in ("nan", "None")]
+        except Exception:
+            continue
+    return []
+
+
+def _load_catalog_list(csv_path: str, col_idx: int) -> list[str]:
+    """
+    يقرأ عمود CSV برقمه (للملفات الاحتياطية العامة).
+    يدعم الترميزات العربية الشائعة (UTF-8 / cp1256).
+    """
+    for enc in ("utf-8-sig", "utf-8", "cp1256"):
+        try:
+            df = _pd.read_csv(csv_path, header=0, encoding=enc)
+            col = df.iloc[:, col_idx]
+            return [str(v).strip() for v in col.dropna().tolist()
+                    if str(v).strip() and str(v) not in ("nan", "None")]
+        except Exception:
+            continue
+    return []
+
+
+def _find_catalog_file(salla_filename: str, fallback_filename: str) -> tuple[str, bool]:
+    """
+    يحدّد مسار ملف الكتالوج بالأولوية التالية:
+    1. ملف سلة الرسمي في DATA_DIR (Railway Volume)
+    2. ملف سلة الرسمي في جذر المشروع (للتطوير المحلي)
+    3. الملف الاحتياطي عبر get_catalog_data_path
+
+    يُعيد (المسار, هل_هو_ملف_سلة)
+    """
+    import os as _os_local
+    from utils.data_paths import get_catalog_data_path
+
+    # 1. ملف سلة في DATA_DIR
+    data_dir = (_os_local.environ.get("DATA_DIR") or "").strip()
+    if data_dir:
+        salla_path = _os_local.path.join(data_dir, salla_filename)
+        if _os_local.path.exists(salla_path):
+            return salla_path, True
+
+    # 2. ملف سلة في جذر المشروع (بجانب app.py)
+    root = _os_local.path.dirname(_os_local.path.dirname(_os_local.path.abspath(__file__)))
+    salla_root_path = _os_local.path.join(root, salla_filename)
+    if _os_local.path.exists(salla_root_path):
+        return salla_root_path, True
+
+    # 3. الملف الاحتياطي
+    return get_catalog_data_path(fallback_filename), False
+
+
+def _resolve_catalog_paths() -> tuple[str, str]:
+    """يحدد مسار brands.csv و categories.csv عبر data_paths (ملفات احتياطية)."""
+    from utils.data_paths import get_catalog_data_path
+    return (
+        get_catalog_data_path(BRANDS_CSV_FILE),
+        get_catalog_data_path(CATEGORIES_CSV_FILE),
+    )
+
+
+def _build_brands_list() -> str:
+    """
+    يبني قائمة الماركات بأولوية: ملف سلة الرسمي → الملف الاحتياطي.
+    يعيد الأسماء مفصولة بفواصل عربية لقراءة أفضل من الـ AI.
+    """
+    path, is_salla = _find_catalog_file(SALLA_BRANDS_FILE, BRANDS_CSV_FILE)
+    if is_salla:
+        items = _load_catalog_by_colname(path, SALLA_BRANDS_COL)
+    else:
+        items = _load_catalog_list(path, BRANDS_CSV_COL)
+    if items:
+        return "\n".join(f"- {b}" for b in items)
+    return "⚠️ لم يُعثر على ملف الماركات — يرجى رفع «ماركات مهووس.csv» في مجلد /data"
+
+
+def _build_categories_list() -> str:
+    """
+    يبني قائمة الأقسام بأولوية: ملف سلة الرسمي → الملف الاحتياطي.
+    """
+    path, is_salla = _find_catalog_file(SALLA_CATEGORIES_FILE, CATEGORIES_CSV_FILE)
+    if is_salla:
+        items = _load_catalog_by_colname(path, SALLA_CATEGORIES_COL)
+    else:
+        items = _load_catalog_list(path, CATEGORIES_CSV_COL)
+    if items:
+        return "\n".join(f"- {c}" for c in items)
+    return "⚠️ لم يُعثر على ملف الأقسام — يرجى رفع «تصنيفات مهووس.csv» في مجلد /data"
+
+
+def generate_seo_description(raw_product_data: str) -> dict:
+    """
+    توليد الوصف التسويقي SEO بتنسيق Markdown مع ربط:
+    - exact_brand    : الماركة المطابقة تماماً من brands.csv
+    - exact_category : القسم المطابق تماماً من categories.csv
+    - markdown_desc  : الوصف الجاهز
+
+    يستخدم Gemini → OpenRouter → Cohere بالتتابع
+    (نفس منطق call_ai في هذا الملف).
+
+    المعاملات:
+      raw_product_data : نص خام يصف المنتج (اسم، سعر، URL، إلخ)
+
+    يُعيد dict:
+      {"exact_brand": str, "exact_category": str, "markdown_desc": str}
+      أو {"error": str} عند الفشل الكامل
+    """
+    if not raw_product_data or not raw_product_data.strip():
+        return {"error": "raw_product_data فارغ — لا شيء لتوليده"}
+
+    prompt = SEO_CONTENT_PROMPT.format(
+        brands_list=_build_brands_list(),
+        categories_list=_build_categories_list(),
+        raw_product_data=raw_product_data.strip()[:4000],  # حد آمن
+    )
+
+    # حرارة 0.1 (شبه حتمي) لضمان النسخ الحرفي من قوائم سلة
+    raw_text = _call_gemini(prompt, temperature=0.1, max_tokens=2048)
+    if not raw_text:
+        raw_text = _call_openrouter(prompt)
+    if not raw_text:
+        raw_text = _call_cohere(prompt)
+
+    if not raw_text:
+        _log_err("generate_seo_description", "جميع مزودي AI فشلوا")
+        return {"error": "فشلت جميع محاولات الاتصال بالذكاء الاصطناعي"}
+
+    data = _parse_json(raw_text)
+    if not data:
+        # إن أخفق JSON نعيد الـ markdown كاملاً بدون ربط
+        _log_err("generate_seo_description", f"فشل تحليل JSON — سنعيد النص خاماً: {raw_text[:120]}")
+        return {
+            "exact_brand": "",
+            "exact_category": "",
+            "suggested_new_brand": "",
+            "markdown_desc": raw_text.strip(),
+            "warning": "JSON parse failed — returned raw text",
+        }
+
+    # ── التقاط الماركات المفقودة (Auto-Capture Missing Brands) ─────────────
+    suggested_brand = str(data.get("suggested_new_brand", "") or "").strip()
+    if suggested_brand:
+        from utils.data_paths import get_catalog_data_path
+        _missing_file = get_catalog_data_path("missing_brands.txt")
+        try:
+            # قراءة الماركات المسجلة مسبقاً لمنع التكرار
+            _existing: set[str] = set()
+            if _os.path.exists(_missing_file):
+                with open(_missing_file, "r", encoding="utf-8") as _fh:
+                    _existing = {ln.strip() for ln in _fh if ln.strip()}
+            # تسجيل الماركة فقط إذا لم تكن مسجلة من قبل
+            if suggested_brand not in _existing:
+                _os.makedirs(_os.path.dirname(_missing_file), exist_ok=True)
+                with open(_missing_file, "a", encoding="utf-8") as _fh:
+                    _fh.write(f"{suggested_brand}\n")
+        except Exception as _capture_err:
+            _log_err("generate_seo_description", f"فشل حفظ الماركة المقترحة: {_capture_err}")
+    # ────────────────────────────────────────────────────────────────────────
+
+    return {
+        "exact_brand":         str(data.get("exact_brand", "") or "").strip(),
+        "exact_category":      str(data.get("exact_category", "") or "").strip(),
+        "suggested_new_brand": suggested_brand,
+        "markdown_desc":       str(data.get("markdown_desc", "") or "").strip(),
+    }
+
+
+def get_catalog_status() -> dict:
+    """
+    يعيد حالة ملفات الكتالوج (للعرض في واجهة الإعدادات):
+    - ملفات سلة الرسمية (إن وُجدت)
+    - الملفات الاحتياطية
+    - missing_brands.txt
+    """
+    from utils.data_paths import get_catalog_data_path
+
+    def _stat_salla(salla_file: str, salla_col: str, fallback_file: str, fallback_col_idx: int) -> dict:
+        path, is_salla = _find_catalog_file(salla_file, fallback_file)
+        source = "سلة (رسمي)" if is_salla else "احتياطي (generic)"
+        if not _os.path.exists(path):
+            return {"found": False, "path": path, "source": source, "count": 0, "sample": []}
+        if is_salla:
+            items = _load_catalog_by_colname(path, salla_col)
+        else:
+            items = _load_catalog_list(path, fallback_col_idx)
+        return {"found": True, "path": path, "source": source,
+                "count": len(items), "sample": items[:5]}
+
+    # حالة missing_brands.txt
+    missing_path = get_catalog_data_path("missing_brands.txt")
+    if _os.path.exists(missing_path):
+        try:
+            with open(missing_path, "r", encoding="utf-8") as _fh:
+                _mb = [ln.strip() for ln in _fh if ln.strip()]
+            missing_stat = {"found": True, "path": missing_path,
+                            "count": len(_mb), "sample": _mb[:10]}
+        except Exception:
+            missing_stat = {"found": True, "path": missing_path, "count": -1}
+    else:
+        missing_stat = {"found": False, "path": missing_path, "count": 0}
+
+    return {
+        "brands":         _stat_salla(SALLA_BRANDS_FILE, SALLA_BRANDS_COL,
+                                      BRANDS_CSV_FILE, BRANDS_CSV_COL),
+        "categories":     _stat_salla(SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL,
+                                      CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
+        "missing_brands": missing_stat,
+    }
