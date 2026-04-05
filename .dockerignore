@@ -1,11 +1,18 @@
 .git
 .gitignore
+.cursor
 **/__pycache__
 **/*.pyc
-**/.pytest_cache
+**/*.pyo
+*.db
 .env
-.env.*
-testsprite_tests
-*.md
-.vscode
-.idea
+.venv
+venv
+.streamlit/secrets.toml
+.dockerignore
+terminals
+agent-transcripts
+mcps
+
+# ملفات البيانات المحلية — تُحقن عبر env vars أو Railway Volume
+data/

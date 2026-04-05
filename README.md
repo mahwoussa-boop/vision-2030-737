@@ -129,14 +129,13 @@ https://share.streamlit.io
 
 ### 2️⃣ إضافة Secrets
 ```toml
-# Settings → Secrets — ضع القيم الحقيقية فقط في واجهة Streamlit / Railway / .env المحلي.
-# لا تُرفع مفاتيح أو روابط ويب هوك حقيقية إلى Git. إن وُجدت سابقاً في السجل فاستبدلها ودوّرها في Google AI Studio وMake.
+# Settings → Secrets
 
-GEMINI_API_KEYS = '["your-gemini-api-key-1","your-gemini-api-key-2"]'
+GEMINI_API_KEYS = '["AIzaSyD4PLzzy8GTmqtLtEhTecUKHZ7pPPhtv3s","AIzaSyCzMKz1dcEExSTUoOx-dXFAVaxlgvy1SYo","AIzaSyDQwXq-SqqGiyZzjrQIpDRDjOBr7CfCifY","AIzaSyCM_7dJ-0mq4H81CHBYAIA1MkDbj8lk7Ko"]'
 
-WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/your-update-prices-webhook-path"
+WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/99oljy0d6r3chwg6bdfsptcf6bk8htsd"
 
-WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/your-new-products-webhook-path"
+WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
 ```
 
 ### 3️⃣ جرّب!
