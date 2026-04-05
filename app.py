@@ -124,12 +124,19 @@ if "health_check_done" not in st.session_state:
             "ok": True, "warnings": [], "errors": [], "details": {}
         }
 
-# إظهار أخطاء الفحص الذاتي إن وُجدت (لا يوقف التطبيق)
+# ── تشغيل خيط المجدول التلقائي (مرة واحدة عند أول تشغيل للبيئة) ─────────
+if "scheduler_started" not in st.session_state:
+    try:
+        from scrapers.scheduler import start_scheduler_thread
+        start_scheduler_thread()
+        st.session_state["scheduler_started"] = True
+    except Exception:
+        st.session_state["scheduler_started"] = False
+
+# أخطاء حرجة فقط تُعرض عالمياً (مثل DB تالفة) — التحذيرات تُعرض في الشريط الجانبي
 _hs = st.session_state.get("health_status", {})
 for _hc_err in _hs.get("errors", []):
     st.error(f"⚠️ فحص النظام: {_hc_err}")
-for _hc_warn in _hs.get("warnings", []):
-    st.warning(f"🔔 {_hc_warn}")
 try:
     init_db()
     init_db_v26()
@@ -1521,6 +1528,14 @@ with st.sidebar:
         _all_df = st.session_state.results.get("all", pd.DataFrame())
         if not _all_df.empty:
             render_sidebar_filters(_all_df)
+
+    # ── تحذيرات الفحص الذاتي — في الشريط الجانبي فقط ───────────────────
+    _hs_sb = st.session_state.get("health_status", {})
+    _sb_warns = _hs_sb.get("warnings", [])
+    if _sb_warns:
+        st.sidebar.markdown("---")
+        for _w in _sb_warns:
+            st.sidebar.caption(f"🔔 {_w}")
 
 
 # إشعار خفيف بعد الانتقال من أزرار لوحة التحكم
@@ -2938,12 +2953,15 @@ elif page == "🕷️ كشط المنافسين":
             subprocess.Popen(
                 [
                     _sys_sc.executable, _SCRAPER_SCRIPT,
-                    "--max-products", str(int(st.session_state.get("sc_max_prod", 500))),
-                    "--concurrency",  str(int(st.session_state.get("sc_concurrency", 8))),
+                    "--max-products", str(
+                        0 if st.session_state.get("sc_all_products", True)
+                        else int(st.session_state.get("sc_max_prod", 0))
+                    ),
+                    "--concurrency", str(int(st.session_state.get("sc_concurrency", 8))),
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,  # Orphan process — يبقى حتى لو أُغلق المتصفح أو أُعيد تحميل Streamlit
+                start_new_session=True,
             )
             st.session_state["_sc_started"] = True
         except Exception as _exc:
@@ -3000,14 +3018,132 @@ elif page == "🕷️ كشط المنافسين":
     _prog_now = _load_progress()
     _is_running = bool(_prog_now.get("running", False))
 
-    _sc_col1, _sc_col2 = st.columns(2)
+    _sc_col1, _sc_col2, _sc_col3 = st.columns(3)
     with _sc_col1:
-        st.number_input("أقصى منتجات لكل متجر", 50, 5000, 500, step=50, key="sc_max_prod")
+        st.checkbox(
+            "🔄 جميع المنتجات (بلا سقف)",
+            value=True,
+            key="sc_all_products",
+            help="يكشط كل منتج موجود في Sitemap كل متجر بدون حد أقصى",
+        )
     with _sc_col2:
-        st.number_input("طلبات متزامنة", 2, 20, 8, step=1, key="sc_concurrency")
+        st.number_input(
+            "أقصى منتجات / متجر",
+            0, 50000, 0 if st.session_state.get("sc_all_products", True) else 1000,
+            step=500,
+            key="sc_max_prod",
+            disabled=bool(st.session_state.get("sc_all_products", True)),
+            help="0 = جميع المنتجات بلا سقف",
+        )
+    with _sc_col3:
+        st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="sc_concurrency")
+
+    # ══ جدولة تلقائية ════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("⏰ الجدولة التلقائية (Fire & Forget)")
+
+    import json as _json_sch
+    try:
+        from scrapers.scheduler import (
+            get_scheduler_status, enable_scheduler, disable_scheduler,
+            trigger_now as _trigger_now,
+        )
+        _sch = get_scheduler_status()
+        _sch_enabled = bool(_sch.get("enabled", False))
+        _sch_interval = int(_sch.get("interval_hours", 12))
+        _sch_runs = int(_sch.get("runs_count", 0))
+        _sch_last = str(_sch.get("last_run", "") or "لم يعمل بعد")[:19]
+        _sch_next_label = _sch.get("next_run_label", "—")
+        _sch_ok = True
+    except Exception as _sch_err:
+        _sch_ok = False
+        _sch_enabled = False
+
+    if _sch_ok:
+        _sch_c1, _sch_c2 = st.columns([3, 2])
+        with _sch_c1:
+            if _sch_enabled:
+                st.markdown(
+                    f'<div style="background:#0a2a0a;border:1px solid #00C853;'
+                    f'border-radius:8px;padding:10px 14px">'
+                    f'🤖 <b>الكشط التلقائي مُفعَّل</b><br>'
+                    f'<span style="color:#9e9e9e;font-size:.82rem">'
+                    f'يعمل كل {_sch_interval} ساعة | '
+                    f'التشغيل القادم: <b style="color:#4fc3f7">{_sch_next_label}</b> | '
+                    f'عدد التشغيلات: {_sch_runs}</span></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="background:#1a1a1a;border:1px dashed #555;'
+                    'border-radius:8px;padding:10px 14px">'
+                    '⏸️ <b>الكشط التلقائي معطَّل</b><br>'
+                    '<span style="color:#9e9e9e;font-size:.82rem">'
+                    'فعّله لكشط المنافسين آلياً دون أي تدخل يدوي</span></div>',
+                    unsafe_allow_html=True,
+                )
+        with _sch_c2:
+            st.number_input("تكرار (ساعات)", 1, 168, _sch_interval, step=1,
+                            key="sc_interval_h")
+
+        def _cb_toggle_scheduler():
+            _h = int(st.session_state.get("sc_interval_h", 12))
+            _mp = 0 if st.session_state.get("sc_all_products", True) else int(
+                st.session_state.get("sc_max_prod", 0))
+            if not _sch_enabled:
+                enable_scheduler(interval_hours=_h)
+                st.session_state["_sc_msg"] = (
+                    "success", f"✅ الجدولة مُفعَّلة — كشط كل {_h} ساعة")
+            else:
+                disable_scheduler()
+                st.session_state["_sc_msg"] = ("warning", "⏸️ الجدولة التلقائية مُعطَّلة")
+
+        def _cb_run_now():
+            _mp = 0 if st.session_state.get("sc_all_products", True) else int(
+                st.session_state.get("sc_max_prod", 0))
+            _cc = int(st.session_state.get("sc_concurrency", 8))
+            ok = _trigger_now(max_products=_mp, concurrency=_cc)
+            if ok:
+                st.session_state["_sc_msg"] = ("success", "🚀 تم إطلاق الكشط الآن في الخلفية!")
+            else:
+                st.session_state["_sc_msg"] = ("error", "❌ فشل تشغيل الكاشط")
+
+        _btn_c1, _btn_c2, _btn_c3 = st.columns(3)
+        with _btn_c1:
+            st.button(
+                "⏸️ تعطيل" if _sch_enabled else "▶️ تفعيل الجدولة",
+                on_click=_cb_toggle_scheduler,
+                key="btn_toggle_sched",
+                use_container_width=True,
+                type="primary" if not _sch_enabled else "secondary",
+            )
+        with _btn_c2:
+            st.button(
+                "🚀 تشغيل الآن",
+                on_click=_cb_run_now,
+                key="btn_run_now_sched",
+                use_container_width=True,
+                disabled=_is_running,
+            )
+        with _btn_c3:
+            if _sch_last and _sch_last != "لم يعمل بعد":
+                st.caption(f"آخر تشغيل:\n{_sch_last[:10]}")
+    else:
+        st.caption("⚠️ لا يمكن تحميل وحدة الجدولة")
+
+    # عرض تقدير الحجم
+    st.markdown("---")
+    _stores_count = len(_load_stores())
+    if _stores_count:
+        _limit = int(st.session_state.get("sc_max_prod", 0))
+        _all_flag = bool(st.session_state.get("sc_all_products", True))
+        if _all_flag or _limit == 0:
+            st.info(f"📊 سيتم كشط **جميع المنتجات** من {_stores_count} متجر")
+        else:
+            st.info(f"📊 تقدير: {_stores_count * _limit:,} منتج")
 
     st.button(
-        "🚀 بدء الكشط في الخلفية" if not _is_running else "⏳ الكشط يعمل بالفعل…",
+        "🚀 بدء الكشط يدوياً" if not _is_running else "⏳ الكشط يعمل بالفعل…",
         type="primary",
         on_click=_start_scraper_bg,
         key="btn_start_scraper",
