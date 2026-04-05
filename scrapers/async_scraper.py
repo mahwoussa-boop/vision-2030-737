@@ -52,13 +52,34 @@ COMPETITORS_FILE = _DATA_DIR / "competitors_list.json"
 OUTPUT_CSV       = _DATA_DIR / "competitors_latest.csv"
 PROGRESS_FILE    = _DATA_DIR / "scraper_progress.json"
 LASTMOD_FILE     = _DATA_DIR / "scraper_lastmod_cache.json"
+ERROR_LOG        = _DATA_DIR / "scraper_errors.log"
 
-# ── إعداد logging ──────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+CSV_COLS = ["store", "name", "price", "image", "url", "brand", "sku", "scraped_at"]
+
+# ── إعداد logging (console + ملف خطأ) ────────────────────────────────────
+def _setup_logging() -> None:
+    """يهيئ logging مرة واحدة: console + ERROR_LOG للأخطاء."""
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+    # file handler — يكتب كل شيء (INFO+) في ملف السجل
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(str(ERROR_LOG), encoding="utf-8", mode="a")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception:
+        pass
+
+
+_setup_logging()
 logger = logging.getLogger("scraper")
 
 # ── Regexes للاستخراج ─────────────────────────────────────────────────────
@@ -79,6 +100,50 @@ _PRICE_META_RE = re.compile(
     r'<meta[^>]+(?:itemprop|property)=["\'](?:price|product:price:amount)["\'][^>]+content=["\']([^"\']+)["\']',
     re.I,
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CSV helpers — قراءة/دمج/كتابة مع حفظ البيانات القديمة
+# ══════════════════════════════════════════════════════════════════════════
+def _load_existing_csv() -> Dict[str, Dict[str, Any]]:
+    """يقرأ CSV الموجود ويعيده كـ {url: row_dict} للدمج لاحقاً."""
+    if not OUTPUT_CSV.exists():
+        return {}
+    try:
+        rows: Dict[str, Dict[str, Any]] = {}
+        with OUTPUT_CSV.open(encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                u = (row.get("url") or "").strip()
+                if u:
+                    rows[u] = row
+        return rows
+    except Exception as exc:
+        logger.warning("فشل قراءة CSV القديم: %s", exc)
+        return {}
+
+
+def _write_merged_csv(
+    existing: Dict[str, Dict[str, Any]],
+    new_rows: List[Dict[str, Any]],
+) -> int:
+    """يدمج الصفوف القديمة مع الجديدة (الجديد يكسب عند تعارض الـ URL)،
+    ثم يكتب الكل دفعة واحدة — يعيد عدد الصفوف النهائي."""
+    merged = dict(existing)
+    for row in new_rows:
+        u = (row.get("url") or "").strip()
+        if u:
+            merged[u] = row
+    if not merged:
+        return 0
+    tmp = OUTPUT_CSV.with_suffix(".tmp")
+    with tmp.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CSV_COLS, extrasaction="ignore")
+        writer.writeheader()
+        for row in merged.values():
+            writer.writerow(row)
+    tmp.replace(OUTPUT_CSV)  # atomic rename — لا يمحو الملف القديم إلا بعد نجاح الكتابة
+    return len(merged)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -353,7 +418,7 @@ async def fetch_product(
                 html = None
 
         if not html:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             html = await loop.run_in_executor(None, try_all_sync_fallbacks, url)
 
         progress.update(urls_processed=progress._data["urls_processed"] + 1)
@@ -397,15 +462,21 @@ async def run_scraper(
         len(stores), max_products_per_store, concurrency, incremental,
     )
 
+    # ── سجّل بداية الجلسة في ملف الأخطاء ──
+    logger.info(
+        "═══ بدء جلسة كشط جديدة %s ═══",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
     # Lastmod cache للكشط التزايدي
     lastmod_cache = _load_lastmod_cache() if incremental else {}
 
-    csv_cols = ["store", "name", "price", "image", "url", "brand", "sku", "scraped_at"]
-    csv_fh = OUTPUT_CSV.open("w", newline="", encoding="utf-8-sig")
-    writer = csv.DictWriter(csv_fh, fieldnames=csv_cols, extrasaction="ignore")
-    writer.writeheader()
+    # اقرأ البيانات القديمة قبل أي شيء — لن تُمحى
+    existing_rows = _load_existing_csv()
+    logger.info("سجلات قديمة في CSV: %d", len(existing_rows))
 
     progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
+    all_new_rows: List[Dict[str, Any]] = []
     rows_written = 0
     sem = asyncio.Semaphore(concurrency)
     new_lastmod_cache: Dict[str, str] = {}
@@ -490,34 +561,39 @@ async def run_scraper(
                 result = await coro
                 progress.update(store_urls_done=_url_idx + 1)
                 if result:
-                    writer.writerow(result)
+                    all_new_rows.append(result)
                     rows_written += 1
                     _store_rows += 1
+                    # كتابة تدريجية آمنة كل 50 منتج (تحفظ دون حذف القديم)
                     if rows_written % 50 == 0:
-                        csv_fh.flush()
-                        progress.update(rows_in_csv=rows_written)
+                        _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
+                        progress.update(rows_in_csv=_total_so_far)
 
             _res = dict(progress._data.get("stores_results") or {})
             _res[domain] = _store_rows
+            _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
             progress.update(
                 stores_done=progress._data["stores_done"] + 1,
-                rows_in_csv=rows_written,
+                rows_in_csv=_total_so_far,
                 stores_results=_res,
                 store_urls_done=0,
                 store_urls_total=0,
             )
-            logger.info("  ✓ %s — %d منتج", domain, _store_rows)
+            logger.info("  ✓ %s — %d منتج جديد | إجمالي CSV: %d", domain, _store_rows, _total_so_far)
 
-    csv_fh.close()
+    # كتابة نهائية شاملة
+    total_csv = _write_merged_csv(existing_rows, all_new_rows)
 
     # حفظ الـ lastmod cache
     if incremental:
-        merged = {**lastmod_cache, **new_lastmod_cache}
-        _save_lastmod_cache(merged)
+        _save_lastmod_cache({**lastmod_cache, **new_lastmod_cache})
 
-    progress.done(rows_written)
-    logger.info("اكتمل الكشط — %d منتج في %s", rows_written, OUTPUT_CSV)
-    return rows_written
+    progress.done(total_csv)
+    logger.info(
+        "اكتمل الكشط — %d جديد، %d إجمالي في %s",
+        rows_written, total_csv, OUTPUT_CSV,
+    )
+    return total_csv
 
 
 # ══════════════════════════════════════════════════════════════════════════
