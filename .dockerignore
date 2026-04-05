@@ -13,3 +13,6 @@ venv
 terminals
 agent-transcripts
 mcps
+
+# ملفات البيانات المحلية — تُحقن عبر env vars أو Railway Volume
+data/

@@ -57,9 +57,12 @@ from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             fetch_page_title_from_url)
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
+                                trigger_price_update,
                                 verify_webhook_connection, export_to_make_format,
                                 send_batch_smart)
 from utils.salla_shamel_export import export_to_salla_shamel
+from utils.filter_ui import (render_sidebar_filters, apply_global_filters,
+                              get_active_filter_summary)
 from utils.data_helpers import (safe_results_for_json, restore_results_from_json,
                                 ts_badge, decision_badge,
                                 row_media_urls_from_analysis,
@@ -113,8 +116,9 @@ _defaults = {
     "decisions_pending": {},   # {product_name: action}
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
-    "nav_flash": None,  # رسالة قصيرة بعد الانتقال من أزرار لوحة التحكم
-    "last_audit_stats": None,  # آخر عدادات تدقيق من run_full_analysis
+    "nav_flash": None,    # رسالة انتقال سريعة من أزرار لوحة التحكم
+    "last_audit_stats": None,  # عدادات تدقيق من run_full_analysis
+    "_action_toast": None, # رسالة نجاح/فشل Callback تُعرض كـ toast
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -123,6 +127,12 @@ for k, v in _defaults.items():
 # تحميل المنتجات المخفية من قاعدة البيانات عند كل تشغيل
 _db_hidden = get_hidden_product_keys()
 st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
+
+# تنقل من أزرار لوحة التحكم — يُطبَّق هنا قبل `st.radio(..., key="main_nav")` في الشريط الجانبي
+# (Streamlit يمنع تعيين st.session_state.main_nav بعد إنشاء الودجت في نفس التشغيل)
+_nav_apply = st.session_state.pop("_nav_pending", None)
+if _nav_apply and _nav_apply in SECTIONS:
+    st.session_state.main_nav = _nav_apply
 
 # ════════════════════════════════════════════════
 #  دوال المعالجة — يجب تعريفها قبل استخدامها
@@ -389,19 +399,22 @@ def _render_audit_bar(audit_stats: dict):
     ti = int(audit_stats.get("total_input") or 0)
     pr = int(audit_stats.get("processed") or 0)
     nc = int(audit_stats.get("no_competitor_found") or 0)
+    se = int(audit_stats.get("skipped_empty") or 0)
     sk = int(audit_stats.get("skipped_samples") or 0)
-    tot = pr + nc + sk
+    tot = pr + nc + se + sk
     st.markdown(
         f"""
-    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px;
         background:#2c3e50;color:#fff;padding:15px;border-radius:8px;margin-bottom:16px;">
-        <div style="text-align:center;flex:1;min-width:100px;"><strong>📦 إجمالي المدخلات</strong><br>
+        <div style="text-align:center;flex:1;min-width:88px;"><strong>📦 إجمالي المدخلات</strong><br>
             <span style="font-size:1.5rem;">{ti}</span></div>
-        <div style="text-align:center;flex:1;min-width:100px;"><strong>✅ وُجد منافس (مطابقة)</strong><br>
+        <div style="text-align:center;flex:1;min-width:88px;"><strong>✅ وُجد منافس</strong><br>
             <span style="font-size:1.5rem;color:#4caf50;">{pr}</span></div>
-        <div style="text-align:center;flex:1;min-width:100px;"><strong>⚪ لم يُعثر على منافس</strong><br>
+        <div style="text-align:center;flex:1;min-width:88px;"><strong>⚪ لا منافس</strong><br>
             <span style="font-size:1.5rem;color:#ff9800;">{nc}</span></div>
-        <div style="text-align:center;flex:1;min-width:100px;"><strong>🚫 مستبعد (عينة / حجم &lt;10مل)</strong><br>
+        <div style="text-align:center;flex:1;min-width:88px;"><strong>👻 صفوف فارغة</strong><br>
+            <span style="font-size:1.5rem;color:#9e9e9e;">{se}</span></div>
+        <div style="text-align:center;flex:1;min-width:88px;"><strong>🚫 عينة / &lt;10مل</strong><br>
             <span style="font-size:1.5rem;color:#e53935;">{sk}</span></div>
     </div>
     """,
@@ -410,7 +423,7 @@ def _render_audit_bar(audit_stats: dict):
     if ti > 0 and tot != ti:
         st.error(
             f"🚨 تحذير تدقيق: المدخلات ({ti}) لا تساوي مجموع الحالات ({tot}) — "
-            f"معالج={pr} + بدون منافس={nc} + مستبعد={sk}."
+            f"معالج={pr} + بدون منافس={nc} + فارغ={se} + عينة/صغير={sk}."
         )
 
 
@@ -684,6 +697,91 @@ def _processed_row_url_chips_html(our_url: str, comp_url: str) -> str:
 
 
 # ════════════════════════════════════════════════
+#  Callbacks — أحداث الأزرار التفاعلية (Event-Driven)
+#  تُعرَّف هنا (خارج حلقة الرسم) حتى تتوافق مع on_click.
+#  ضمان: تُنفَّذ مرة واحدة بالضبط عند كل نقرة، والحالة تُحدَّث
+#  تلقائياً قبل إعادة رسم الصفحة — بدون st.rerun() صريح.
+# ════════════════════════════════════════════════
+def _cb_send_make(
+    prefix: str, idx,
+    our_name: str, comp_name: str,
+    our_price: float, comp_price: float, diff: float,
+    decision: str, comp_src: str, pid: str, comp_url: str,
+) -> None:
+    """
+    Callback: إرسال تحديث سعر واحد إلى Make.com عبر on_click.
+    يقرأ السعر المستهدف من st.session_state لضمان القراءة اللحظية.
+    """
+    _price_key = f"target_price_{prefix}_{idx}"
+    _tp = float(st.session_state.get(_price_key, 0) or 0)
+    if _tp <= 0:
+        st.session_state[f"_act_{prefix}_{idx}"] = (
+            "error", "❌ السعر يجب أن يكون أكبر من صفر"
+        )
+        return
+
+    _ok = trigger_price_update(
+        pid, _tp, comp_url,
+        name=our_name,
+        comp_name=comp_name,
+        comp_price=comp_price,
+        diff=diff,
+        decision=decision,
+        competitor=comp_src,
+    )
+
+    _hk = f"{prefix}_{our_name}_{idx}"
+    if _ok:
+        st.session_state.hidden_products.add(_hk)
+        try:
+            save_hidden_product(_hk, our_name, "sent_to_make")
+            save_processed(
+                _hk, our_name, comp_src, "send_price",
+                old_price=our_price, new_price=_tp, product_id=pid,
+                notes=f"Make ← {prefix} | {comp_src} | {comp_price:.0f}→{_tp:.0f}ر.س",
+            )
+        except Exception:
+            pass
+        # toast يُعرض على مستوى الصفحة بعد إعادة الرسم
+        st.session_state["_action_toast"] = (
+            "success", f"✅ تم إرسال «{our_name}» ← {_tp:,.0f} ر.س"
+        )
+    else:
+        st.session_state[f"_act_{prefix}_{idx}"] = (
+            "error", "❌ فشل الإرسال — تحقق من الـ Webhook أو البيانات."
+        )
+
+
+def _cb_exclude(
+    prefix: str, idx,
+    our_name: str, our_price: float,
+    comp_price: float, diff: float,
+    comp_src: str, pid: str,
+) -> None:
+    """Callback: استبعاد المنتج وحفظه في DB عبر on_click."""
+    st.session_state[f"excluded_{prefix}_{idx}"] = True
+    st.session_state.hidden_products.add(f"{prefix}_{our_name}_{idx}")
+    st.session_state.decisions_pending[our_name] = {
+        "action": "removed", "reason": "استبعاد",
+        "our_price": our_price, "comp_price": comp_price,
+        "diff": diff, "competitor": comp_src,
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    try:
+        _hk = f"{prefix}_{our_name}_{idx}"
+        log_decision(our_name, prefix, "removed", "استبعاد",
+                     our_price, comp_price, diff, comp_src)
+        save_hidden_product(_hk, our_name, "removed")
+        save_processed(
+            _hk, our_name, comp_src, "removed",
+            old_price=our_price, new_price=our_price, product_id=pid,
+            notes=f"استبعاد من {prefix}",
+        )
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════
 #  مكوّن جدول المقارنة البصري (مشترك)
 # ════════════════════════════════════════════════
 def render_pro_table(df, prefix, section_type="update", show_search=True,
@@ -691,12 +789,20 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
     """
     جدول احترافي بصري مع:
     - فلاتر ذكية (مكشوفة في شبكة أو داخل Expander)
-    - أزرار AI + قرار لكل منتج
+    - أزرار AI + قرار لكل منتج (Event-Driven via on_click)
     - تصدير Make
     - Pagination
     """
     if df is None or df.empty:
         st.info("لا توجد منتجات")
+        return
+
+    # ── تطبيق الفلاتر العالمية (Global Quick-Filters من الشريط الجانبي) ──
+    df = apply_global_filters(df)
+    if df.empty:
+        _gf_sum = get_active_filter_summary()
+        st.info(f"لا توجد منتجات تطابق الفلاتر الحالية ({_gf_sum})" if _gf_sum
+                else "لا توجد منتجات")
         return
 
     # ── فلاتر ─────────────────────────────────
@@ -841,6 +947,8 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
         _hide_key = f"{prefix}_{our_name}_{idx}"
         if _hide_key in st.session_state.hidden_products:
             continue
+        if prefix in ("raise", "lower") and st.session_state.get(f"excluded_{prefix}_{idx}"):
+            continue
         comp_name  = str(row.get("منتج_المنافس", "—"))
         our_price  = safe_float(row.get("السعر", 0))
         comp_price = safe_float(row.get("سعر_المنافس", 0))
@@ -921,78 +1029,76 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
         if isinstance(all_comps, list) and len(all_comps) > 0:
             st.markdown(comp_strip(all_comps), unsafe_allow_html=True)
 
-        # ── أزرار لكل منتج (شريط إجراءات منفصل لسعر أعلى / فرصة رفع) ─────
-        _auto_price = round(comp_price - 1, 2) if comp_price > 0 else our_price
+        # ── شريط الإجراءات التفاعلي (Event-Driven via on_click) ─────────
         if prefix in ("raise", "lower"):
-            prc_col, hint_col = st.columns([1, 4])
-            with prc_col:
-                _custom_price = st.number_input(
-                    "سعر", value=float(_auto_price), min_value=0.0,
-                    step=1.0, key=f"cp_{prefix}_{idx}",
-                    label_visibility="collapsed"
+            st.write("")
+            _suggested = float(comp_price) - 1.0 if comp_price > 0 else float(our_price)
+            if _suggested <= 0:
+                _suggested = float(our_price)
+
+            # pid يُحسب هنا لأنه مطلوب كـ arg للـ Callbacks
+            _pid_cb_raw = (
+                row.get("معرف_المنتج", "") or row.get("product_id", "")
+                or row.get("رقم المنتج", "") or row.get("رقم_المنتج", "")
+                or row.get("معرف المنتج", "") or ""
+            )
+            try:
+                _fv_cb = float(_pid_cb_raw)
+                _pid_cb = str(int(_fv_cb)) if _fv_cb == int(_fv_cb) else str(_pid_cb_raw)
+            except (ValueError, TypeError):
+                _pid_cb = str(_pid_cb_raw).strip()
+            if _pid_cb in ("nan", "None", "NaN", ""):
+                _pid_cb = ""
+
+            _comp_url_make = (_comp_url_v or str(row.get("رابط_المنافس", "") or "")).strip()
+
+            act_col1, act_col2, act_col3, _act_sp = st.columns([2.5, 2.5, 2, 4])
+            with act_col1:
+                st.number_input(
+                    "🎯 السعر المستهدف (ر.س)",
+                    value=float(_suggested),
+                    min_value=0.0,
+                    step=1.0,
+                    key=f"target_price_{prefix}_{idx}",
                 )
-            with hint_col:
-                st.caption("اضبط السعر المستهدف ثم استخدم «تحديث السعر» لإرساله إلى Make.com")
-            col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 3])
-            with col_btn1:
-                if st.button("🚀 تحديث السعر", key=f"update_{prefix}_{idx}"):
-                    _pid_raw = (
-                        row.get("معرف_المنتج", "") or
-                        row.get("product_id", "") or
-                        row.get("رقم المنتج", "") or
-                        row.get("رقم_المنتج", "") or
-                        row.get("معرف المنتج", "") or ""
-                    )
-                    try:
-                        _fv = float(_pid_raw)
-                        _pid = str(int(_fv)) if _fv == int(_fv) else str(_pid_raw)
-                    except (ValueError, TypeError):
-                        _pid = str(_pid_raw).strip()
-                    if _pid in ("nan", "None", "NaN", ""):
-                        _pid = ""
-                    _final_price = _custom_price if _custom_price > 0 else _auto_price
-                    res = send_single_product({
-                        "product_id": _pid,
-                        "name": our_name, "price": _final_price,
-                        "comp_name": comp_name, "comp_price": comp_price,
-                        "diff": diff, "decision": decision, "competitor": comp_src
-                    })
-                    if res["success"]:
-                        _hk = f"{prefix}_{our_name}_{idx}"
-                        st.session_state.hidden_products.add(_hk)
-                        save_hidden_product(_hk, our_name, "sent_to_make")
-                        save_processed(_hk, our_name, comp_src, "send_price",
-                                       old_price=our_price, new_price=_final_price,
-                                       product_id=_pid,
-                                       notes=f"Make ← {prefix} | منافس: {comp_src} | {comp_price:.0f}→{_final_price:.0f}ر.س")
-                        st.rerun()
-            with col_btn2:
-                if st.button("🗑️ استبعاد", key=f"ignore_{prefix}_{idx}"):
-                    st.session_state.decisions_pending[our_name] = {
-                        "action": "removed", "reason": "استبعاد",
-                        "our_price": our_price, "comp_price": comp_price,
-                        "diff": diff, "competitor": comp_src,
-                        "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    }
-                    log_decision(our_name, prefix, "removed",
-                                 "استبعاد", our_price, comp_price, diff, comp_src)
-                    _hk = f"{prefix}_{our_name}_{idx}"
-                    st.session_state.hidden_products.add(_hk)
-                    save_hidden_product(_hk, our_name, "removed")
-                    save_processed(_hk, our_name, comp_src, "removed",
-                                   old_price=our_price, new_price=our_price,
-                                   product_id=str(row.get("معرف_المنتج", "")),
-                                   notes=f"استبعاد من {prefix}")
-                    st.rerun()
-            with col_btn3:
-                st.empty()
-            if _vs_compact:
-                st.markdown(
-                    '<hr style="border:none;border-top:1px solid #2a2a3d;margin:4px 0 8px">',
-                    unsafe_allow_html=True,
+            with act_col2:
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                st.button(
+                    "🚀 تحديث السعر (Make)",
+                    key=f"send_make_{prefix}_{idx}",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_cb_send_make,
+                    args=(
+                        prefix, idx, our_name, comp_name,
+                        our_price, comp_price, diff,
+                        decision, comp_src, _pid_cb, _comp_url_make,
+                    ),
                 )
-            else:
-                st.markdown("---")
+            with act_col3:
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                st.button(
+                    "🗑️ استبعاد",
+                    key=f"reject_bar_{prefix}_{idx}",
+                    use_container_width=True,
+                    on_click=_cb_exclude,
+                    args=(
+                        prefix, idx, our_name, our_price,
+                        comp_price, diff, comp_src, _pid_cb,
+                    ),
+                )
+            # عرض نتيجة الإجراء (خطأ فقط؛ النجاح يُعرض كـ toast أعلى الصفحة)
+            _act_res = st.session_state.pop(f"_act_{prefix}_{idx}", None)
+            if _act_res:
+                _atype, _amsg = _act_res
+                st.error(_amsg) if _atype == "error" else st.success(_amsg)
+
+            _hr_act = (
+                '<hr style="border:none;border-top:1px solid #2a2a3d;margin:10px 0 14px">'
+                if _vs_compact
+                else "<hr style='margin:16px 0;border-top:2px dashed rgba(238,238,238,.25);'>"
+            )
+            st.markdown(_hr_act, unsafe_allow_html=True)
 
         if prefix in ("raise", "lower"):
             b1, b2, b3, b4, b8, b9 = st.columns([1, 1, 1, 1, 1, 1])
@@ -1225,14 +1331,21 @@ with st.sidebar:
     st.markdown(f"## {APP_ICON} {APP_TITLE}")
     st.caption(f"الإصدار {APP_VERSION}")
 
-    # حالة AI — تشخيص مفصل
-    ai_ok = bool(GEMINI_API_KEYS)
+    # حالة AI — أي مزود (Gemini و/أو OpenRouter و/أو Cohere) يكفي للمسار الهجين
+    ai_ok = ANY_AI_PROVIDER_CONFIGURED
     if ai_ok:
         ai_color = "#00C853"
-        ai_label = f"🤖 Gemini ✅ ({len(GEMINI_API_KEYS)} مفتاح)"
+        _ai_bits = []
+        if GEMINI_API_KEYS:
+            _ai_bits.append(f"Gemini×{len(GEMINI_API_KEYS)}")
+        if (OPENROUTER_API_KEY or "").strip():
+            _ai_bits.append("OpenRouter")
+        if (COHERE_API_KEY or "").strip():
+            _ai_bits.append("Cohere")
+        ai_label = f"🤖 {' · '.join(_ai_bits)} ✅"
     else:
         ai_color = "#FF1744"
-        ai_label = "🔴 AI غير متصل — تحقق من Secrets"
+        ai_label = "🔴 AI غير متصل — أضف مفتاحاً (Gemini أو OpenRouter أو Cohere)"
 
     st.markdown(
         f'<div style="background:{ai_color}22;border:1px solid {ai_color};'
@@ -1253,10 +1366,11 @@ with st.sidebar:
                 return v[:8] + "…" + v[-4:]
 
             st.info(
-                "على **Railway / Docker**: أضف المتغير `GEMINI_API_KEY` أو `GEMINI_API_KEYS` "
-                "في إعدادات الخدمة → Variables (لا يعتمد التطبيق على ملف secrets.toml هناك)."
+                "على **Railway / Docker**: أضف **أحد** المسارات: `GEMINI_API_KEY` / `GEMINI_API_KEYS` "
+                "أو **`OPENROUTER_API_KEY`** أو **`COHERE_API_KEY`** في Variables للخدمة "
+                "(لا يعتمد التطبيق على ملف secrets.toml هناك). المحرك يجرّب Gemini ثم OpenRouter ثم Cohere."
             )
-            st.write("**متغيرات البيئة ذات الصلة:**")
+            st.write("**متغيرات البيئة — Gemini:**")
             _any = False
             for key_name in (
                 "GEMINI_API_KEYS",
@@ -1271,11 +1385,23 @@ with st.sidebar:
                     st.success(f"✅ `{key_name}` = `{_mask(raw)}` (طول {len(raw)})")
                 else:
                     st.caption(f"— `{key_name}` غير مضبوط")
-            st.write(f"**ما يقرأه التطبيق الآن:** `{len(GEMINI_API_KEYS)}` مفتاحاً فعّالاً")
+            st.write("**متغيرات البيئة — بدائل (كافية بدون Gemini):**")
+            for key_name in ("OPENROUTER_API_KEY", "OPENROUTER_KEY", "COHERE_API_KEY"):
+                raw = os.environ.get(key_name, "")
+                if raw:
+                    _any = True
+                    st.success(f"✅ `{key_name}` = `{_mask(raw)}` (طول {len(raw)})")
+                else:
+                    st.caption(f"— `{key_name}` غير مضبوط")
+            st.write(
+                f"**ما يقرأه التطبيق:** Gemini={len(GEMINI_API_KEYS)} | "
+                f"OpenRouter={'نعم' if (OPENROUTER_API_KEY or '').strip() else 'لا'} | "
+                f"Cohere={'نعم' if (COHERE_API_KEY or '').strip() else 'لا'}"
+            )
             if not _any:
                 st.warning(
-                    "لم يُعثر على أي مفتاح في البيئة. أنشئ مفتاحاً من Google AI Studio "
-                    "وأضف `GEMINI_API_KEY` في Railway ثم أعد النشر."
+                    "لم يُعثر على أي مفتاح. إما مفتاح **Google AI Studio** (`GEMINI_API_KEY`) "
+                    "أو مفتاح **OpenRouter** (`OPENROUTER_API_KEY`) — الأخير يكفي لتشغيل مسار الـ fallback."
                 )
             st.write("**Streamlit secrets (اختياري — Streamlit Cloud فقط):**")
             try:
@@ -1362,6 +1488,12 @@ with st.sidebar:
                     f'font-size:.8rem">📦 {pending_cnt} قرار معلق</div>',
                     unsafe_allow_html=True)
 
+    # ── فلاتر سريعة عالمية في نهاية الشريط الجانبي ──
+    if st.session_state.results:
+        _all_df = st.session_state.results.get("all", pd.DataFrame())
+        if not _all_df.empty:
+            render_sidebar_filters(_all_df)
+
 
 # إشعار خفيف بعد الانتقال من أزرار لوحة التحكم
 if st.session_state.get("nav_flash"):
@@ -1371,6 +1503,17 @@ if st.session_state.get("nav_flash"):
             st.toast(_nf, icon="⏳")
         else:
             st.info(_nf)
+
+# Toast نتائج Callbacks (إرسال Make / فشل)
+_at = st.session_state.pop("_action_toast", None)
+if _at:
+    _at_type, _at_msg = _at
+    if hasattr(st, "toast"):
+        st.toast(_at_msg, icon="✅" if _at_type == "success" else "❌")
+    elif _at_type == "success":
+        st.success(_at_msg)
+    else:
+        st.error(_at_msg)
 
 
 # ════════════════════════════════════════════════
@@ -1415,7 +1558,7 @@ if page == "📊 لوحة التحكم":
                     use_container_width=True,
                     help=f"انتقل إلى {sec_title}",
                 ):
-                    st.session_state.main_nav = sec_title
+                    st.session_state._nav_pending = sec_title
                     st.session_state.nav_flash = f"➡️ {sec_title}"
                     st.rerun()
 
@@ -2647,6 +2790,11 @@ elif page == "⚙️ الإعدادات":
 
     with tab1:
         # ── الحالة الحالية ────────────────────────────────────────────────
+        st.success(
+            "✅ **مسار AI جاهز** (Gemini و/أو OpenRouter و/أو Cohere)"
+            if ANY_AI_PROVIDER_CONFIGURED
+            else "❌ **لا يوجد أي مزود** — أضف مفتاحاً على الأقل"
+        )
         gemini_s = f"✅ {len(GEMINI_API_KEYS)} مفتاح" if GEMINI_API_KEYS else "❌ لا توجد مفاتيح"
         or_s     = "✅ مفعل" if OPENROUTER_API_KEY else "❌ غير موجود"
         co_s     = "✅ مفعل" if COHERE_API_KEY else "❌ غير موجود"

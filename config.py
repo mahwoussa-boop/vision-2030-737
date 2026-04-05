@@ -97,6 +97,23 @@ OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
 COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
+
+def any_ai_provider_configured() -> bool:
+    """
+    True إذا وُجد مفتاح لأي مزود يدعمه المحرك (Gemini مباشرة، أو OpenRouter، أو Cohere).
+    على Railway يكفي OPENROUTER_API_KEY بدون GEMINI_* — المسارات تتدرج تلقائياً في ai_engine.
+    """
+    if GEMINI_API_KEYS:
+        return True
+    if (OPENROUTER_API_KEY or "").strip():
+        return True
+    if (COHERE_API_KEY or "").strip():
+        return True
+    return False
+
+
+ANY_AI_PROVIDER_CONFIGURED = any_ai_provider_configured()
+
 # ══════════════════════════════════════════════
 #  Make Webhooks
 # ══════════════════════════════════════════════

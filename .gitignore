@@ -3,3 +3,9 @@ __pycache__/
 *.pyo
 *.db
 .streamlit/secrets.toml
+
+# ملفات البيانات المحلية — لا تُرفع لـ GitHub أبداً
+# يتم نقلها لـ Railway عبر متغيرات البيئة (Base64) أو Railway Volume
+data/
+*.csv
+*.json
