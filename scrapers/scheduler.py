@@ -97,22 +97,29 @@ def disable_scheduler() -> None:
     logger.info("المجدول مُعطَّل")
 
 
-def trigger_now(max_products: int = 0, concurrency: int = 8) -> bool:
+def trigger_now(max_products: int = 0, concurrency: int = 8, full: bool = False) -> bool:
     """
     يُشغّل الكاشط فوراً كـ Orphan Process.
     يُحدِّث next_run في الحالة.
+    full=True → يتخطى lastmod cache ويكشط كل شيء.
     """
     if not _SCRAPER_SCRIPT.exists():
         logger.error("الكاشط غير موجود: %s", _SCRAPER_SCRIPT)
         return False
     try:
+        cmd = [
+            sys.executable, "-m", "scrapers.async_scraper",
+            "--max-products", str(max_products),
+            "--concurrency", str(concurrency),
+        ]
+        if full:
+            cmd.append("--full")
         subprocess.Popen(
-            [sys.executable, str(_SCRAPER_SCRIPT),
-             "--max-products", str(max_products),
-             "--concurrency", str(concurrency)],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            cwd=str(_ROOT),
         )
         state = _load_state()
         state["last_run"]    = datetime.utcnow().isoformat()
