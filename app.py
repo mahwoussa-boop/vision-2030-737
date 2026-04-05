@@ -1,5 +1,6 @@
 """
 app.py - نظام التسعير الذكي مهووس v26.0
+# SYSTEM STATUS: LOCKED & AUTONOMOUS — Fire and Forget Mode
 ✅ معالجة خلفية مع حفظ تلقائي
 ✅ جداول مقارنة بصرية في كل الأقسام
 ✅ أزرار AI + قرارات لكل منتج
@@ -12,6 +13,8 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ تاريخ جميل لكل العمليات
 ✅ محرك أتمتة ذكي مع قواعد تسعير قابلة للتخصيص (v26.0)
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
+✅ محرك كشط غير متزامن (Async Scraper + Detached Process)
+✅ فحص ذاتي عند الإقلاع (Health Check)
 """
 import html
 import streamlit as st
@@ -102,6 +105,31 @@ st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON,
                    layout="wide", initial_sidebar_state="expanded")
 st.markdown(get_styles(), unsafe_allow_html=True)
 st.markdown(get_sidebar_toggle_js(), unsafe_allow_html=True)
+
+# ── فحص ذاتي عند الإقلاع (يعمل مرة واحدة فقط لكل جلسة) ────────────────
+if "health_check_done" not in st.session_state:
+    try:
+        from utils.health_check import run_system_diagnostics
+        _hc = run_system_diagnostics()
+        st.session_state["health_check_done"] = True
+        st.session_state["health_status"] = {
+            "ok": _hc.ok,
+            "warnings": _hc.warnings,
+            "errors":   _hc.errors,
+            "details":  _hc.details,
+        }
+    except Exception as _hce:
+        st.session_state["health_check_done"] = True
+        st.session_state["health_status"] = {
+            "ok": True, "warnings": [], "errors": [], "details": {}
+        }
+
+# إظهار أخطاء الفحص الذاتي إن وُجدت (لا يوقف التطبيق)
+_hs = st.session_state.get("health_status", {})
+for _hc_err in _hs.get("errors", []):
+    st.error(f"⚠️ فحص النظام: {_hc_err}")
+for _hc_warn in _hs.get("warnings", []):
+    st.warning(f"🔔 {_hc_warn}")
 try:
     init_db()
     init_db_v26()
@@ -1594,7 +1622,8 @@ if page == "📊 لوحة التحكم":
                     data=excel_all, file_name="mahwous_all.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with cc2:
-            if st.button("📤 إرسال كل شيء لـ Make (دفعات ذكية)"):
+            if st.button("📤 إرسال كل شيء لـ Make (دفعات ذكية)",
+                         key="dash_send_all_make"):
                 _prog_all = st.progress(0, text="جاري الإرسال...")
                 _status_all = st.empty()
                 _sent_total = 0
@@ -1641,12 +1670,60 @@ if page == "📊 لوحة التحكم":
         type=["csv", "xlsx", "xls"],
         key="dash_our_file",
     )
-    comp_files = st.file_uploader(
-        "🏪 ملفات المنافسين (متعدد)",
-        type=["csv", "xlsx", "xls"],
-        accept_multiple_files=True,
-        key="dash_comp_files",
+
+    # ── جسر الكشط التلقائي (Auto-Scraper Bridge) ─────────────────────────
+    import os as _os_dash
+    _AUTO_CSV = _os_dash.path.join(
+        _os_dash.environ.get("DATA_DIR", "data"), "competitors_latest.csv"
     )
+    _auto_available = _os_dash.path.exists(_AUTO_CSV)
+    _auto_rows = 0   # ← يُهيَّأ دائماً لمنع NameError إذا تغيّرت حالة الملف بين reruns
+
+    if _auto_available:
+        _auto_rows = 0
+        try:
+            with open(_AUTO_CSV, encoding="utf-8-sig") as _af:
+                _auto_rows = sum(1 for _ in _af) - 1
+        except Exception:
+            pass
+        st.markdown(
+            f'<div style="background:#0a2a0a;border:1px solid #00C853;border-radius:8px;'
+            f'padding:10px 14px;margin:6px 0;font-size:.88rem">'
+            f'🤖 <b>بيانات الكشط التلقائي جاهزة</b> — '
+            f'{_auto_rows:,} منتج من المنافسين<br>'
+            f'<span style="color:#9e9e9e;font-size:.78rem">'
+            f'استخدمها مباشرةً بدلاً من رفع ملف يدوي</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div style="background:#1a1a1a;border:1px dashed #555;border-radius:8px;'
+            'padding:8px 14px;margin:6px 0;font-size:.82rem;color:#888">'
+            '🤖 البيانات التلقائية غير متوفرة بعد — '
+            '<a href="#" style="color:#4fc3f7">اذهب لصفحة الكشط</a> لتشغيل المحرك</div>',
+            unsafe_allow_html=True,
+        )
+
+    _use_auto = st.checkbox(
+        "🤖 استخدام بيانات الكشط التلقائي من المنافسين",
+        value=bool(st.session_state.pop("_use_auto_scraper", False)) and _auto_available,
+        disabled=not _auto_available,
+        key="dash_use_auto_scraper",
+        help="يستخدم الملف المُنتج تلقائياً من محرك الكشط بدلاً من رفع ملف يدوياً",
+    )
+
+    if not _use_auto:
+        comp_files = st.file_uploader(
+            "🏪 ملفات المنافسين (متعدد)",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            key="dash_comp_files",
+        )
+    else:
+        comp_files = None  # غير مستخدم عند التحميل التلقائي
+        st.success(
+            f"✅ سيُستخدم الملف الآلي: `{_AUTO_CSV}` ({_auto_rows:,} منتج)"
+        )
 
     if our_file is not None:
         try:
@@ -1689,8 +1766,12 @@ if page == "📊 لوحة التحكم":
         )
 
     if st.button("🚀 بدء التحليل", type="primary", key="dash_btn_start_analysis"):
-        if not our_file or not comp_files:
-            st.warning("⚠️ ارفع ملف منتجاتنا وملف منافس واحد على الأقل")
+        # ── حارس المدخلات (يدعم الوضعين: يدوي وتلقائي) ──────────────────
+        _auto_mode = bool(st.session_state.get("dash_use_auto_scraper")) and _auto_available
+        if not our_file:
+            st.warning("⚠️ ارفع ملف منتجاتنا أولاً")
+        elif not _auto_mode and not comp_files:
+            st.warning("⚠️ ارفع ملف منافس واحد على الأقل، أو فعّل الكشط التلقائي")
         else:
             _prep_ok = False
             our_df = None
@@ -1707,15 +1788,25 @@ if page == "📊 لوحة التحكم":
                         our_df = our_df.head(int(max_rows))
 
                     comp_dfs = {}
-                    for _ci, cf in enumerate(comp_files):
-                        cdf, cerr = read_file(cf)
-                        if cerr:
-                            st.warning(f"⚠️ {cf.name}: {cerr}")
-                        else:
-                            cdf = apply_user_column_map(
-                                cdf, **_effective_column_map(cdf, f"dash_map_comp_{_ci}")
-                            )
-                            comp_dfs[cf.name] = cdf
+                    if _auto_mode:
+                        # ── وضع الكشط التلقائي: تحميل CSV من القرص ────────
+                        try:
+                            _auto_df = pd.read_csv(_AUTO_CSV, encoding="utf-8-sig")
+                            comp_dfs["competitors_latest.csv"] = _auto_df
+                            st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج")
+                        except Exception as _ae:
+                            st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
+                    else:
+                        # ── وضع الرفع اليدوي ─────────────────────────────
+                        for _ci, cf in enumerate(comp_files):
+                            cdf, cerr = read_file(cf)
+                            if cerr:
+                                st.warning(f"⚠️ {cf.name}: {cerr}")
+                            else:
+                                cdf = apply_user_column_map(
+                                    cdf, **_effective_column_map(cdf, f"dash_map_comp_{_ci}")
+                                )
+                                comp_dfs[cf.name] = cdf
 
                     if not comp_dfs:
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
@@ -2775,6 +2866,239 @@ elif page == "⚡ أتمتة Make":
                     st.rerun()
         else:
             st.info("لا توجد قرارات معلقة")
+
+
+# ════════════════════════════════════════════════
+#  11. كشط المنافسين (Async Scraper Dashboard)
+# ════════════════════════════════════════════════
+elif page == "🕷️ كشط المنافسين":
+    import subprocess
+    import sys as _sys_sc
+    import os as _os_scraper
+
+    st.header("🕷️ كشط بيانات المنافسين")
+    db_log("scraper", "view")
+
+    _SCRAPER_SCRIPT   = _os_scraper.path.join("scrapers", "async_scraper.py")
+    _DATA_SC          = _os_scraper.environ.get("DATA_DIR", "data")
+    _PROGRESS_FILE    = _os_scraper.path.join(_DATA_SC, "scraper_progress.json")
+    _OUTPUT_CSV       = _os_scraper.path.join(_DATA_SC, "competitors_latest.csv")
+    _COMPETITORS_FILE = _os_scraper.path.join(_DATA_SC, "competitors_list.json")
+
+    import json as _json_sc
+
+    def _load_stores() -> list:
+        try:
+            return _json_sc.loads(open(_COMPETITORS_FILE, encoding="utf-8").read())
+        except Exception:
+            return []
+
+    def _save_stores(lst: list) -> None:
+        _os_scraper.makedirs(_DATA_SC, exist_ok=True)
+        open(_COMPETITORS_FILE, "w", encoding="utf-8").write(
+            _json_sc.dumps(lst, ensure_ascii=False, indent=2)
+        )
+
+    def _load_progress() -> dict:
+        try:
+            return _json_sc.loads(open(_PROGRESS_FILE, encoding="utf-8").read())
+        except Exception:
+            return {"running": False}
+
+    # ══ Callbacks ══════════════════════════════════════════════════════════
+    def _cb_add_store():
+        url = (st.session_state.get("sc_new_url") or "").strip()
+        if not url:
+            return
+        lst = _load_stores()
+        # تطبيع الرابط
+        if not url.startswith("http"):
+            url = "https://" + url
+        if url not in lst:
+            lst.append(url)
+            _save_stores(lst)
+            st.session_state["_sc_msg"] = ("success", f"✅ تمت إضافة {url}")
+        else:
+            st.session_state["_sc_msg"] = ("warning", "الرابط موجود مسبقاً")
+        st.session_state["sc_new_url"] = ""
+
+    def _cb_remove_store(idx_to_remove: int):
+        lst = _load_stores()
+        if 0 <= idx_to_remove < len(lst):
+            removed = lst.pop(idx_to_remove)
+            _save_stores(lst)
+            st.session_state["_sc_msg"] = ("success", f"تم حذف: {removed}")
+
+    def _start_scraper_bg():
+        if not _os_scraper.path.exists(_SCRAPER_SCRIPT):
+            st.session_state["_sc_err"] = f"ملف الكاشط غير موجود: {_SCRAPER_SCRIPT}"
+            return
+        _os_scraper.makedirs(_DATA_SC, exist_ok=True)
+        try:
+            subprocess.Popen(
+                [
+                    _sys_sc.executable, _SCRAPER_SCRIPT,
+                    "--max-products", str(int(st.session_state.get("sc_max_prod", 500))),
+                    "--concurrency",  str(int(st.session_state.get("sc_concurrency", 8))),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # Orphan process — يبقى حتى لو أُغلق المتصفح أو أُعيد تحميل Streamlit
+            )
+            st.session_state["_sc_started"] = True
+        except Exception as _exc:
+            st.session_state["_sc_err"] = str(_exc)
+
+    # ══ عرض رسائل الـ Callbacks ═══════════════════════════════════════════
+    if _sc_msg := st.session_state.pop("_sc_msg", None):
+        getattr(st, _sc_msg[0])(_sc_msg[1])
+    if st.session_state.pop("_sc_started", False):
+        st.success("✅ بدأ الكشط في الخلفية — راقب التقدم أدناه")
+    if _sc_err := st.session_state.pop("_sc_err", None):
+        st.error(f"❌ {_sc_err}")
+
+    # ══ 1. إدارة المنافسين ════════════════════════════════════════════════
+    st.subheader("🌐 إدارة متاجر المنافسين")
+
+    _col_url, _col_add = st.columns([4, 1])
+    with _col_url:
+        st.text_input(
+            "🔗 رابط متجر جديد (سلة، زد، Shopify، …)",
+            placeholder="https://example.com",
+            key="sc_new_url",
+            label_visibility="collapsed",
+        )
+    with _col_add:
+        st.button("➕ إضافة", on_click=_cb_add_store, key="btn_add_store",
+                  use_container_width=True)
+
+    _stores_list = _load_stores()
+    if _stores_list:
+        st.markdown(f"**{len(_stores_list)} متجر مستهدف:**")
+        for _si, _surl in enumerate(_stores_list):
+            _r1, _r2 = st.columns([6, 1])
+            with _r1:
+                st.markdown(
+                    f'<div style="padding:5px 8px;background:#1a1a2e;border-radius:6px;'
+                    f'font-size:.85rem">{_si+1}. {_surl}</div>',
+                    unsafe_allow_html=True,
+                )
+            with _r2:
+                st.button(
+                    "🗑️", key=f"del_store_{_si}",
+                    on_click=_cb_remove_store, args=(_si,),
+                    use_container_width=True,
+                    help=f"حذف {_surl}",
+                )
+    else:
+        st.info("لا توجد متاجر — أضف رابطاً للبدء")
+
+    # ══ 2. إعدادات وتشغيل الكاشط ════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("⚙️ إعدادات الكشط")
+
+    _prog_now = _load_progress()
+    _is_running = bool(_prog_now.get("running", False))
+
+    _sc_col1, _sc_col2 = st.columns(2)
+    with _sc_col1:
+        st.number_input("أقصى منتجات لكل متجر", 50, 5000, 500, step=50, key="sc_max_prod")
+    with _sc_col2:
+        st.number_input("طلبات متزامنة", 2, 20, 8, step=1, key="sc_concurrency")
+
+    st.button(
+        "🚀 بدء الكشط في الخلفية" if not _is_running else "⏳ الكشط يعمل بالفعل…",
+        type="primary",
+        on_click=_start_scraper_bg,
+        key="btn_start_scraper",
+        use_container_width=True,
+        disabled=_is_running,
+    )
+
+    # ══ 3. لوحة المراقبة الحية ═══════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("📊 لوحة المراقبة الحية")
+
+    if not _os_scraper.path.exists(_PROGRESS_FILE):
+        st.info("لم تبدأ أي عملية كشط — اضغط «بدء الكشط» للانطلاق.")
+    else:
+        _prog = _load_progress()
+        _running    = bool(_prog.get("running", False))
+        _processed  = int(_prog.get("urls_processed", 0))
+        _total      = max(int(_prog.get("urls_total", 1)), 1)
+        _rows       = int(_prog.get("rows_in_csv", 0))
+        _errors     = int(_prog.get("fetch_exceptions", 0))
+        _success    = float(_prog.get("success_rate_pct", 0))
+        _current    = str(_prog.get("current_store", ""))
+        _last_err   = str(_prog.get("last_error", ""))
+        _stores_done = int(_prog.get("stores_done", 0))
+        _stores_tot  = int(_prog.get("stores_total", 0))
+
+        if _running:
+            st.info(f"🔄 يعمل الآن — المتجر الحالي: **{_current or '…'}**")
+            try:
+                from streamlit_autorefresh import st_autorefresh
+                st_autorefresh(interval=4000, key="sc_autorefresh")
+            except ImportError:
+                pass
+        else:
+            _finished = _prog.get("finished_at", "")
+            st.success(
+                f"✅ اكتمل — {_rows:,} منتج مُستخرج"
+                + (f" | {_finished[:16]}" if _finished else "")
+            )
+
+        st.progress(min(_processed / _total, 1.0),
+                    text=f"روابط: {_processed:,} / {_total:,}")
+
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("🏪 متاجر",          f"{_stores_done} / {_stores_tot}")
+        _mc2.metric("📦 منتجات",          f"{_rows:,}")
+        _mc3.metric("📈 معدل النجاح",     f"{_success:.1f}%")
+        _mc4.metric("⚠️ أخطاء",           str(_errors))
+
+        if _last_err:
+            st.error(f"آخر خطأ: {_last_err}")
+
+        st.button("🔄 تحديث يدوي", key="sc_manual_refresh")
+
+    # ══ 4. تحميل الناتج + زر الانتقال الفوري للمطابقة ═══════════════════
+    st.markdown("---")
+    st.subheader("📥 الناتج وبدء المطابقة")
+
+    if _os_scraper.path.exists(_OUTPUT_CSV):
+        _csv_size = round(_os_scraper.path.getsize(_OUTPUT_CSV) / 1024, 1)
+        _csv_rows = 0
+        try:
+            with open(_OUTPUT_CSV, encoding="utf-8-sig") as _f:
+                _csv_rows = sum(1 for _ in _f) - 1
+        except Exception:
+            pass
+
+        _dl_col, _go_col = st.columns(2)
+        with _dl_col:
+            with open(_OUTPUT_CSV, "rb") as _fout:
+                st.download_button(
+                    f"📥 تحميل الملف ({_csv_size} KB · {_csv_rows:,} منتج)",
+                    data=_fout.read(),
+                    file_name="competitors_latest.csv",
+                    mime="text/csv",
+                    key="sc_download_csv",
+                    use_container_width=True,
+                )
+        with _go_col:
+            if st.button(
+                "🚀 انتقل للمطابقة واستخدم البيانات الآلية",
+                key="sc_go_match",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state._nav_pending = "📊 لوحة التحكم"
+                st.session_state["_use_auto_scraper"] = True
+                st.session_state.nav_flash = "🤖 تم تفعيل البيانات الآلية"
+                st.rerun()
+    else:
+        st.info("لم يُنتج ملف بعد — ابدأ الكشط أولاً.")
 
 
 # ════════════════════════════════════════════════
