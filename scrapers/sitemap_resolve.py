@@ -112,16 +112,19 @@ async def resolve_product_urls(
     store_url: str,
     session: aiohttp.ClientSession,
     *,
-    max_products: int = 5000,
+    max_products: int = 0,
 ) -> list[str]:
     """
     الدالة الرئيسية — تُرجع قائمة URLs لصفحات المنتجات.
+
+    max_products=0 يعني بلا حد (جميع المنتجات).
 
     الخوارزمية:
     1. جرّب مسارات Sitemap المعيارية
     2. إن لم تجد → robots.txt
     3. فلترة URLs التي تبدو صفحات منتجات
     """
+    _no_limit = (max_products <= 0)
     base = _base_url(store_url)
     product_urls: list[str] = []
 
@@ -153,12 +156,12 @@ async def resolve_product_urls(
     for url in all_urls:
         if _PRODUCT_URL_KEYWORDS.search(url):
             product_urls.append(url)
-        if len(product_urls) >= max_products:
+        if not _no_limit and len(product_urls) >= max_products:
             break
 
-    # إذا فشل كل شيء، أرجع الـ store_url نفسه
+    # إذا فشل كل شيء، أرجع كل الـ URLs بدون فلتر
     if not product_urls and all_urls:
-        product_urls = all_urls[:max_products]
+        product_urls = all_urls if _no_limit else all_urls[:max_products]
 
     logger.info("resolve_product_urls %s → %d URLs", base, len(product_urls))
     return product_urls

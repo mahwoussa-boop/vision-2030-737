@@ -28,6 +28,13 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import ClientTimeout
 
+from scrapers.anti_ban import (
+    get_browser_headers,
+    get_rate_limiter,
+    fetch_with_retry,
+    try_cloudscraper,
+)
+
 # ── مسارات ────────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = Path(os.environ.get("DATA_DIR", "")).resolve() if os.environ.get("DATA_DIR") else _ROOT / "data"
@@ -201,7 +208,7 @@ def extract_product(html: str, page_url: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  جلب صفحة منتج واحدة
+#  جلب صفحة منتج واحدة — مع retry + anti-ban + cloudscraper fallback
 # ══════════════════════════════════════════════════════════════════════════
 async def fetch_product(
     session: aiohttp.ClientSession,
@@ -211,29 +218,32 @@ async def fetch_product(
     progress: Progress,
 ) -> dict | None:
     async with sem:
-        headers = {"User-Agent": random.choice(_USER_AGENTS),
-                   "Accept-Language": "ar,en;q=0.8"}
-        try:
-            async with session.get(url, headers=headers, ssl=False,
-                                   allow_redirects=True) as resp:
-                if resp.status != 200:
-                    progress.error(f"{url} → HTTP {resp.status}")
-                    return None
+        resp = await fetch_with_retry(
+            session, url, max_retries=3, referer=f"https://{store_domain}/"
+        )
+
+        html: str | None = None
+        if resp is not None:
+            try:
                 html = await resp.text(errors="ignore")
-        except Exception as exc:
-            progress.error(f"{url} → {type(exc).__name__}: {exc}")
+            except Exception:
+                html = None
+
+        # Cloudflare fallback — مزامن في executor لكي لا يجمّد event loop
+        if not html:
+            loop = asyncio.get_event_loop()
+            html = await loop.run_in_executor(None, try_cloudscraper, url)
+
+        progress.update(urls_processed=progress._data["urls_processed"] + 1)
+
+        if not html:
+            progress.error(f"{url} → تعذّر الجلب بعد كل المحاولات")
             return None
-        finally:
-            progress.update(
-                urls_processed=progress._data["urls_processed"] + 1
-            )
 
         product = extract_product(html, url)
         if product:
             product["store"] = store_domain
             product["scraped_at"] = datetime.now().strftime("%Y-%m-%d")
-        # تأخير ديناميكي (Anti-Ban jitter) بين طلبات نفس الدومين
-        await asyncio.sleep(random.uniform(0.4, 1.2))
         return product
 
 
@@ -241,11 +251,13 @@ async def fetch_product(
 #  المحرك الرئيسي
 # ══════════════════════════════════════════════════════════════════════════
 async def run_scraper(
-    max_products_per_store: int = 1000,
+    max_products_per_store: int = 0,
     concurrency: int = 8,
 ) -> int:
     """
     يشغّل الكشط الكامل ويُرجع عدد الصفوف المكتوبة.
+
+    max_products_per_store=0 → كشط جميع المنتجات بدون سقف.
     """
     # ── قراءة قائمة المتاجر ────────────────────────────────────────────────
     if not COMPETITORS_FILE.exists():
@@ -273,9 +285,13 @@ async def run_scraper(
     from scrapers.sitemap_resolve import resolve_product_urls
 
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency + 4)
-    timeout   = ClientTimeout(total=25, connect=10)
+    timeout   = ClientTimeout(total=30, connect=10)
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+    # headers مشتركة للـ session (يُعاد تعريفها لكل طلب في fetch_with_retry)
+    default_headers = get_browser_headers()
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout,
+                                    headers=default_headers) as session:
         for store_url in stores:
             domain = urlparse(store_url).netloc
             progress.update(current_store=domain,
@@ -297,7 +313,8 @@ async def run_scraper(
 
             tasks = [
                 fetch_product(session, url, domain, sem, progress)
-                for url in product_urls[:max_products_per_store]
+                for url in (product_urls if max_products_per_store <= 0
+                            else product_urls[:max_products_per_store])
             ]
 
             for coro in asyncio.as_completed(tasks):
@@ -326,8 +343,8 @@ async def run_scraper(
 # ══════════════════════════════════════════════════════════════════════════
 def main() -> None:
     parser = argparse.ArgumentParser(description="Async Competitor Scraper")
-    parser.add_argument("--max-products", type=int, default=1000,
-                        help="أقصى عدد منتجات لكل متجر")
+    parser.add_argument("--max-products", type=int, default=0,
+                        help="أقصى عدد منتجات لكل متجر (0 = جميع المنتجات بلا سقف)")
     parser.add_argument("--concurrency", type=int, default=8,
                         help="عدد الطلبات المتزامنة")
     args = parser.parse_args()
