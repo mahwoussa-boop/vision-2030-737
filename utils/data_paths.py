@@ -18,3 +18,17 @@ def get_data_dir() -> str:
 def get_data_db_path(filename: str) -> str:
     """مسار ملف قاعدة بيانات داخل مجلد البيانات."""
     return os.path.join(get_data_dir(), filename)
+
+
+def get_catalog_data_path(filename: str) -> str:
+    """
+    مسار ملفات الكتالوج (brands.csv / categories.csv):
+    1. DATA_DIR (Railway Volume) إن كان مضبوطاً.
+    2. data/ نسبي إلى جذر المشروع (للتطوير المحلي).
+    """
+    data_dir = (os.environ.get("DATA_DIR") or "").strip()
+    if data_dir:
+        return os.path.join(data_dir, filename)
+    # جذر المشروع = أعلى بمستوى واحد من هذا الملف (utils/)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "data", filename)

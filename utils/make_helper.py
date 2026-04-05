@@ -208,26 +208,59 @@ def send_single_product(product: Dict) -> Dict:
         return {"success": False, "message": f"❌ السعر غير صحيح: {price}"}
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
-    payload = {
-        "products": [{
-            "product_id":  product_id,
-            "name":        name,
-            "price":       float(price),
-            "section":     product.get("section", "update"),
-            "comp_name":   product.get("comp_name", ""),
-            "competitor":  product.get("competitor", ""),
-            "price_diff":  product.get("price_diff", product.get("diff", 0)),
-            "match_score": product.get("match_score", 0),
-            "decision":    product.get("decision", ""),
-            "brand":       product.get("brand", ""),
-        }]
+    _prod = {
+        "product_id":  product_id,
+        "name":        name,
+        "price":       float(price),
+        "section":     product.get("section", "update"),
+        "comp_name":   product.get("comp_name", ""),
+        "competitor":  product.get("competitor", ""),
+        "price_diff":  product.get("price_diff", product.get("diff", 0)),
+        "match_score": product.get("match_score", 0),
+        "decision":    product.get("decision", ""),
+        "brand":       product.get("brand", ""),
     }
+    _cu = str(product.get("comp_url", product.get("رابط_المنافس", "")) or "").strip()
+    if _cu:
+        _prod["comp_url"] = _cu
+
+    payload = {"products": [_prod]}
 
     result = _post_to_webhook(WEBHOOK_UPDATE_PRICES, payload)
     if result["success"]:
         pid_info = f" [ID: {product_id}]" if product_id else ""
         result["message"] = f"✅ تم تحديث «{name}»{pid_info} ← {price:,.0f} ر.س"
     return result
+
+
+def trigger_price_update(
+    sku: str,
+    target_price: float,
+    comp_url: str = "",
+    *,
+    name: str = "",
+    comp_name: str = "",
+    comp_price: float = 0.0,
+    diff: float = 0.0,
+    decision: str = "",
+    competitor: str = "",
+) -> bool:
+    """
+    غلاف تفاعلي لإرسال تحديث سعر واحد إلى Make.com.
+    يعيد True عند نجاح HTTP — للاستخدام من أزرار الواجهة.
+    """
+    res = send_single_product({
+        "product_id": sku,
+        "name": name,
+        "price": float(target_price),
+        "comp_name": comp_name,
+        "comp_price": comp_price,
+        "diff": diff,
+        "decision": decision,
+        "competitor": competitor,
+        "comp_url": comp_url or "",
+    })
+    return bool(res.get("success"))
 
 
 # ══════════════════════════════════════════════════════════════════════════

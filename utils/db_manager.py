@@ -6,10 +6,13 @@ utils/db_manager.py - v18.0
 - سجل كامل بالتاريخ والوقت
 """
 import hashlib
+import logging
 import sqlite3, json, os
 from datetime import datetime
 
 from utils.data_paths import get_data_db_path
+
+_logger = logging.getLogger(__name__)
 
 # قاعدة SQLite الرئيسية — مسار الملف عبر get_data_db_path() (DATA_DIR على Railway)
 _DB_NAME = "pricing_v18.db"
@@ -800,7 +803,7 @@ def migrate_db_v26():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Migration v26 error: {e}")
+        _logger.error("Migration v26 error: %s", e)
         try: conn.close()
         except: pass
 
