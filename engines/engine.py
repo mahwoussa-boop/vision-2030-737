@@ -1864,6 +1864,7 @@ def _excluded_match_row(
         تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
         صورة_منتجنا=our_img or "",
         رابط_منتجنا=our_url or "",
+        صورة_المنافس="",
         رابط_المنافس="",
     )
 
@@ -1889,6 +1890,13 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 
     cp    = float(best.get("price") or 0)
     score = float(best.get("score") or 0)
+    comp_img = str(
+        best.get("صورة_المنافس")
+        or best.get("image_url")
+        or best.get("thumb")
+        or best.get("صورة_المنتج")
+        or ""
+    ).strip()
     diff  = round(our_price - cp, 2) if (our_price>0 and cp>0) else 0
     # نظام الخطورة حسب AI_COMPARISON_INSTRUCTIONS (نسبة مئوية + ثقة)
     diff_pct = abs((diff / cp) * 100) if cp > 0 else 0
@@ -1942,6 +1950,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
                 جميع_المنافسين=ac, مصدر_المطابقة=src or "fuzzy",
                 تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
                 صورة_منتجنا=our_img or "", رابط_منتجنا=our_url or "",
+                صورة_المنافس=comp_img,
                 رابط_المنافس=str(best.get("product_url") or best.get("url") or "").strip())
 
 
