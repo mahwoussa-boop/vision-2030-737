@@ -28,6 +28,14 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import ClientTimeout
 
+# دعم التشغيل بطريقتين:
+# 1) python -m scrapers.async_scraper
+# 2) python scrapers/async_scraper.py
+if __package__ in (None, ""):
+    _BOOT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_BOOT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_BOOT_ROOT))
+
 from scrapers.anti_ban import (
     get_browser_headers,
     get_rate_limiter,
@@ -73,7 +81,7 @@ _JSON_LD_RE   = re.compile(
 )
 _PRICE_RE     = re.compile(r'"price"\s*:\s*"?([\d.,]+)"?')
 _NAME_RE      = re.compile(r'"name"\s*:\s*"([^"]{4,200})"')
-_IMAGE_RE     = re.compile(r'"image"\s*:\s*(?:"([^"]+)"|(?:\["([^"]+)")')
+_IMAGE_RE     = re.compile(r'"image"\s*:\s*(?:"([^"]+)"|\[\s*"([^"]+)")')
 _PRODUCT_TYPE = re.compile(r'"@type"\s*:\s*"Product"', re.I)
 _OG_TITLE_RE  = re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 _OG_PRICE_RE  = re.compile(r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']', re.I)

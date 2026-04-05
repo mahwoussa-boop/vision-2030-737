@@ -13,7 +13,7 @@ import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -35,11 +35,34 @@ _SALLA_PATTERN = re.compile(
     r"(?:salla\.sa|salla\.store|salla\.store|\.myshopify\.com|\.sa/store)", re.I
 )
 
-# كلمات دالة على صفحة منتج
-_PRODUCT_URL_KEYWORDS = re.compile(
-    r"/product[s]?/|/p/|/item/|/shop/|/ar/p/|/en/p/|منتج|product",
+# مؤشرات روابط منتجات (Salla/Zid/Shopify وغيرها)
+_PRODUCT_URL_HINTS = re.compile(
+    r"/products?/|/item/|/shop/|/product/|[/-]p\d+(?:$|[/?#])|/p\d+(?:$|[/?#])",
     re.I,
 )
+
+# استبعاد الصفحات غير المنتجات (سياسات/مدونة/حساب/دعم...)
+_NON_PRODUCT_URL_HINTS = re.compile(
+    r"/blog(?:/|$)|/category(?:/|$)|/collections?(?:/|$)|/pages?(?:/|$)|"
+    r"privacy|policy|terms|shipping|return|refund|about|contact|faq|"
+    r"wishlist|checkout|cart|login|register|account|sitemap|track|help|"
+    r"سياس|الخصوص|الشحن|الارجاع|الاستبدال|اتفاقي|اتصل|المدون|الاسئله",
+    re.I,
+)
+
+
+def _looks_like_product_url(url: str) -> bool:
+    """
+    يقرر هل الرابط يبدو صفحة منتج.
+    """
+    if not url:
+        return False
+    low = url.lower()
+    if low.endswith(".xml"):
+        return False
+    if _NON_PRODUCT_URL_HINTS.search(low):
+        return False
+    return bool(_PRODUCT_URL_HINTS.search(low))
 
 
 def _base_url(url: str) -> str:
@@ -152,9 +175,13 @@ async def resolve_product_urls(
 
     all_urls = sitemap_urls + nested
 
-    # ── فلترة صفحات المنتجات ──────────────────────────────────────────────
+    # ── فلترة صفحات المنتجات + إزالة التكرار ─────────────────────────────
+    seen: set[str] = set()
     for url in all_urls:
-        if _PRODUCT_URL_KEYWORDS.search(url):
+        if url in seen:
+            continue
+        seen.add(url)
+        if _looks_like_product_url(url):
             product_urls.append(url)
         if not _no_limit and len(product_urls) >= max_products:
             break
