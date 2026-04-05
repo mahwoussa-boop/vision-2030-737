@@ -616,7 +616,7 @@ def _detect_double_header(df):
 
 
 def _smart_rename_columns(df):
-    """تخمين ذكي لأسماء الأعمدة بناءً على محتوى البيانات لمواجهة ملفات الكشط الخام (عناوين CSS)."""
+    """التعرف العميق على الأعمدة (Scraper CSS + محتوى) — أسماء موحّدة مع _fcol و resolve_catalog_columns."""
     if df is None or df.empty:
         return df
     cols = list(df.columns)
@@ -624,7 +624,10 @@ def _smart_rename_columns(df):
     is_dirty = any(
         "__" in str(c)
         or "style" in str(c).lower()
+        or "productcard" in str(c).lower()
         or "text-" in str(c).lower()
+        or "w-full" in str(c).lower()
+        or "abs-" in str(c).lower()
         or "href" in str(c).lower()
         or "src" in str(c).lower()
         or str(c).lower().startswith("unnamed")
@@ -635,42 +638,78 @@ def _smart_rename_columns(df):
         blob = " ".join(str(c) for c in cols).lower()
         return ("اسم" in blob or "منتج" in blob) and ("سعر" in blob or "price" in blob)
 
-    # أربعة أعمدة بعناوين عربية/منطقية — لا تعيد التسمية
     if len(cols) == 4 and not is_dirty and _clean_arabic_headers():
         return df
 
     if not is_dirty and len(cols) != 4:
         return df
 
+    # أنماط شائعة في تصديرات الكشط (الأكثر تحديداً أولاً)
+    CSS_PATTERNS = [
+        ("styles_productcard__name", "اسم المنتج"),
+        ("productcard__name", "اسم المنتج"),
+        ("text-sm-2", "سعر المنتج"),
+        ("text-sm", "سعر المنتج"),
+        ("abs-size href", "رابط المنتج"),
+        ("w-full src", "صورة المنتج"),
+        ("w-full", "صورة المنتج"),
+    ]
+
+    KNOWN_EXACT = frozenset({
+        "اسم المنتج", "أسم المنتج", "المنتج", "سعر المنتج", "السعر", "سعر",
+        "صورة المنتج", "صوره المنتج", "رابط المنتج", "الرابط", "الماركة",
+        "رقم المنتج", "معرف المنتج", "رمز المنتج", "رمز المنتج sku",
+    })
+    KNOWN_EXACT_EN = frozenset({
+        "product name", "product_name", "name", "price", "sku", "title",
+        "product id", "product_id", "link", "url", "image",
+    })
+
+    def _known_header(c):
+        s = str(c).strip()
+        if s in KNOWN_EXACT:
+            return True
+        sl = s.lower().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+        if sl in KNOWN_EXACT_EN:
+            return True
+        return False
+
     new_cols = {}
     used = set()
 
     for col in cols:
+        if _known_header(col):
+            continue
+        csl = str(col).lower()
+        for needle, std in CSS_PATTERNS:
+            if needle in csl:
+                if std in used:
+                    continue
+                new_cols[col] = std
+                used.add(std)
+                break
+
+    for col in cols:
+        if col in new_cols or _known_header(col):
+            continue
+        c_str = str(col).strip()
+        need_heuristic = (
+            c_str.startswith("Unnamed")
+            or "__" in c_str
+            or "style" in c_str.lower()
+            or "text-" in c_str.lower()
+            or "href" in c_str.lower()
+            or "src" in c_str.lower()
+            or "w-full" in c_str.lower()
+        )
+        if not need_heuristic:
+            continue
+
         sample = df[col].dropna().astype(str).head(30)
         if sample.empty:
             continue
         vs = [v.strip() for v in sample.tolist()]
         n = len(vs)
-
-        url_count = sum(1 for v in vs if v.startswith("http"))
-        if url_count >= n * 0.5:
-            img_count = sum(
-                1
-                for v in vs
-                if ("cdn.salla" in v or "cdn." in v.lower())
-                or ".jpg" in v.lower()
-                or ".png" in v.lower()
-                or ".webp" in v.lower()
-                or ".jpeg" in v.lower()
-                or _IMG_URL_RE.search(v.lower())
-            )
-            if img_count >= max(1, n * 0.4) and "صورة المنتج" not in used:
-                new_cols[col] = "صورة المنتج"
-                used.add("صورة المنتج")
-            elif "رابط المنتج" not in used:
-                new_cols[col] = "رابط المنتج"
-                used.add("رابط المنتج")
-            continue
 
         numeric_count = 0
         for v in vs:
@@ -689,6 +728,28 @@ def _smart_rename_columns(df):
         if numeric_count >= n * 0.6 and "سعر المنتج" not in used:
             new_cols[col] = "سعر المنتج"
             used.add("سعر المنتج")
+            continue
+
+        url_count = sum(1 for v in vs if v.startswith("http"))
+        if url_count >= n * 0.5:
+            img_count = sum(
+                1
+                for v in vs
+                if (
+                    ("cdn.salla" in v or "cdn." in v.lower())
+                    or ".jpg" in v.lower()
+                    or ".png" in v.lower()
+                    or ".webp" in v.lower()
+                    or ".jpeg" in v.lower()
+                    or _IMG_URL_RE.search(v.lower())
+                )
+            )
+            if img_count >= max(1, n * 0.4) and "صورة المنتج" not in used:
+                new_cols[col] = "صورة المنتج"
+                used.add("صورة المنتج")
+            elif "رابط المنتج" not in used:
+                new_cols[col] = "رابط المنتج"
+                used.add("رابط المنتج")
             continue
 
         if "اسم المنتج" not in used:
@@ -1739,8 +1800,16 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     1. بناء CompIndex لكل منافس (تطبيع مسبق)
     2. لكل منتجنا → search vectorized
     3. score≥97 → تلقائي | 62-96 → AI batch | <62 → مراجعة
+
+    يُرجع: (DataFrame النتائج, audit_stats)
     """
     results = []
+    audit_stats = {
+        "total_input": int(len(our_df)) if our_df is not None else 0,
+        "processed": 0,
+        "skipped_samples": 0,
+        "no_competitor_found": 0,
+    }
     our_col       = _name_col_for_analysis(our_df)
     our_price_col = _fcol(our_df, ["سعر المنتج","السعر","سعر","Price","price","PRICE"])
     our_id_col    = _fcol_optional(our_df, [
@@ -1836,7 +1905,21 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
 
     for i, (_, row) in enumerate(our_df.iterrows()):
         product = str(row.get(our_col, "")).strip()
-        if not product or is_sample(product):
+        if not product:
+            audit_stats["skipped_samples"] += 1
+            if progress_callback:
+                progress_callback((i + 1) / total, results)
+            continue
+
+        if is_sample(product):
+            audit_stats["skipped_samples"] += 1
+            if progress_callback:
+                progress_callback((i + 1) / total, results)
+            continue
+
+        size_ml = extract_size(product)
+        if size_ml > 0 and size_ml < 10:
+            audit_stats["skipped_samples"] += 1
             if progress_callback:
                 progress_callback((i + 1) / total, results)
             continue
@@ -1854,7 +1937,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         brand   = extract_brand(product)
         brand_from_row = _cell_clean(row, our_brand_col) if our_brand_col else ""
         display_brand = brand_from_row or brand
-        size    = extract_size(product)
+        size    = size_ml
         ptype   = extract_type(product)
         gender  = extract_gender(product)
         our_n   = normalize(product)
@@ -1867,6 +1950,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                                             our_pline=our_pl, top_n=6))
 
         if not all_cands:
+            audit_stats["no_competitor_found"] += 1
             results.append(
                 _excluded_match_row(
                     product, our_price, our_id, display_brand, size, ptype, gender,
@@ -1878,6 +1962,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             if progress_callback:
                 progress_callback((i + 1) / total, results)
             continue
+
+        audit_stats["processed"] += 1
 
         all_cands.sort(key=lambda x: x["score"], reverse=True)
         top5  = all_cands[:5]
@@ -1917,7 +2003,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             progress_callback((i + 1) / total, results)
 
     _flush()
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), audit_stats
 
 
 # ═══════════════════════════════════════════════════════
