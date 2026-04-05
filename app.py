@@ -2890,27 +2890,31 @@ elif page == "🕷️ كشط المنافسين":
     import subprocess
     import sys as _sys_sc
     import os as _os_scraper
+    import json as _json_sc
+    from pathlib import Path as _Path
 
     st.header("🕷️ كشط بيانات المنافسين")
     db_log("scraper", "view")
 
-    _SCRAPER_SCRIPT   = _os_scraper.path.join("scrapers", "async_scraper.py")
-    _DATA_SC          = _os_scraper.environ.get("DATA_DIR", "data")
-    _PROGRESS_FILE    = _os_scraper.path.join(_DATA_SC, "scraper_progress.json")
-    _OUTPUT_CSV       = _os_scraper.path.join(_DATA_SC, "competitors_latest.csv")
-    _COMPETITORS_FILE = _os_scraper.path.join(_DATA_SC, "competitors_list.json")
+    # ── مسارات ──────────────────────────────────────────────────────────
+    _SC_ROOT      = _Path(__file__).resolve().parent
+    _DATA_SC      = _os_scraper.environ.get("DATA_DIR", str(_SC_ROOT / "data"))
+    _PROGRESS_FILE = _os_scraper.path.join(_DATA_SC, "scraper_progress.json")
+    _OUTPUT_CSV    = _os_scraper.path.join(_DATA_SC, "competitors_latest.csv")
+    _COMP_FILE     = _os_scraper.path.join(_DATA_SC, "competitors_list.json")
+    _ERROR_LOG     = _os_scraper.path.join(_DATA_SC, "scraper_errors.log")
+    _SCRAPER_SCRIPT = _os_scraper.path.join("scrapers", "async_scraper.py")
 
-    import json as _json_sc
-
+    # ── دوال مساعدة ─────────────────────────────────────────────────────
     def _load_stores() -> list:
         try:
-            return _json_sc.loads(open(_COMPETITORS_FILE, encoding="utf-8").read())
+            return _json_sc.loads(open(_COMP_FILE, encoding="utf-8").read())
         except Exception:
             return []
 
     def _save_stores(lst: list) -> None:
         _os_scraper.makedirs(_DATA_SC, exist_ok=True)
-        open(_COMPETITORS_FILE, "w", encoding="utf-8").write(
+        open(_COMP_FILE, "w", encoding="utf-8").write(
             _json_sc.dumps(lst, ensure_ascii=False, indent=2)
         )
 
@@ -2920,19 +2924,36 @@ elif page == "🕷️ كشط المنافسين":
         except Exception:
             return {"running": False}
 
-    # ══ Callbacks ══════════════════════════════════════════════════════════
+    def _read_error_log(max_lines: int = 60) -> str:
+        """يقرأ آخر سطور من ملف السجل."""
+        try:
+            with open(_ERROR_LOG, encoding="utf-8", errors="replace") as _f:
+                lines = _f.readlines()
+            return "".join(lines[-max_lines:]) if lines else ""
+        except FileNotFoundError:
+            return ""
+        except Exception as _ex:
+            return f"(تعذّر قراءة السجل: {_ex})"
+
+    def _count_csv_rows() -> int:
+        try:
+            with open(_OUTPUT_CSV, encoding="utf-8-sig") as _f:
+                return max(0, sum(1 for _ in _f) - 1)
+        except Exception:
+            return 0
+
+    # ══ Callbacks ═══════════════════════════════════════════════════════
     def _cb_add_store():
         url = (st.session_state.get("sc_new_url") or "").strip()
         if not url:
             return
-        lst = _load_stores()
-        # تطبيع الرابط
         if not url.startswith("http"):
             url = "https://" + url
+        lst = _load_stores()
         if url not in lst:
             lst.append(url)
             _save_stores(lst)
-            st.session_state["_sc_msg"] = ("success", f"✅ تمت إضافة {url}")
+            st.session_state["_sc_msg"] = ("success", f"تمت إضافة: {url}")
         else:
             st.session_state["_sc_msg"] = ("warning", "الرابط موجود مسبقاً")
         st.session_state["sc_new_url"] = ""
@@ -2944,392 +2965,427 @@ elif page == "🕷️ كشط المنافسين":
             _save_stores(lst)
             st.session_state["_sc_msg"] = ("success", f"تم حذف: {removed}")
 
-    def _start_scraper_bg():
-        if not _os_scraper.path.exists(_SCRAPER_SCRIPT):
-            st.session_state["_sc_err"] = f"ملف الكاشط غير موجود: {_SCRAPER_SCRIPT}"
-            return
+    def _start_scraper_bg(full_mode: bool = False):
         _os_scraper.makedirs(_DATA_SC, exist_ok=True)
         try:
+            # فتح ملف السجل بوضع الإضافة (append) — لا يُمحى
+            _log_fh = open(_ERROR_LOG, "a", encoding="utf-8")
             _cmd = [
                 _sys_sc.executable, "-m", "scrapers.async_scraper",
                 "--max-products", str(
                     0 if st.session_state.get("sc_all_products", True)
-                    else int(st.session_state.get("sc_max_prod", 0))
+                    else int(st.session_state.get("sc_max_prod", 0) or 0)
                 ),
                 "--concurrency", str(int(st.session_state.get("sc_concurrency", 8))),
             ]
+            if full_mode:
+                _cmd.append("--full")
             subprocess.Popen(
                 _cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=_log_fh,
+                stderr=_log_fh,
                 start_new_session=True,
+                cwd=str(_SC_ROOT),        # ← حاسم: يضمن import scrapers.* يعمل
             )
             st.session_state["_sc_started"] = True
         except Exception as _exc:
             st.session_state["_sc_err"] = str(_exc)
 
-    # ══ عرض رسائل الـ Callbacks ═══════════════════════════════════════════
+    def _cb_start():      _start_scraper_bg(full_mode=False)
+    def _cb_start_full(): _start_scraper_bg(full_mode=True)
+
+    # ══ رسائل الـ Callbacks ══════════════════════════════════════════════
     if _sc_msg := st.session_state.pop("_sc_msg", None):
         getattr(st, _sc_msg[0])(_sc_msg[1])
     if st.session_state.pop("_sc_started", False):
-        st.success("✅ بدأ الكشط في الخلفية — راقب التقدم أدناه")
+        st.success("بدأ الكشط في الخلفية — راقب التقدم أدناه وشاهد سجل الأخطاء")
     if _sc_err := st.session_state.pop("_sc_err", None):
-        st.error(f"❌ {_sc_err}")
+        st.error(f"فشل تشغيل الكاشط: {_sc_err}")
 
-    # ══ 1. إدارة المنافسين ════════════════════════════════════════════════
-    st.subheader("🌐 إدارة متاجر المنافسين")
-
-    _col_url, _col_add = st.columns([4, 1])
-    with _col_url:
-        st.text_input(
-            "🔗 رابط متجر جديد (سلة، زد، Shopify، …)",
-            placeholder="https://example.com",
-            key="sc_new_url",
-            label_visibility="collapsed",
-        )
-    with _col_add:
-        st.button("➕ إضافة", on_click=_cb_add_store, key="btn_add_store",
-                  use_container_width=True)
-
-    _stores_list = _load_stores()
-    if _stores_list:
-        st.markdown(f"**{len(_stores_list)} متجر مستهدف:**")
-        for _si, _surl in enumerate(_stores_list):
-            _r1, _r2 = st.columns([6, 1])
-            with _r1:
-                st.markdown(
-                    f'<div style="padding:5px 8px;background:#1a1a2e;border-radius:6px;'
-                    f'font-size:.85rem">{_si+1}. {_surl}</div>',
-                    unsafe_allow_html=True,
-                )
-            with _r2:
-                st.button(
-                    "🗑️", key=f"del_store_{_si}",
-                    on_click=_cb_remove_store, args=(_si,),
-                    use_container_width=True,
-                    help=f"حذف {_surl}",
-                )
-    else:
-        st.info("لا توجد متاجر — أضف رابطاً للبدء")
-
-    # ══ 2. إعدادات وتشغيل الكاشط ════════════════════════════════════════
-    st.markdown("---")
-    st.subheader("⚙️ إعدادات الكشط")
-
-    _prog_now = _load_progress()
+    _prog_now  = _load_progress()
     _is_running = bool(_prog_now.get("running", False))
 
-    _sc_col1, _sc_col2, _sc_col3 = st.columns(3)
-    with _sc_col1:
-        st.checkbox(
-            "🔄 جميع المنتجات (بلا سقف)",
-            value=True,
-            key="sc_all_products",
-            help="يكشط كل منتج موجود في Sitemap كل متجر بدون حد أقصى",
-        )
-    with _sc_col2:
-        st.number_input(
-            "أقصى منتجات / متجر",
-            0, 50000, 0 if st.session_state.get("sc_all_products", True) else 1000,
-            step=500,
-            key="sc_max_prod",
-            disabled=bool(st.session_state.get("sc_all_products", True)),
-            help="0 = جميع المنتجات بلا سقف",
-        )
-    with _sc_col3:
-        st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="sc_concurrency")
+    # ══════════════════════════════════════════════════════════════════════
+    # تقسيم الصفحة إلى تبويبات منظمة
+    # ══════════════════════════════════════════════════════════════════════
+    _tab_stores, _tab_run, _tab_monitor, _tab_log, _tab_sched = st.tabs([
+        "🌐 المتاجر",
+        "▶️ تشغيل",
+        "📊 المراقبة",
+        "🪲 سجل الأخطاء",
+        "⏰ الجدولة",
+    ])
 
-    # ══ جدولة تلقائية ════════════════════════════════════════════════════
-    st.markdown("---")
-    st.subheader("⏰ الجدولة التلقائية (Fire & Forget)")
+    # ══════════════════════════════════
+    # تبويب 1: إدارة المتاجر
+    # ══════════════════════════════════
+    with _tab_stores:
+        st.subheader("إدارة متاجر المنافسين")
+        _col_url, _col_add = st.columns([4, 1])
+        with _col_url:
+            st.text_input(
+                "رابط متجر جديد",
+                placeholder="https://example.com  أو  example.com",
+                key="sc_new_url",
+                label_visibility="collapsed",
+            )
+        with _col_add:
+            st.button("➕ إضافة", on_click=_cb_add_store, key="btn_add_store",
+                      use_container_width=True)
 
-    import json as _json_sch
-    try:
-        from scrapers.scheduler import (
-            get_scheduler_status, enable_scheduler, disable_scheduler,
-            trigger_now as _trigger_now,
+        _stores_list = _load_stores()
+        if _stores_list:
+            st.caption(f"{len(_stores_list)} متجر مستهدف")
+            for _si, _surl in enumerate(_stores_list):
+                _r1, _r2 = st.columns([7, 1])
+                with _r1:
+                    st.markdown(
+                        f'<div style="padding:6px 10px;background:#12122a;'
+                        f'border:1px solid #2a2a4a;border-radius:6px;font-size:.84rem">'
+                        f'<b style="color:#6C63FF">{_si+1}.</b> {_surl}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with _r2:
+                    st.button("🗑️", key=f"del_{_si}", on_click=_cb_remove_store,
+                              args=(_si,), use_container_width=True, help=f"حذف {_surl}")
+        else:
+            st.warning("لا توجد متاجر — أضف رابطاً للبدء")
+            st.info(
+                "أمثلة:\n"
+                "- `https://worldgivenchy.com`\n"
+                "- `https://saeedsalah.com`\n"
+                "- `https://example.salla.sa`"
+            )
+
+    # ══════════════════════════════════
+    # تبويب 2: تشغيل الكاشط
+    # ══════════════════════════════════
+    with _tab_run:
+        st.subheader("إعدادات وتشغيل الكاشط")
+
+        _stores_count = len(_load_stores())
+        if not _stores_count:
+            st.warning("لا توجد متاجر — أضف من تبويب «المتاجر» أولاً")
+        else:
+            _sc_col1, _sc_col2, _sc_col3 = st.columns(3)
+            with _sc_col1:
+                st.checkbox(
+                    "جميع المنتجات (بلا سقف)",
+                    value=True, key="sc_all_products",
+                    help="يكشط كل منتج في Sitemap بدون حد",
+                )
+            with _sc_col2:
+                st.number_input(
+                    "أقصى منتجات / متجر",
+                    0, 50000,
+                    0 if st.session_state.get("sc_all_products", True) else 1000,
+                    step=500, key="sc_max_prod",
+                    disabled=bool(st.session_state.get("sc_all_products", True)),
+                )
+            with _sc_col3:
+                st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="sc_concurrency")
+
+            _limit    = int(st.session_state.get("sc_max_prod", 0) or 0)
+            _all_flag = bool(st.session_state.get("sc_all_products", True))
+            if _all_flag or _limit == 0:
+                st.info(f"سيتم كشط **جميع المنتجات** من {_stores_count} متجر")
+            else:
+                st.info(f"تقدير: {_stores_count * _limit:,} منتج")
+
+            st.markdown("---")
+            _btn_a, _btn_b = st.columns(2)
+            with _btn_a:
+                st.button(
+                    "⏳ الكشط يعمل بالفعل…" if _is_running else "🚀 بدء الكشط (تزايدي)",
+                    type="primary", on_click=_cb_start,
+                    key="btn_start_incr", use_container_width=True,
+                    disabled=_is_running,
+                    help="يكشط فقط المنتجات الجديدة أو المحدَّثة — البيانات القديمة تُحفظ",
+                )
+            with _btn_b:
+                st.button(
+                    "🔄 كشط كامل (يُعيد الكل)",
+                    type="secondary", on_click=_cb_start_full,
+                    key="btn_start_full", use_container_width=True,
+                    disabled=_is_running,
+                    help="يكشط جميع المنتجات من جديد بغض النظر عن التغييرات",
+                )
+
+            st.caption(
+                "**البيانات القديمة لا تُحذف:** كل جلسة كشط تُضيف وتُحدِّث فقط، "
+                "ولا تمحو ما سبق جمعه من متاجر أخرى."
+            )
+
+    # ══════════════════════════════════
+    # تبويب 3: المراقبة الحية
+    # ══════════════════════════════════
+    with _tab_monitor:
+        if _is_running:
+            try:
+                from streamlit_autorefresh import st_autorefresh
+                st_autorefresh(interval=3000, key="sc_autorefresh")
+            except ImportError:
+                st.caption("نصيحة: ثبّت `streamlit-autorefresh` للتحديث التلقائي")
+
+        if not _os_scraper.path.exists(_PROGRESS_FILE):
+            st.info("لم تبدأ أي عملية كشط بعد.")
+        else:
+            _prog      = _load_progress()
+            _running   = bool(_prog.get("running", False))
+            _rows      = int(_prog.get("rows_in_csv", 0))
+            _errors    = int(_prog.get("fetch_exceptions", 0))
+            _success   = float(_prog.get("success_rate_pct", 0))
+            _current   = str(_prog.get("current_store", ""))
+            _last_err  = str(_prog.get("last_error", ""))
+            _s_done    = int(_prog.get("stores_done", 0))
+            _s_tot     = max(int(_prog.get("stores_total", 1)), 1)
+            _u_done    = int(_prog.get("store_urls_done", 0))
+            _u_tot     = max(int(_prog.get("store_urls_total", 1)), 1)
+            _s_res     = dict(_prog.get("stores_results") or {})
+
+            # حالة الجلسة
+            if _running:
+                st.markdown(
+                    f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
+                    f'border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                    f'🔄 <b>يعمل الآن</b> — '
+                    f'<b style="color:#4fc3f7">{_current or "…"}</b>'
+                    f'<span style="color:#9e9e9e"> ({_s_done + 1}/{_s_tot})</span></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                _fin = _prog.get("finished_at", "")
+                _csv_total = _count_csv_rows()
+                st.success(
+                    f"اكتملت الجلسة الأخيرة — "
+                    f"{_rows:,} منتج جديد/محدَّث | إجمالي CSV: {_csv_total:,}"
+                    + (f" | {_fin[:16]}" if _fin else "")
+                )
+
+            # شريط المتاجر
+            _sp = min(_s_done / _s_tot, 1.0)
+            st.progress(_sp, text=f"المتاجر: {_s_done}/{_s_tot} ({_sp*100:.0f}%)")
+
+            # شريط المتجر الحالي
+            if _running and _u_tot > 1:
+                _up = min(_u_done / _u_tot, 1.0)
+                st.progress(_up, text=f"{_current}: {_u_done:,}/{_u_tot:,} رابط ({_up*100:.0f}%)")
+
+            # بطاقات
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1.metric("إجمالي CSV", f"{_count_csv_rows():,}")
+            _c2.metric("جلسة هذه", f"{_rows:,}")
+            _c3.metric("نسبة النجاح", f"{_success:.1f}%")
+            _c4.metric("أخطاء", str(_errors))
+
+            # تفاصيل المتاجر
+            _sl = _load_stores()
+            if _sl:
+                st.markdown("**تفاصيل المتاجر:**")
+                _items = []
+                for _i, _u in enumerate(_sl):
+                    _d = _u.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+                    _cnt = _s_res.get(_d)
+                    if _d == _current and _running:
+                        _bw = int(min(_u_done / _u_tot, 1.0) * 100) if _u_tot > 1 else 0
+                        _items.append(
+                            f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'🔄 <b style="color:#4fc3f7">{_i+1}. {_d}</b>'
+                            f'<span style="color:#9e9e9e"> — {_u_done:,}/{_u_tot:,}</span>'
+                            f'<div style="margin-top:4px;height:4px;background:#1a2a3a;border-radius:2px">'
+                            f'<div style="width:{_bw}%;height:100%;background:#4fc3f7;border-radius:2px"></div>'
+                            f'</div></div>'
+                        )
+                    elif _cnt is not None:
+                        _items.append(
+                            f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'✅ <span style="color:#aaa">{_i+1}. {_d}</span>'
+                            f'<span style="color:#00C853"> — {_cnt:,} منتج</span></div>'
+                        )
+                    elif _i < _s_done:
+                        _items.append(
+                            f'<div style="background:#0a1a0a;border:1px dashed #2a3a2a;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'✅ <span style="color:#666">{_i+1}. {_d} — 0 منتج</span></div>'
+                        )
+                    elif _running:
+                        _items.append(
+                            f'<div style="background:#111;border:1px dashed #333;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'⏳ <span style="color:#555">{_i+1}. {_d}</span></div>'
+                        )
+                    else:
+                        _items.append(
+                            f'<div style="background:#0d0d0d;border:1px solid #222;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'⬜ <span style="color:#666">{_i+1}. {_d}</span></div>'
+                        )
+                st.markdown(
+                    '<div style="display:flex;flex-direction:column;gap:4px">'
+                    + "".join(_items) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if _last_err:
+                st.error(f"آخر خطأ مسجَّل: {_last_err}")
+
+            # تحميل الناتج
+            st.markdown("---")
+            if _os_scraper.path.exists(_OUTPUT_CSV):
+                _csv_sz  = round(_os_scraper.path.getsize(_OUTPUT_CSV) / 1024, 1)
+                _csv_cnt = _count_csv_rows()
+                _dl2, _go2 = st.columns(2)
+                with _dl2:
+                    with open(_OUTPUT_CSV, "rb") as _fout:
+                        st.download_button(
+                            f"📥 تحميل CSV ({_csv_sz} KB · {_csv_cnt:,} منتج)",
+                            data=_fout.read(),
+                            file_name="competitors_latest.csv",
+                            mime="text/csv",
+                            key="sc_dl_mon",
+                            use_container_width=True,
+                        )
+                with _go2:
+                    if st.button("🚀 انتقل للمطابقة", key="sc_go_mon",
+                                 type="primary", use_container_width=True):
+                        st.session_state._nav_pending = "📊 لوحة التحكم"
+                        st.session_state["_use_auto_scraper"] = True
+                        st.rerun()
+            else:
+                st.info("لم يُنتج ملف بعد.")
+
+            st.button("🔄 تحديث يدوي", key="sc_refresh_mon")
+
+    # ══════════════════════════════════
+    # تبويب 4: سجل الأخطاء
+    # ══════════════════════════════════
+    with _tab_log:
+        st.subheader("سجل العمليات والأخطاء")
+        st.caption(
+            f"الملف: `{_ERROR_LOG}` — يُضاف إليه ولا يُمحى بين الجلسات"
         )
-        _sch = get_scheduler_status()
-        _sch_enabled = bool(_sch.get("enabled", False))
-        _sch_interval = int(_sch.get("interval_hours", 12))
-        _sch_runs = int(_sch.get("runs_count", 0))
-        _sch_last = str(_sch.get("last_run", "") or "لم يعمل بعد")[:19]
-        _sch_next_label = _sch.get("next_run_label", "—")
-        _sch_ok = True
-    except Exception as _sch_err:
-        _sch_ok = False
-        _sch_enabled = False
 
-    if _sch_ok:
-        _sch_c1, _sch_c2 = st.columns([3, 2])
-        with _sch_c1:
-            if _sch_enabled:
+        _log_text = _read_error_log(max_lines=100)
+        if _log_text:
+            # تمييز الأخطاء بلون مختلف
+            _log_lines = _log_text.splitlines()
+            _err_lines = [l for l in _log_lines if "[ERROR]" in l or "[WARNING]" in l or "Traceback" in l or "Error" in l]
+            _info_cnt  = len(_log_lines) - len(_err_lines)
+
+            _lc1, _lc2, _lc3 = st.columns(3)
+            _lc1.metric("أسطر في السجل", len(_log_lines))
+            _lc2.metric("أخطاء/تحذيرات", len(_err_lines))
+            _lc3.metric("معلومات", _info_cnt)
+
+            if _err_lines:
+                with st.expander(f"عرض الأخطاء فقط ({len(_err_lines)} سطر)", expanded=True):
+                    st.code("\n".join(_err_lines[-40:]), language=None)
+
+            with st.expander("السجل الكامل (آخر 100 سطر)", expanded=not _err_lines):
+                st.code(_log_text, language=None)
+
+            # زر تحميل السجل الكامل
+            with open(_ERROR_LOG, "rb") as _lf:
+                st.download_button(
+                    "📥 تحميل السجل الكامل",
+                    data=_lf.read(),
+                    file_name="scraper_errors.log",
+                    mime="text/plain",
+                    key="sc_dl_log",
+                )
+        else:
+            st.info("السجل فارغ — لم تبدأ أي عملية كشط بعد، أو السجل جديد.")
+
+        if st.button("🗑️ مسح السجل", key="sc_clear_log"):
+            try:
+                open(_ERROR_LOG, "w", encoding="utf-8").close()
+                st.success("تم مسح السجل")
+                st.rerun()
+            except Exception as _ex:
+                st.error(f"فشل المسح: {_ex}")
+
+    # ══════════════════════════════════
+    # تبويب 5: الجدولة التلقائية
+    # ══════════════════════════════════
+    with _tab_sched:
+        st.subheader("الجدولة التلقائية")
+        try:
+            from scrapers.scheduler import (
+                get_scheduler_status, enable_scheduler, disable_scheduler,
+                trigger_now as _trigger_now,
+            )
+            _sch        = get_scheduler_status()
+            _sch_on     = bool(_sch.get("enabled", False))
+            _sch_h      = int(_sch.get("interval_hours", 12))
+            _sch_runs   = int(_sch.get("runs_count", 0))
+            _sch_last   = str(_sch.get("last_run", "") or "لم يعمل بعد")[:19]
+            _sch_next   = _sch.get("next_run_label", "—")
+
+            if _sch_on:
                 st.markdown(
                     f'<div style="background:#0a2a0a;border:1px solid #00C853;'
-                    f'border-radius:8px;padding:10px 14px">'
+                    f'border-radius:8px;padding:12px 16px">'
                     f'🤖 <b>الكشط التلقائي مُفعَّل</b><br>'
-                    f'<span style="color:#9e9e9e;font-size:.82rem">'
-                    f'يعمل كل {_sch_interval} ساعة | '
-                    f'التشغيل القادم: <b style="color:#4fc3f7">{_sch_next_label}</b> | '
+                    f'<span style="color:#9e9e9e;font-size:.83rem">'
+                    f'كل {_sch_h} ساعة | القادم: <b style="color:#4fc3f7">{_sch_next}</b> | '
                     f'عدد التشغيلات: {_sch_runs}</span></div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
                     '<div style="background:#1a1a1a;border:1px dashed #555;'
-                    'border-radius:8px;padding:10px 14px">'
+                    'border-radius:8px;padding:12px 16px">'
                     '⏸️ <b>الكشط التلقائي معطَّل</b><br>'
-                    '<span style="color:#9e9e9e;font-size:.82rem">'
-                    'فعّله لكشط المنافسين آلياً دون أي تدخل يدوي</span></div>',
+                    '<span style="color:#9e9e9e;font-size:.83rem">'
+                    'فعّله لكشط المنافسين آلياً</span></div>',
                     unsafe_allow_html=True,
                 )
-        with _sch_c2:
-            st.number_input("تكرار (ساعات)", 1, 168, _sch_interval, step=1,
-                            key="sc_interval_h")
 
-        def _cb_toggle_scheduler():
-            _h = int(st.session_state.get("sc_interval_h", 12))
-            _mp = 0 if st.session_state.get("sc_all_products", True) else int(
-                st.session_state.get("sc_max_prod", 0))
-            if not _sch_enabled:
-                enable_scheduler(interval_hours=_h)
-                st.session_state["_sc_msg"] = (
-                    "success", f"✅ الجدولة مُفعَّلة — كشط كل {_h} ساعة")
-            else:
-                disable_scheduler()
-                st.session_state["_sc_msg"] = ("warning", "⏸️ الجدولة التلقائية مُعطَّلة")
+            _sh_c1, _sh_c2 = st.columns([3, 2])
+            with _sh_c1:
+                st.number_input("تكرار (ساعات)", 1, 168, _sch_h, step=1, key="sc_interval_h")
+            with _sh_c2:
+                if _sch_last != "لم يعمل بعد":
+                    st.caption(f"آخر تشغيل: {_sch_last[:10]}")
 
-        def _cb_run_now():
-            _mp = 0 if st.session_state.get("sc_all_products", True) else int(
-                st.session_state.get("sc_max_prod", 0))
-            _cc = int(st.session_state.get("sc_concurrency", 8))
-            ok = _trigger_now(max_products=_mp, concurrency=_cc)
-            if ok:
-                st.session_state["_sc_msg"] = ("success", "🚀 تم إطلاق الكشط الآن في الخلفية!")
-            else:
-                st.session_state["_sc_msg"] = ("error", "❌ فشل تشغيل الكاشط")
-
-        _btn_c1, _btn_c2, _btn_c3 = st.columns(3)
-        with _btn_c1:
-            st.button(
-                "⏸️ تعطيل" if _sch_enabled else "▶️ تفعيل الجدولة",
-                on_click=_cb_toggle_scheduler,
-                key="btn_toggle_sched",
-                use_container_width=True,
-                type="primary" if not _sch_enabled else "secondary",
-            )
-        with _btn_c2:
-            st.button(
-                "🚀 تشغيل الآن",
-                on_click=_cb_run_now,
-                key="btn_run_now_sched",
-                use_container_width=True,
-                disabled=_is_running,
-            )
-        with _btn_c3:
-            if _sch_last and _sch_last != "لم يعمل بعد":
-                st.caption(f"آخر تشغيل:\n{_sch_last[:10]}")
-    else:
-        st.caption("⚠️ لا يمكن تحميل وحدة الجدولة")
-
-    # عرض تقدير الحجم
-    st.markdown("---")
-    _stores_count = len(_load_stores())
-    if _stores_count:
-        _limit = int(st.session_state.get("sc_max_prod", 0))
-        _all_flag = bool(st.session_state.get("sc_all_products", True))
-        if _all_flag or _limit == 0:
-            st.info(f"📊 سيتم كشط **جميع المنتجات** من {_stores_count} متجر")
-        else:
-            st.info(f"📊 تقدير: {_stores_count * _limit:,} منتج")
-
-    st.button(
-        "🚀 بدء الكشط يدوياً" if not _is_running else "⏳ الكشط يعمل بالفعل…",
-        type="primary",
-        on_click=_start_scraper_bg,
-        key="btn_start_scraper",
-        use_container_width=True,
-        disabled=_is_running,
-    )
-
-    # ══ 3. لوحة المراقبة الحية ═══════════════════════════════════════════
-    st.markdown("---")
-    st.subheader("📊 لوحة المراقبة الحية")
-
-    if not _os_scraper.path.exists(_PROGRESS_FILE):
-        st.info("لم تبدأ أي عملية كشط — اضغط «بدء الكشط» للانطلاق.")
-    else:
-        _prog = _load_progress()
-        _running      = bool(_prog.get("running", False))
-        _processed    = int(_prog.get("urls_processed", 0))
-        _total        = max(int(_prog.get("urls_total", 1)), 1)
-        _rows         = int(_prog.get("rows_in_csv", 0))
-        _errors       = int(_prog.get("fetch_exceptions", 0))
-        _success      = float(_prog.get("success_rate_pct", 0))
-        _current      = str(_prog.get("current_store", ""))
-        _last_err     = str(_prog.get("last_error", ""))
-        _stores_done  = int(_prog.get("stores_done", 0))
-        _stores_tot   = max(int(_prog.get("stores_total", 1)), 1)
-        _s_urls_done  = int(_prog.get("store_urls_done", 0))
-        _s_urls_tot   = max(int(_prog.get("store_urls_total", 1)), 1)
-        _stores_res   = dict(_prog.get("stores_results") or {})
-
-        # ── تحديث تلقائي كل 3 ثوان عند التشغيل ──
-        if _running:
-            try:
-                from streamlit_autorefresh import st_autorefresh
-                st_autorefresh(interval=3000, key="sc_autorefresh")
-            except ImportError:
-                pass
-            _store_idx = _stores_done + 1
-            st.markdown(
-                f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
-                f'border-radius:8px;padding:10px 14px;margin-bottom:8px">'
-                f'🔄 <b>يعمل الآن</b> — المتجر '
-                f'<b style="color:#4fc3f7">{_current or "…"}</b> '
-                f'<span style="color:#9e9e9e">({_store_idx} / {_stores_tot})</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            _finished = _prog.get("finished_at", "")
-            st.success(
-                f"✅ اكتمل — {_rows:,} منتج مُستخرج"
-                + (f" | {_finished[:16]}" if _finished else "")
-            )
-
-        # ── شريط تقدم المتاجر (عداد المتاجر) ──
-        _store_pct = min(_stores_done / _stores_tot, 1.0)
-        st.progress(
-            _store_pct,
-            text=f"🏪 المتاجر: {_stores_done} / {_stores_tot}  "
-                 f"({'%.0f' % (_store_pct * 100)}%)",
-        )
-
-        # ── شريط تقدم المتجر الحالي (روابط) ──
-        if _running and _current and _s_urls_tot > 1:
-            _cur_pct = min(_s_urls_done / _s_urls_tot, 1.0)
-            st.progress(
-                _cur_pct,
-                text=f"🔗 {_current}: {_s_urls_done:,} / {_s_urls_tot:,} رابط  "
-                     f"({'%.0f' % (_cur_pct * 100)}%)",
-            )
-
-        # ── بطاقات الأرقام ──
-        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
-        _mc1.metric("🏪 متاجر",       f"{_stores_done} / {_stores_tot}")
-        _mc2.metric("📦 منتجات",       f"{_rows:,}")
-        _mc3.metric("📈 نسبة النجاح",  f"{_success:.1f}%")
-        _mc4.metric("⚠️ أخطاء",        str(_errors))
-
-        # ── قائمة المتاجر التفصيلية ──
-        _all_stores_list = _load_stores()
-        if _all_stores_list:
-            st.markdown("**📋 تفاصيل المتاجر:**")
-            _html_items = []
-            for _si, _surl in enumerate(_all_stores_list):
-                _d = (
-                    _surl.replace("https://", "")
-                         .replace("http://", "")
-                         .rstrip("/")
-                         .split("/")[0]
-                )
-                _cnt = _stores_res.get(_d)
-                if _d == _current and _running:
-                    # المتجر الجاري كشطه الآن
-                    _cur_bar_w = int(min(_s_urls_done / _s_urls_tot, 1.0) * 100) if _s_urls_tot > 1 else 0
-                    _item = (
-                        f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
-                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                        f'🔄 <b style="color:#4fc3f7">{_si+1}. {_d}</b>'
-                        f'<span style="color:#9e9e9e"> — {_s_urls_done:,}/{_s_urls_tot:,} رابط</span>'
-                        f'<div style="margin-top:4px;height:4px;background:#1a2a3a;border-radius:2px">'
-                        f'<div style="width:{_cur_bar_w}%;height:100%;background:#4fc3f7;border-radius:2px"></div>'
-                        f'</div></div>'
-                    )
-                elif _cnt is not None:
-                    # متجر انتهى مع عدد منتجاته
-                    _item = (
-                        f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
-                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                        f'✅ <span style="color:#9e9e9e">{_si+1}. {_d}</span>'
-                        f'<span style="color:#00C853"> — {_cnt:,} منتج</span>'
-                        f'</div>'
-                    )
-                elif _si < _stores_done:
-                    # انتهى لكن بدون بيانات (0 منتجات)
-                    _item = (
-                        f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
-                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                        f'✅ <span style="color:#777">{_si+1}. {_d}</span>'
-                        f'<span style="color:#555"> — 0 منتج</span>'
-                        f'</div>'
-                    )
-                elif _running:
-                    # لم يحن دوره بعد
-                    _item = (
-                        f'<div style="background:#111;border:1px dashed #333;'
-                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                        f'⏳ <span style="color:#555">{_si+1}. {_d}</span>'
-                        f'</div>'
-                    )
+            def _cb_toggle_sch():
+                _h = int(st.session_state.get("sc_interval_h", 12))
+                if not _sch_on:
+                    enable_scheduler(interval_hours=_h)
+                    st.session_state["_sc_msg"] = ("success", f"الجدولة مُفعَّلة — كل {_h} ساعة")
                 else:
-                    # لم يُكشط بعد (قبل أي تشغيل)
-                    _item = (
-                        f'<div style="background:#111;border:1px solid #222;'
-                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                        f'⬜ <span style="color:#777">{_si+1}. {_d}</span>'
-                        f'</div>'
-                    )
-                _html_items.append(_item)
-            st.markdown(
-                '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">'
-                + "".join(_html_items) + "</div>",
-                unsafe_allow_html=True,
-            )
+                    disable_scheduler()
+                    st.session_state["_sc_msg"] = ("warning", "الجدولة مُعطَّلة")
 
-        if _last_err:
-            st.error(f"آخر خطأ: {_last_err}")
+            def _cb_run_sched_now():
+                _mp = 0 if st.session_state.get("sc_all_products", True) else int(
+                    st.session_state.get("sc_max_prod", 0) or 0)
+                _cc = int(st.session_state.get("sc_concurrency", 8))
+                ok = _trigger_now(max_products=_mp, concurrency=_cc)
+                st.session_state["_sc_msg"] = (
+                    "success" if ok else "error",
+                    "تم إطلاق الكشط الآن!" if ok else "فشل تشغيل الكاشط"
+                )
 
-        st.button("🔄 تحديث يدوي", key="sc_manual_refresh")
-
-    # ══ 4. تحميل الناتج + زر الانتقال الفوري للمطابقة ═══════════════════
-    st.markdown("---")
-    st.subheader("📥 الناتج وبدء المطابقة")
-
-    if _os_scraper.path.exists(_OUTPUT_CSV):
-        _csv_size = round(_os_scraper.path.getsize(_OUTPUT_CSV) / 1024, 1)
-        _csv_rows = 0
-        try:
-            with open(_OUTPUT_CSV, encoding="utf-8-sig") as _f:
-                _csv_rows = sum(1 for _ in _f) - 1
-        except Exception:
-            pass
-
-        _dl_col, _go_col = st.columns(2)
-        with _dl_col:
-            with open(_OUTPUT_CSV, "rb") as _fout:
-                st.download_button(
-                    f"📥 تحميل الملف ({_csv_size} KB · {_csv_rows:,} منتج)",
-                    data=_fout.read(),
-                    file_name="competitors_latest.csv",
-                    mime="text/csv",
-                    key="sc_download_csv",
+            _sb1, _sb2 = st.columns(2)
+            with _sb1:
+                st.button(
+                    "⏸️ تعطيل" if _sch_on else "▶️ تفعيل الجدولة",
+                    on_click=_cb_toggle_sch, key="btn_tog_sch",
+                    type="primary" if not _sch_on else "secondary",
                     use_container_width=True,
                 )
-        with _go_col:
-            if st.button(
-                "🚀 انتقل للمطابقة واستخدم البيانات الآلية",
-                key="sc_go_match",
-                type="primary",
-                use_container_width=True,
-            ):
-                st.session_state._nav_pending = "📊 لوحة التحكم"
-                st.session_state["_use_auto_scraper"] = True
-                st.session_state.nav_flash = "🤖 تم تفعيل البيانات الآلية"
-                st.rerun()
-    else:
-        st.info("لم يُنتج ملف بعد — ابدأ الكشط أولاً.")
+            with _sb2:
+                st.button(
+                    "🚀 تشغيل الآن",
+                    on_click=_cb_run_sched_now, key="btn_run_sch_now",
+                    use_container_width=True, disabled=_is_running,
+                )
+
+        except Exception as _sch_ex:
+            st.error(f"تعذّر تحميل وحدة الجدولة: {_sch_ex}")
 
 
 # ════════════════════════════════════════════════
