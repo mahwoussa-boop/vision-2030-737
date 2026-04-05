@@ -3159,24 +3159,37 @@ elif page == "🕷️ كشط المنافسين":
         st.info("لم تبدأ أي عملية كشط — اضغط «بدء الكشط» للانطلاق.")
     else:
         _prog = _load_progress()
-        _running    = bool(_prog.get("running", False))
-        _processed  = int(_prog.get("urls_processed", 0))
-        _total      = max(int(_prog.get("urls_total", 1)), 1)
-        _rows       = int(_prog.get("rows_in_csv", 0))
-        _errors     = int(_prog.get("fetch_exceptions", 0))
-        _success    = float(_prog.get("success_rate_pct", 0))
-        _current    = str(_prog.get("current_store", ""))
-        _last_err   = str(_prog.get("last_error", ""))
-        _stores_done = int(_prog.get("stores_done", 0))
-        _stores_tot  = int(_prog.get("stores_total", 0))
+        _running      = bool(_prog.get("running", False))
+        _processed    = int(_prog.get("urls_processed", 0))
+        _total        = max(int(_prog.get("urls_total", 1)), 1)
+        _rows         = int(_prog.get("rows_in_csv", 0))
+        _errors       = int(_prog.get("fetch_exceptions", 0))
+        _success      = float(_prog.get("success_rate_pct", 0))
+        _current      = str(_prog.get("current_store", ""))
+        _last_err     = str(_prog.get("last_error", ""))
+        _stores_done  = int(_prog.get("stores_done", 0))
+        _stores_tot   = max(int(_prog.get("stores_total", 1)), 1)
+        _s_urls_done  = int(_prog.get("store_urls_done", 0))
+        _s_urls_tot   = max(int(_prog.get("store_urls_total", 1)), 1)
+        _stores_res   = dict(_prog.get("stores_results") or {})
 
+        # ── تحديث تلقائي كل 3 ثوان عند التشغيل ──
         if _running:
-            st.info(f"🔄 يعمل الآن — المتجر الحالي: **{_current or '…'}**")
             try:
                 from streamlit_autorefresh import st_autorefresh
-                st_autorefresh(interval=4000, key="sc_autorefresh")
+                st_autorefresh(interval=3000, key="sc_autorefresh")
             except ImportError:
                 pass
+            _store_idx = _stores_done + 1
+            st.markdown(
+                f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
+                f'border-radius:8px;padding:10px 14px;margin-bottom:8px">'
+                f'🔄 <b>يعمل الآن</b> — المتجر '
+                f'<b style="color:#4fc3f7">{_current or "…"}</b> '
+                f'<span style="color:#9e9e9e">({_store_idx} / {_stores_tot})</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
         else:
             _finished = _prog.get("finished_at", "")
             st.success(
@@ -3184,14 +3197,95 @@ elif page == "🕷️ كشط المنافسين":
                 + (f" | {_finished[:16]}" if _finished else "")
             )
 
-        st.progress(min(_processed / _total, 1.0),
-                    text=f"روابط: {_processed:,} / {_total:,}")
+        # ── شريط تقدم المتاجر (عداد المتاجر) ──
+        _store_pct = min(_stores_done / _stores_tot, 1.0)
+        st.progress(
+            _store_pct,
+            text=f"🏪 المتاجر: {_stores_done} / {_stores_tot}  "
+                 f"({'%.0f' % (_store_pct * 100)}%)",
+        )
 
+        # ── شريط تقدم المتجر الحالي (روابط) ──
+        if _running and _current and _s_urls_tot > 1:
+            _cur_pct = min(_s_urls_done / _s_urls_tot, 1.0)
+            st.progress(
+                _cur_pct,
+                text=f"🔗 {_current}: {_s_urls_done:,} / {_s_urls_tot:,} رابط  "
+                     f"({'%.0f' % (_cur_pct * 100)}%)",
+            )
+
+        # ── بطاقات الأرقام ──
         _mc1, _mc2, _mc3, _mc4 = st.columns(4)
-        _mc1.metric("🏪 متاجر",          f"{_stores_done} / {_stores_tot}")
-        _mc2.metric("📦 منتجات",          f"{_rows:,}")
-        _mc3.metric("📈 معدل النجاح",     f"{_success:.1f}%")
-        _mc4.metric("⚠️ أخطاء",           str(_errors))
+        _mc1.metric("🏪 متاجر",       f"{_stores_done} / {_stores_tot}")
+        _mc2.metric("📦 منتجات",       f"{_rows:,}")
+        _mc3.metric("📈 نسبة النجاح",  f"{_success:.1f}%")
+        _mc4.metric("⚠️ أخطاء",        str(_errors))
+
+        # ── قائمة المتاجر التفصيلية ──
+        _all_stores_list = _load_stores()
+        if _all_stores_list:
+            st.markdown("**📋 تفاصيل المتاجر:**")
+            _html_items = []
+            for _si, _surl in enumerate(_all_stores_list):
+                _d = (
+                    _surl.replace("https://", "")
+                         .replace("http://", "")
+                         .rstrip("/")
+                         .split("/")[0]
+                )
+                _cnt = _stores_res.get(_d)
+                if _d == _current and _running:
+                    # المتجر الجاري كشطه الآن
+                    _cur_bar_w = int(min(_s_urls_done / _s_urls_tot, 1.0) * 100) if _s_urls_tot > 1 else 0
+                    _item = (
+                        f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'🔄 <b style="color:#4fc3f7">{_si+1}. {_d}</b>'
+                        f'<span style="color:#9e9e9e"> — {_s_urls_done:,}/{_s_urls_tot:,} رابط</span>'
+                        f'<div style="margin-top:4px;height:4px;background:#1a2a3a;border-radius:2px">'
+                        f'<div style="width:{_cur_bar_w}%;height:100%;background:#4fc3f7;border-radius:2px"></div>'
+                        f'</div></div>'
+                    )
+                elif _cnt is not None:
+                    # متجر انتهى مع عدد منتجاته
+                    _item = (
+                        f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'✅ <span style="color:#9e9e9e">{_si+1}. {_d}</span>'
+                        f'<span style="color:#00C853"> — {_cnt:,} منتج</span>'
+                        f'</div>'
+                    )
+                elif _si < _stores_done:
+                    # انتهى لكن بدون بيانات (0 منتجات)
+                    _item = (
+                        f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'✅ <span style="color:#777">{_si+1}. {_d}</span>'
+                        f'<span style="color:#555"> — 0 منتج</span>'
+                        f'</div>'
+                    )
+                elif _running:
+                    # لم يحن دوره بعد
+                    _item = (
+                        f'<div style="background:#111;border:1px dashed #333;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'⏳ <span style="color:#555">{_si+1}. {_d}</span>'
+                        f'</div>'
+                    )
+                else:
+                    # لم يُكشط بعد (قبل أي تشغيل)
+                    _item = (
+                        f'<div style="background:#111;border:1px solid #222;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'⬜ <span style="color:#777">{_si+1}. {_d}</span>'
+                        f'</div>'
+                    )
+                _html_items.append(_item)
+            st.markdown(
+                '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">'
+                + "".join(_html_items) + "</div>",
+                unsafe_allow_html=True,
+            )
 
         if _last_err:
             st.error(f"آخر خطأ: {_last_err}")
