@@ -249,6 +249,12 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     _fs_price = "1rem" if compact else "1.1rem"
     our_thumb = _lazy_img_tag(our_img, width=_iw, height=_ih, alt="منتجنا")
     comp_thumb = _lazy_img_tag(comp_img, width=_iw, height=_ih, alt="المنافس")
+    if not comp_thumb:
+        comp_thumb = (
+            f'<div style="width:{_iw}px;height:{_ih}px;border-radius:6px;flex-shrink:0;'
+            f'background:#121c2e;border:1px dashed #2a3f5f;display:flex;align-items:center;'
+            f'justify-content:center;color:#4a5c78;font-size:.8rem">—</div>'
+        )
     # السعر المقترح = أقل من أقل منافس بريال
     suggested = comp_price - 1 if comp_price > 0 else 0
     sugg_html = ""

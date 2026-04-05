@@ -70,7 +70,8 @@ from utils.data_helpers import (safe_results_for_json, restore_results_from_json
                                 ts_badge, decision_badge,
                                 row_media_urls_from_analysis,
                                 our_product_url_from_row,
-                                competitor_product_url_from_row)
+                                competitor_product_url_from_row,
+                                format_missing_for_salla)
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
@@ -2102,8 +2103,7 @@ elif page == "🔍 منتجات مفقودة":
                 st.download_button("📥 Excel", data=excel_m, file_name="missing.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="miss_dl")
             with cc2:
-                _csv_m = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                st.download_button("📄 CSV", data=_csv_m, file_name="missing.csv", mime="text/csv", key="miss_csv")
+                pass
             with cc3:
                 _salla_fast = export_to_salla_shamel(filtered, generate_descriptions=False)
                 st.download_button(
@@ -2113,6 +2113,25 @@ elif page == "🔍 منتجات مفقودة":
                     mime="text/csv",
                     key="miss_salla_fast",
                     help="قالب استيراد سلة الشامل — صف «بيانات المنتج» ثم رؤوس الأعمدة",
+                )
+            _csv_col1, _csv_col2 = st.columns(2)
+            with _csv_col1:
+                _salla_ready_df = format_missing_for_salla(filtered)
+                st.download_button(
+                    label="📥 تحميل المفقودات (جاهز لسلة)",
+                    data=_salla_ready_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="missing_salla_ready.csv",
+                    mime="text/csv",
+                    type="primary",
+                    key="miss_csv_ready",
+                )
+            with _csv_col2:
+                st.download_button(
+                    label="📊 تحميل المفقودات (البيانات الخام)",
+                    data=filtered.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="missing_raw_data.csv",
+                    mime="text/csv",
+                    key="miss_csv_raw",
                 )
             if st.button("🤖 توليد ملف سلة الشامل + وصف AI (بطيء)", key="miss_salla_ai_run"):
                 with st.spinner("جاري استدعاء الذكاء الاصطناعي لكل صف — قد يستغرق وقتاً..."):
