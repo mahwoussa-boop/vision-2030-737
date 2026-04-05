@@ -957,6 +957,7 @@ def process_paste(text): return analyze_paste(text)
 # ══════════════════════════════════════════════════════════════════════════
 import pandas as _pd
 import os as _os
+import functools as _functools
 
 from engines.prompts import (
     SEO_CONTENT_PROMPT,
@@ -1040,7 +1041,8 @@ def _resolve_catalog_paths() -> tuple[str, str]:
 def _build_brands_list() -> str:
     """
     يبني قائمة الماركات بأولوية: ملف سلة الرسمي → الملف الاحتياطي.
-    يعيد الأسماء مفصولة بفواصل عربية لقراءة أفضل من الـ AI.
+    النتيجة مُخزَّنة في ذاكرة العملية (LRU cache) — لا يُعيد قراءة الملف مع كل طلب.
+    استدعِ `_build_brands_list.cache_clear()` إذا أردت إعادة القراءة (مثلاً بعد رفع ملف جديد).
     """
     path, is_salla = _find_catalog_file(SALLA_BRANDS_FILE, BRANDS_CSV_FILE)
     if is_salla:
@@ -1050,6 +1052,12 @@ def _build_brands_list() -> str:
     if items:
         return "\n".join(f"- {b}" for b in items)
     return "⚠️ لم يُعثر على ملف الماركات — يرجى رفع «ماركات مهووس.csv» في مجلد /data"
+
+
+# ── ذاكرة تخزين مؤقت (TTL 6 ساعات) تحمي الخادم من إعادة قراءة الملفات ──
+@_functools.lru_cache(maxsize=1)
+def _brands_list_cached() -> str:
+    return _build_brands_list()
 
 
 def _build_categories_list() -> str:
@@ -1064,6 +1072,20 @@ def _build_categories_list() -> str:
     if items:
         return "\n".join(f"- {c}" for c in items)
     return "⚠️ لم يُعثر على ملف الأقسام — يرجى رفع «تصنيفات مهووس.csv» في مجلد /data"
+
+
+@_functools.lru_cache(maxsize=1)
+def _categories_list_cached() -> str:
+    return _build_categories_list()
+
+
+def clear_catalog_cache() -> None:
+    """
+    يمسح ذاكرة التخزين المؤقت لقوائم الماركات والأقسام.
+    استدعِها بعد رفع ملفات جديدة من الواجهة.
+    """
+    _brands_list_cached.cache_clear()
+    _categories_list_cached.cache_clear()
 
 
 def generate_seo_description(raw_product_data: str) -> dict:
@@ -1087,8 +1109,8 @@ def generate_seo_description(raw_product_data: str) -> dict:
         return {"error": "raw_product_data فارغ — لا شيء لتوليده"}
 
     prompt = SEO_CONTENT_PROMPT.format(
-        brands_list=_build_brands_list(),
-        categories_list=_build_categories_list(),
+        brands_list=_brands_list_cached(),
+        categories_list=_categories_list_cached(),
         raw_product_data=raw_product_data.strip()[:4000],  # حد آمن
     )
 
