@@ -56,27 +56,22 @@ ERROR_LOG        = _DATA_DIR / "scraper_errors.log"
 
 CSV_COLS = ["store", "name", "price", "image", "url", "brand", "sku", "scraped_at"]
 
-# ── إعداد logging (console + ملف خطأ) ────────────────────────────────────
+# ── إعداد logging ─────────────────────────────────────────────────────────
 def _setup_logging() -> None:
-    """يهيئ logging مرة واحدة: console + ERROR_LOG للأخطاء."""
+    """يهيئ logging مرة واحدة فقط — StreamHandler وحده.
+    عند التشغيل كـ subprocess، يُعيد توجيه stdout إلى الملف من app.py؛
+    لا نحتاج FileHandler منفصل لتجنب التكرار."""
+    root = logging.getLogger()
+    if root.handlers:
+        return  # لا تضف handlers مرة ثانية
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    root = logging.getLogger()
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
     root.setLevel(logging.INFO)
-    if not root.handlers:
-        ch = logging.StreamHandler()
-        ch.setFormatter(fmt)
-        root.addHandler(ch)
-    # file handler — يكتب كل شيء (INFO+) في ملف السجل
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(str(ERROR_LOG), encoding="utf-8", mode="a")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
-    except Exception:
-        pass
 
 
 _setup_logging()
@@ -93,6 +88,9 @@ _OG_TITLE_RE  = re.compile(
 _OG_PRICE_RE  = re.compile(
     r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
+_OG_CURRENCY_RE = re.compile(
+    r'<meta[^>]+property=["\']product:price:currency["\'][^>]+content=["\']([^"\']+)["\']', re.I
+)
 _OG_IMAGE_RE  = re.compile(
     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
@@ -100,6 +98,16 @@ _PRICE_META_RE = re.compile(
     r'<meta[^>]+(?:itemprop|property)=["\'](?:price|product:price:amount)["\'][^>]+content=["\']([^"\']+)["\']',
     re.I,
 )
+_PRICE_META_CURRENCY_RE = re.compile(
+    r'<meta[^>]+(?:itemprop|property)=["\'](?:priceCurrency|product:price:currency)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_PRICE_CLASS_RE = re.compile(
+    r'<[^>]+class=["\'][^"\']*(?:product-price|price|amount|text-sm-2)[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+    re.I | re.S,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_USD_TO_SAR = 3.75
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -234,7 +242,9 @@ def _parse_price(raw: Any) -> Optional[float]:
         return None
     if isinstance(raw, (int, float)):
         return float(raw) if float(raw) > 0 else None
-    s = re.sub(r"[^\d.,]", "", str(raw).replace(",", ""))
+    s0 = str(raw).strip().replace("٬", ",").replace("،", ",")
+    s = re.sub(r"[^\d.,]", "", s0)
+    s = s.replace(",", "")
     if not s:
         return None
     try:
@@ -242,6 +252,58 @@ def _parse_price(raw: Any) -> Optional[float]:
         return v if v > 0 else None
     except ValueError:
         return None
+
+
+def _strip_tags(text: str) -> str:
+    return _TAG_RE.sub(" ", str(text or "")).strip()
+
+
+def _currency_hint(text: str) -> str:
+    t = str(text or "").upper()
+    if not t:
+        return ""
+    if any(x in t for x in ("SAR", "ر.س", "﷼", "ريال")):
+        return "SAR"
+    if "USD" in t or "$" in t:
+        return "USD"
+    return ""
+
+
+def _price_to_sar(price: Optional[float], currency: str = "", raw_text: str = "") -> Optional[float]:
+    if price is None or price <= 0:
+        return None
+    c = str(currency or "").strip().upper()
+    if not c:
+        c = _currency_hint(raw_text)
+    if c == "USD":
+        return round(float(price) * _USD_TO_SAR, 2)
+    return float(price)
+
+
+def _pick_price_candidate(candidates: List[tuple]) -> Optional[float]:
+    """اختر السعر مع تفضيل SAR، ثم حوّل USD→SAR عند الحاجة."""
+    if not candidates:
+        return None
+    for p, cur, raw in candidates:
+        if str(cur or "").strip().upper() == "SAR":
+            v = _price_to_sar(p, cur, raw)
+            if v and v > 0:
+                return v
+    for p, cur, raw in candidates:
+        v = _price_to_sar(p, cur, raw)
+        if v and v > 0:
+            return v
+    return None
+
+
+def _extract_price_from_common_classes(html: str) -> Optional[tuple]:
+    """Fallback: ابحث في كلاسات الأسعار الشائعة (Salla/Zid وغيرها)."""
+    for m in _PRICE_CLASS_RE.finditer(html or ""):
+        raw = _strip_tags(m.group(1))
+        p = _parse_price(raw)
+        if p and p > 0:
+            return p, _currency_hint(raw), raw
+    return None
 
 
 def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
@@ -263,21 +325,30 @@ def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
         if not name:
             continue
 
-        # سعر
+        # سعر + عملة (تفضيل SAR ثم تحويل USD عند اللزوم)
+        price_candidates: List[tuple] = []
         offers = node.get("offers") or node.get("Offers") or {}
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        if isinstance(offers, dict):
-            otype = offers.get("@type", "")
-            if otype == "AggregateOffer":
-                price_raw = offers.get("lowPrice") or offers.get("highPrice") or offers.get("price")
+        offers_list = offers if isinstance(offers, list) else [offers]
+        for off in offers_list:
+            if isinstance(off, dict):
+                otype = str(off.get("@type", "") or "")
+                if otype == "AggregateOffer":
+                    price_raw = off.get("lowPrice") or off.get("highPrice") or off.get("price")
+                else:
+                    price_raw = off.get("price")
+                cur = off.get("priceCurrency") or off.get("currency") or node.get("priceCurrency") or ""
             else:
-                price_raw = offers.get("price")
-        else:
-            price_raw = offers
-        if price_raw is None:
-            price_raw = node.get("price")
-        price = _parse_price(price_raw)
+                price_raw = off
+                cur = node.get("priceCurrency") or ""
+            p = _parse_price(price_raw)
+            if p and p > 0:
+                price_candidates.append((p, str(cur or ""), str(price_raw or "")))
+        if not price_candidates:
+            p = _parse_price(node.get("price"))
+            if p and p > 0:
+                price_candidates.append((p, str(node.get("priceCurrency") or ""), str(node.get("price") or "")))
+
+        price = _pick_price_candidate(price_candidates)
         if price is None or price <= 0:
             continue
 
@@ -347,7 +418,9 @@ def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
     image_m = _OG_IMAGE_RE.search(html)
     if not name_m or not price_m:
         return None
-    price = _parse_price(price_m.group(1))
+    cur_m = _OG_CURRENCY_RE.search(html) or _PRICE_META_CURRENCY_RE.search(html)
+    cur = cur_m.group(1).strip() if cur_m else ""
+    price = _price_to_sar(_parse_price(price_m.group(1)), cur, price_m.group(1))
     if price is None:
         return None
     return {
@@ -361,12 +434,35 @@ def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, Any]]:
-    """Fallback أخير: أنماط سعر واسم في HTML الخام."""
-    price_m = re.search(r'"price"\s*:\s*"?([\d.,]+)"?', html, re.I)
-    if not price_m:
-        return None
-    price = _parse_price(price_m.group(1))
-    if price is None:
+    """Fallback أخير: JSON snippets/meta/classes للأسعار."""
+    candidates: List[tuple] = []
+
+    # 1) JSON snippets: price + priceCurrency
+    for pm in re.finditer(r'"price"\s*:\s*"?([\d.,]+)"?', html or "", re.I):
+        raw = pm.group(1)
+        around = (html or "")[max(0, pm.start() - 220): pm.end() + 220]
+        cm = re.search(r'"priceCurrency"\s*:\s*"([A-Za-z]{3})"', around, re.I)
+        cur = cm.group(1).strip() if cm else _currency_hint(around)
+        p = _parse_price(raw)
+        if p and p > 0:
+            candidates.append((p, cur, raw))
+
+    # 2) meta tags
+    meta_price_m = _OG_PRICE_RE.search(html or "") or _PRICE_META_RE.search(html or "")
+    if meta_price_m:
+        cur_m = _OG_CURRENCY_RE.search(html or "") or _PRICE_META_CURRENCY_RE.search(html or "")
+        cur = cur_m.group(1).strip() if cur_m else _currency_hint(meta_price_m.group(1))
+        p = _parse_price(meta_price_m.group(1))
+        if p and p > 0:
+            candidates.append((p, cur, meta_price_m.group(1)))
+
+    # 3) common classes: .product-price / .price / .amount / .text-sm-2
+    class_hit = _extract_price_from_common_classes(html or "")
+    if class_hit:
+        candidates.append(class_hit)
+
+    price = _pick_price_candidate(candidates)
+    if price is None or price <= 0:
         return None
     name_m = _OG_TITLE_RE.search(html)
     if not name_m:
@@ -398,16 +494,24 @@ def extract_product(html: str, page_url: str) -> Optional[Dict[str, Any]]:
 # ══════════════════════════════════════════════════════════════════════════
 #  جلب صفحة منتج واحدة — retry + anti-ban + fallbacks
 # ══════════════════════════════════════════════════════════════════════════
+# ── Circuit Breaker — يوقف محاولات دومين يرفض باستمرار ──────────────────
+_DOMAIN_MAX_FAIL = 25  # رفض الدومين بعد 25 فشل متتالٍ
+
 async def fetch_product(
     session: aiohttp.ClientSession,
     url: str,
     store_domain: str,
     sem: asyncio.Semaphore,
     progress: Progress,
+    cb: Dict[str, int],          # {domain: consecutive_failures}
 ) -> Optional[Dict[str, Any]]:
+    # تحقق من Circuit Breaker قبل حجز السيمافور (لا ننتظر ولا نهدر طلباً)
+    if cb.get(store_domain, 0) >= _DOMAIN_MAX_FAIL:
+        return None
+
     async with sem:
         resp = await fetch_with_retry(
-            session, url, max_retries=3, referer=f"https://{store_domain}/"
+            session, url, max_retries=2, referer=f"https://{store_domain}/"
         )
 
         html: Optional[str] = None
@@ -424,9 +528,16 @@ async def fetch_product(
         progress.update(urls_processed=progress._data["urls_processed"] + 1)
 
         if not html:
-            progress.error(f"{url} → تعذّر الجلب بعد كل المحاولات")
+            cb[store_domain] = cb.get(store_domain, 0) + 1
+            if cb[store_domain] == _DOMAIN_MAX_FAIL:
+                logger.warning(
+                    "⛔ %s — %d فشل متتالٍ. تفعيل Circuit Breaker، تخطّي الروابط المتبقية.",
+                    store_domain, _DOMAIN_MAX_FAIL,
+                )
             return None
 
+        # نجاح — أعد ضبط العداد
+        cb[store_domain] = 0
         product = extract_product(html, url)
         if product:
             product["store"] = store_domain
@@ -439,7 +550,7 @@ async def fetch_product(
 # ══════════════════════════════════════════════════════════════════════════
 async def run_scraper(
     max_products_per_store: int = 0,
-    concurrency: int = 8,
+    concurrency: int = 3,
     incremental: bool = True,
 ) -> int:
     """
@@ -480,6 +591,7 @@ async def run_scraper(
     rows_written = 0
     sem = asyncio.Semaphore(concurrency)
     new_lastmod_cache: Dict[str, str] = {}
+    circuit_breaker: Dict[str, int] = {}  # domain → فشل متتالٍ
 
     from scrapers.sitemap_resolve import resolve_product_entries
 
@@ -552,7 +664,7 @@ async def run_scraper(
             )
 
             tasks = [
-                fetch_product(session, url, domain, sem, progress)
+                fetch_product(session, url, domain, sem, progress, circuit_breaker)
                 for url in urls_to_fetch
             ]
 
@@ -606,8 +718,8 @@ def main() -> None:
         help="أقصى عدد منتجات لكل متجر (0 = جميع المنتجات بلا سقف)",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=8,
-        help="عدد الطلبات المتزامنة",
+        "--concurrency", type=int, default=3,
+        help="عدد الطلبات المتزامنة (الافتراضي 3 لتجنب الحجب)",
     )
     parser.add_argument(
         "--full", action="store_true",
