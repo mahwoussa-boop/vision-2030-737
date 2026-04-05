@@ -3,10 +3,12 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
+# Railway: أنشئ Volume واضبط Mount path = /data (أو أي مسار؛ عرّف نفس القيمة في Variables كـ DATA_DIR).
+ENV DATA_DIR=/data
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DATA_DIR=/data
+    PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -14,14 +16,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# إنشاء مجلد البيانات والتأكد من صلاحيات الكتابة
-RUN mkdir -p /data && chmod 777 /data
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# الاعتماد على الإعدادات الموجودة في .streamlit/config.toml
-# Railway ستقوم بتوجيه الترافيك تلقائياً للمنفذ الذي تفتحه الحاوية
-CMD ["streamlit", "run", "app.py"]
+RUN sed -i 's/\r$//' docker-entrypoint.sh 2>/dev/null || true \
+    && chmod +x docker-entrypoint.sh
+
+EXPOSE 8501
+
+# لا تضبط STREAMLIT_SERVER_PORT في Variables على "$PORT" — اترك المنفذ لـ PORT أو للسكربت
+ENTRYPOINT ["./docker-entrypoint.sh"]
