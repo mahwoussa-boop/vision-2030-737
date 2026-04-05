@@ -389,7 +389,12 @@ def _looks_like_image_url(s: str) -> bool:
         return False
     if _IMG_URL_RE.search(vl):
         return True
-    return any(x in vl for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"))
+    if any(x in vl for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+        return True
+    # CDN سلة: cdn.salla.sa/cdn-cgi/image/... — دائماً صورة
+    if "cdn.salla" in vl or "cdn-cgi/image" in vl:
+        return True
+    return False
 
 
 _EMBEDDED_HTTP_IMG = re.compile(
@@ -433,8 +438,14 @@ def _column_content_scores(series):
         vl = v.strip().lower()
         if "http://" in vl or "https://" in vl or vl.startswith("//"):
             http_n += 1
-        if _IMG_URL_RE.search(vl) or ("http" in vl and any(
-            x in vl for x in (".jpg", ".png", ".webp", ".jpeg", ".gif"))):
+        if (
+            _IMG_URL_RE.search(vl)
+            or ("http" in vl and any(x in vl for x in (".jpg", ".png", ".webp", ".jpeg", ".gif")))
+            # CDN روابط سلة (cdn.salla.sa/cdn-cgi/image/...) — قد لا تنتهي بامتداد واضح
+            or ("cdn.salla" in vl and "http" in vl)
+            or ("cdn-cgi/image" in vl and "http" in vl)
+            or ("salla.sa" in vl and any(x in vl for x in ("image", "img", "photo", "media")))
+        ):
             img_n += 1
         try:
             x = float(str(v).replace(",", "").replace("ر.س", "").replace("﷼", "").strip())
@@ -512,6 +523,15 @@ def _infer_column_roles(df):
                 if len(txt) >= 20:
                     rename[c] = "اسم المنتج"
                     break
+
+    # #region agent log H2
+    try:
+        import json, time
+        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+            _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"engine.py:_infer_column_roles","message":"rename_map","data":{"input_cols":list(df.columns),"rename":rename},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
     if rename:
         df = df.rename(columns=rename)
@@ -1202,7 +1222,8 @@ def _fcol_optional(df, cands):
 
 
 def _find_image_column(df):
-    """عمود صورة المنتج — يشمل تصدير سلة ([n] الصورة / اللون) ومرادفات."""
+    """عمود صورة المنتج — يشمل تصدير سلة ([n] الصورة / اللون) ومرادفات.
+    Fallback: فحص المحتوى لروابط CDN من سلة (cdn.salla.sa / cdn-cgi/image)."""
     if df is None or df.empty:
         return None
     c = _fcol_optional(df, [
@@ -1212,6 +1233,7 @@ def _find_image_column(df):
     ])
     if c:
         return c
+    # بحث جزئي في اسم العمود
     for col in df.columns:
         sc = str(col)
         if "وصف صورة" in sc or "وصف صوره" in sc:
@@ -1219,6 +1241,25 @@ def _find_image_column(df):
         if "صورة" in sc or "image" in sc.lower():
             return col
         if "thumb" in sc.lower() and "url" not in sc.lower():
+            return col
+    # Fallback: فحص المحتوى — يكتشف عمود صور سلة حتى لو كان اسمه CSS غريب
+    for col in df.columns:
+        sc = str(col)
+        if "وصف صورة" in sc or "وصف صوره" in sc or "رابط" in sc:
+            continue
+        sample = df[col].dropna().astype(str).head(20)
+        img_hits = sum(
+            1 for v in sample
+            if (
+                "cdn.salla" in v
+                or "cdn-cgi/image" in v
+                or (v.startswith("http") and _IMG_URL_RE.search(v.lower()))
+                or (v.startswith("http") and any(
+                    x in v for x in (".jpg", ".png", ".webp", ".jpeg", ".gif")
+                ))
+            )
+        )
+        if img_hits >= max(1, len(sample) * 0.3):
             return col
     return None
 
@@ -1326,7 +1367,16 @@ def _name_col_for_analysis(df):
         return ""
     if "المنتج" in df.columns:
         return "المنتج"
-    return _find_product_name_column(df)
+    result = _find_product_name_column(df)
+    # #region agent log H2/H3
+    try:
+        import json, time
+        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+            _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"engine.py:_name_col_for_analysis","message":"name_col_detected","data":{"cols":list(df.columns)[:10],"detected":result},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    return result
 
 
 def _first_product_page_url_from_row(row):
