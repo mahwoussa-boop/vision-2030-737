@@ -1,11 +1,11 @@
+# Cursor MCP (نسخة حقيقية بالمفاتيح — لا ترفعها؛ انسخ من mcp.json.example)
+.cursor/mcp.json
+
 __pycache__/
 *.pyc
 *.pyo
 *.db
+data/scrape_events.ndjson
 .streamlit/secrets.toml
-
-# ملفات البيانات المحلية — لا تُرفع لـ GitHub أبداً
-# يتم نقلها لـ Railway عبر متغيرات البيئة (Base64) أو Railway Volume
-data/
-*.csv
-*.json
+.streamlit/secrets.toml
+API_SETUP.md
