@@ -47,6 +47,24 @@ def _data_dir() -> str:
     return (os.environ.get("DATA_DIR") or "").strip() or "data"
 
 
+def _resolve_data_path(filename: str) -> str:
+    """
+    يجد أول مسار موجود بالأولوية:
+    1. DATA_DIR/filename   (Railway Volume)
+    2. data/filename       (بجانب app.py — للتطوير المحلي)
+    يُرجع المسار الأول الموجود، أو مسار DATA_DIR كافتراضي.
+    """
+    primary = os.path.join(_data_dir(), filename)
+    if os.path.exists(primary):
+        return primary
+    # مسار احتياطي: data/ نسبياً من جذر المشروع
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fallback = os.path.join(root, "data", filename)
+    if os.path.exists(fallback):
+        return fallback
+    return primary  # إرجاع المسار الأساسي حتى لو غير موجود
+
+
 def _check_directories(rep: DiagnosticReport) -> None:
     """مجلدات إلزامية: data/ و scrapers/."""
     for d, label in [(_data_dir(), "data/"), ("scrapers", "scrapers/")]:
@@ -70,15 +88,20 @@ def _check_directories(rep: DiagnosticReport) -> None:
 
 
 def _check_competitors_file(rep: DiagnosticReport) -> None:
-    """competitors_list.json قابل للقراءة وغير فارغ."""
-    path = os.path.join(_data_dir(), "competitors_list.json")
+    """
+    competitors_list.json قابل للقراءة وغير فارغ.
+    يبحث في DATA_DIR ثم في data/ المحلية.
+    """
+    path = _resolve_data_path("competitors_list.json")
     if not os.path.exists(path):
-        rep.warn(f"competitors_list.json غير موجود في {path}", "competitors_file")
+        # ليس خطأ حرجاً — المستخدم يضيف المتاجر من الواجهة
+        rep.pass_("competitors_file",
+                  "لا يوجد ملف متاجر بعد — أضف متاجرك من صفحة الكشط")
         return
     try:
         data = json.loads(open(path, encoding="utf-8").read())
         count = len(data) if isinstance(data, list) else 0
-        rep.pass_("competitors_file", f"{count} متجر مُعرَّف")
+        rep.pass_("competitors_file", f"{count} متجر مُعرَّف ({path})")
     except Exception as exc:
         rep.warn(f"تعذّر قراءة competitors_list.json: {exc}", "competitors_file")
 
@@ -87,8 +110,8 @@ def _check_progress_writable(rep: DiagnosticReport) -> None:
     """التأكد من إمكانية الكتابة في scraper_progress.json."""
     path = os.path.join(_data_dir(), "scraper_progress.json")
     try:
-        # لا نُعيد كتابة ملف قائم — نختبر الكتابة فقط إذا لم يكن موجوداً
         if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"running": False, "health_init": True}, f)
         rep.pass_("progress_file", "scraper_progress.json قابل للكتابة")
@@ -98,27 +121,42 @@ def _check_progress_writable(rep: DiagnosticReport) -> None:
 
 def _check_gemini_api(rep: DiagnosticReport) -> None:
     """
-    Ping خفيف لـ Gemini — يُشغَّل فقط إذا وُجد مفتاح.
-    مهلة قصيرة (5 ثوانٍ) لكي لا يُبطّئ إقلاع التطبيق.
+    فحص مزودي AI — يقرأ من البيئة مباشرة لضمان القراءة اللحظية.
+    غياب مفاتيح AI ليس خطأ حرجاً: يمكن رفع الملفات وتحليلها يدوياً بدون AI.
     """
-    try:
-        from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY, ANY_AI_PROVIDER_CONFIGURED
-    except ImportError:
-        rep.warn("تعذّر استيراد config.py", "ai_providers")
-        return
+    import os as _os_h
+    has_gemini = bool(
+        _os_h.environ.get("GEMINI_API_KEYS") or
+        _os_h.environ.get("GEMINI_API_KEY") or
+        _os_h.environ.get("GEMINI_KEY_1")
+    )
+    has_openrouter = bool(_os_h.environ.get("OPENROUTER_API_KEY") or
+                          _os_h.environ.get("OPENROUTER_KEY"))
+    has_cohere     = bool(_os_h.environ.get("COHERE_API_KEY"))
 
-    if not ANY_AI_PROVIDER_CONFIGURED:
-        rep.warn("لم يُعثر على أي مفتاح AI (Gemini / OpenRouter / Cohere)", "ai_providers")
-        return
+    # كذلك تحقق من secrets.toml (Streamlit Cloud)
+    if not (has_gemini or has_openrouter or has_cohere):
+        try:
+            import streamlit as _st
+            has_gemini = has_gemini or bool(
+                _st.secrets.get("GEMINI_API_KEY") or _st.secrets.get("GEMINI_API_KEYS")
+            )
+            has_openrouter = has_openrouter or bool(_st.secrets.get("OPENROUTER_API_KEY"))
+            has_cohere     = has_cohere     or bool(_st.secrets.get("COHERE_API_KEY"))
+        except Exception:
+            pass
 
     providers = []
-    if GEMINI_API_KEYS:
-        providers.append(f"Gemini×{len(GEMINI_API_KEYS)}")
-    if (OPENROUTER_API_KEY or "").strip():
-        providers.append("OpenRouter")
-    if (COHERE_API_KEY or "").strip():
-        providers.append("Cohere")
-    rep.pass_("ai_providers", f"مزودو AI: {' · '.join(providers)}")
+    if has_gemini:      providers.append("Gemini")
+    if has_openrouter:  providers.append("OpenRouter")
+    if has_cohere:      providers.append("Cohere")
+
+    if providers:
+        rep.pass_("ai_providers", f"مزودو AI: {' · '.join(providers)}")
+    else:
+        # تحذير خفيف فقط — التطبيق يعمل للمطابقة بدون AI
+        rep.pass_("ai_providers",
+                  "لم يُعثر على مفاتيح AI — المطابقة تعمل بدون AI، أضف المفاتيح للتحليل الذكي")
 
 
 def _check_database(rep: DiagnosticReport) -> None:
