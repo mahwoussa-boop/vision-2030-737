@@ -1,6 +1,6 @@
 """
 config.py - الإعدادات المركزية v19.0
-المفاتيح محمية عبر Streamlit Secrets
+المفاتيح: أولاً os.environ (Railway / Docker)، ثم Streamlit Secrets عند التوفر.
 """
 import json as _json
 import os as _os
@@ -20,12 +20,12 @@ GEMINI_MODEL = "gemini-2.0-flash"   # النموذج المستقر الموصى
 # ══════════════════════════════════════════════
 def _s(key, default=""):
     """
-    يقرأ Secret بـ 3 طرق:
-    1. st.secrets[key]         الطريقة المباشرة (Streamlit Cloud)
-    2. os.environ              Railway Environment Variables
-    3. default                 القيمة الافتراضية
+    يقرأ الإعداد بـ 3 طرق (بالترتيب):
+    1. os.environ              Railway / Docker / متغيرات النظام
+    2. st.secrets[key]         Streamlit Cloud عند وجود secrets.toml
+    3. default
     """
-    # 1. Railway / os.environ أولاً (يعمل في البناء والتشغيل)
+    # 1. البيئة أولاً — مطلوب على Railway حيث لا يوجد secrets.toml
     v = _os.environ.get(key, "")
     if v:
         return v

@@ -1160,35 +1160,67 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    # زر تشخيص سريع
+    # زر تشخيص سريع — Railway يستخدم متغيرات البيئة وليس secrets.toml
     if not ai_ok:
         if st.button("🔍 تشخيص المشكلة", key="diag_btn"):
             import os
-            st.write("**الـ secrets المتاحة:**")
+
+            def _mask(v: str) -> str:
+                v = str(v or "").strip()
+                if len(v) <= 12:
+                    return "***" if v else ""
+                return v[:8] + "…" + v[-4:]
+
+            st.info(
+                "على **Railway / Docker**: أضف المتغير `GEMINI_API_KEY` أو `GEMINI_API_KEYS` "
+                "في إعدادات الخدمة → Variables (لا يعتمد التطبيق على ملف secrets.toml هناك)."
+            )
+            st.write("**متغيرات البيئة ذات الصلة:**")
+            _any = False
+            for key_name in (
+                "GEMINI_API_KEYS",
+                "GEMINI_API_KEY",
+                "GEMINI_KEY_1",
+                "GEMINI_KEY_2",
+                "GEMINI_KEY_3",
+            ):
+                raw = os.environ.get(key_name, "")
+                if raw:
+                    _any = True
+                    st.success(f"✅ `{key_name}` = `{_mask(raw)}` (طول {len(raw)})")
+                else:
+                    st.caption(f"— `{key_name}` غير مضبوط")
+            st.write(f"**ما يقرأه التطبيق الآن:** `{len(GEMINI_API_KEYS)}` مفتاحاً فعّالاً")
+            if not _any:
+                st.warning(
+                    "لم يُعثر على أي مفتاح في البيئة. أنشئ مفتاحاً من Google AI Studio "
+                    "وأضف `GEMINI_API_KEY` في Railway ثم أعد النشر."
+                )
+            st.write("**Streamlit secrets (اختياري — Streamlit Cloud فقط):**")
             try:
-                available = list(st.secrets.keys())
-                for k in available:
+                _sk = list(st.secrets.keys())
+                for k in _sk:
                     val = str(st.secrets[k])
-                    masked = val[:8] + "..." if len(val) > 8 else val
-                    st.write(f"  `{k}` = `{masked}`")
+                    st.caption(f"  `{k}` = `{_mask(val)}`")
+                if not _sk:
+                    st.caption("لا مفاتيح — طبيعي على Railway عند الاعتماد على Variables فقط.")
             except Exception as e:
-                st.error(f"خطأ: {e}")
-            # محاولة مباشرة
-            for key_name in ["GEMINI_API_KEYS","GEMINI_API_KEY","GEMINI_KEY_1"]:
-                try:
-                    v = st.secrets[key_name]
-                    st.success(f"✅ وجدت {key_name} = {str(v)[:20]}...")
-                except:
-                    st.warning(f"❌ {key_name} غير موجود")
+                st.caption(f"لا ملف secrets (طبيعي على Railway): {e}")
 
     # حالة المعالجة — تحديث حي مع auto-rerun
     if st.session_state.job_id:
         job = get_job_progress(st.session_state.job_id)
         if job:
             if job["status"] == "running":
-                pct = job["processed"] / max(job["total"], 1)
-                st.progress(min(pct, 0.99),
-                            f"⚙️ {job['processed']}/{job['total']} منتج")
+                tot = max(int(job.get("total") or 0), 1)
+                proc = min(int(job.get("processed") or 0), tot)
+                pct = proc / tot
+                pct_lbl = f"{100.0 * pct:.1f}%"
+                st.progress(
+                    min(pct, 0.99),
+                    f"⚙️ {proc}/{tot} منتج — {pct_lbl}",
+                )
+                st.caption("تحليل خلفي — يُحدَّث كل بضع ثوانٍ. لا تغلق الصفحة حتى يكتمل.")
                 # تحديث تلقائي كل 4 ثوانٍ بدون إعادة تشغيل الكود كاملاً
                 try:
                     from streamlit_autorefresh import st_autorefresh
