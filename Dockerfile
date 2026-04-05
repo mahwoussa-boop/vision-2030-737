@@ -22,7 +22,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8501
-
 # Railway / Render set PORT; default 8501 for local docker run.
+# تم استخدام صيغة تضمن عدم تمرير $PORT كسلسلة نصية إذا كانت فارغة
 CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
