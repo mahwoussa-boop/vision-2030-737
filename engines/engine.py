@@ -11,10 +11,11 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
   4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, hashlib, sqlite3, time
+import re, io, json, os, hashlib, sqlite3, time
 from datetime import datetime
 import pandas as pd
 from utils.data_helpers import first_image_url_string, pid_from_row as _pid
+from utils.data_paths import get_data_db_path
 from utils.helpers import favicon_url_for_site, fetch_og_image_url
 from rapidfuzz import fuzz, process as rf_process
 from rapidfuzz.distance import Indel
@@ -273,11 +274,7 @@ def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
     return best_brand
 
 # ─── SQLite Cache ───────────────────────────
-try:
-    from config import MATCH_CACHE_DB as _DB
-except ImportError:
-    _DB = "match_cache_v21.db"
-
+_DB = get_data_db_path("match_cache_v21.db")
 def _init_db():
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
