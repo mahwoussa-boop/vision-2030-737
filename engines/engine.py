@@ -341,6 +341,15 @@ def _drop_scraper_columns(df):
     """حذف أعمدة تبدو كمخرجات كشط وليست حقولاً حقيقية."""
     if df is None or df.empty:
         return df
+    # لا نحذف أعمدة الكشط الخام قبل أن نضمن وجود أعمدة قياسية.
+    # بعض ملفات المنافسين تأتي برؤوس CSS فقط (text-sm-2 / abs-size href / w-full src).
+    canonical_headers = {
+        "اسم المنتج", "المنتج", "سعر المنتج", "السعر",
+        "صورة المنتج", "رابط المنتج", "الماركة",
+    }
+    has_canonical = any(str(c).strip() in canonical_headers for c in df.columns)
+    if not has_canonical:
+        return df
     keep = [c for c in df.columns if not _is_scraper_column_name(c)]
     if not keep:
         return df
@@ -509,6 +518,44 @@ def _infer_column_roles(df):
     return df
 
 
+def _force_ingestion_cleanup(df):
+    """
+    تنظيف إلزامي لطبقة الإدخال:
+    1) كشف صف العناوين الحقيقي (بيانات المنتج/Unnamed).
+    2) توحيد أخطاء الرؤوس (أسم المنتج ...).
+    3) ترجمة أعمدة CSS/HTML إلى أعمدة مفهومة للمحرك.
+    4) تخمين الأدوار من المحتوى كـ fallback.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out.columns = out.columns.map(lambda x: str(x).strip().replace("\ufeff", ""))
+    out = out.dropna(how="all").reset_index(drop=True)
+    out = _detect_double_header(out)
+    out.columns = out.columns.map(lambda x: str(x).strip().replace("\ufeff", ""))
+    out = _normalize_header_typos(out)
+    # توحيد قسري لبعض الرؤوس الشائعة في تصدير المتجر.
+    forced = {}
+    for c in out.columns:
+        sc = str(c).strip()
+        if sc == "أسم المنتج":
+            forced[c] = "اسم المنتج"
+        elif sc in ("رمز المنتج sku", "رمز المنتج SKU"):
+            forced[c] = "رمز المنتج sku"
+    if forced:
+        out = out.rename(columns=forced)
+    if ("سعر المنتج" not in out.columns) and ("السعر" not in out.columns):
+        for alt_price in ("السعر المخفض", "السعر بعد الخصم"):
+            if alt_price in out.columns:
+                out = out.rename(columns={alt_price: "سعر المنتج"})
+                break
+    out = _smart_rename_columns(out)
+    out = _infer_column_roles(out)
+    out = _drop_scraper_columns(out)
+    out = _normalize_header_typos(out)
+    return out
+
+
 # ─── دوال أساسية ────────────────────────────
 def read_file(f):
     try:
@@ -542,13 +589,7 @@ def read_file(f):
                 df = pd.read_excel(f)
         else:
             return None, "صيغة غير مدعومة"
-        df.columns = df.columns.map(lambda x: str(x).strip().replace('\ufeff', ''))
-        df = df.dropna(how='all').reset_index(drop=True)
-        df = _normalize_header_typos(df)
-        df = _drop_scraper_columns(df)
-        df = _detect_double_header(df)
-        df = _smart_rename_columns(df)
-        df = _infer_column_roles(df)
+        df = _force_ingestion_cleanup(df)
         return df, None
     except Exception as e:
         return None, str(e)
@@ -584,10 +625,22 @@ def _should_use_second_row_header(peek):
 
 def _detect_double_header(df):
     """كشف ملفات ذات صفين عناوين (مثل ملف سلة الذي يحتوي على صف مجموعة + صف عناوين)"""
+    if df is None or df.empty:
+        return df
     cols = list(df.columns)
-    unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed'))
-    # إذا أغلب الأعمدة Unnamed → الصف الأول من البيانات قد يكون العناوين الحقيقية
-    if unnamed_count >= len(cols) // 2 and len(df) > 2:
+    unnamed_count = sum(1 for c in cols if str(c).startswith("Unnamed"))
+    group_like_count = sum(
+        1 for c in cols
+        if ("بيانات" in str(c)) or str(c).lower().startswith("unnamed")
+    )
+    looks_like_group_header = (
+        unnamed_count >= max(1, len(cols) // 2)
+        or group_like_count >= max(1, len(cols) // 3)
+        or ("بيانات المنتج" in str(cols[0]) if cols else False)
+    )
+    # إذا ظهر أن الترويسة الحالية "صف مجموعات" أو Unnamed
+    # فالصف الأول غالباً يحمل العناوين الحقيقية.
+    if looks_like_group_header and len(df) >= 1:
         # تحقق: هل الصف الأول يحتوي على أسماء أعمدة معروفة؟
         first_row = df.iloc[0].astype(str).tolist()
         _known_headers = [
@@ -615,21 +668,27 @@ def _detect_double_header(df):
     return df
 
 
+_DIRTY_COL_RE = re.compile(
+    r"(__|styles?_|productcard|text-|w-full|abs-|h-\d|p-\d|gap-|grid-|flex|rounded"
+    r"|sm:|md:|lg:|truncate|min-w|max-w|hover:|focus:|justify-|items-"
+    r"|className|cls\b|src\b|href\b)",
+    re.I,
+)
+_FIRST_URL_RE = re.compile(r"(https?://[^\s\"\'<>,،]+)")
+
+
 def _smart_rename_columns(df):
-    """التعرف العميق على الأعمدة (Scraper CSS + محتوى) — أسماء موحّدة مع _fcol و resolve_catalog_columns."""
+    """التعرف العميق والترجمة القسرية لأعمدة الكشط العشوائية (CSS/HTML/Tailwind).
+
+    يغطي ملفات: عالم جيفنشي، سعيد صلاح، سلة، زد، Shopify، وأي تصدير كشط بأسماء CSS.
+    """
     if df is None or df.empty:
         return df
     cols = list(df.columns)
 
+    # ── هل الملف يحتوي على أعمدة قذرة (CSS / HTML / Unnamed)? ──
     is_dirty = any(
-        "__" in str(c)
-        or "style" in str(c).lower()
-        or "productcard" in str(c).lower()
-        or "text-" in str(c).lower()
-        or "w-full" in str(c).lower()
-        or "abs-" in str(c).lower()
-        or "href" in str(c).lower()
-        or "src" in str(c).lower()
+        _DIRTY_COL_RE.search(str(c))
         or str(c).lower().startswith("unnamed")
         for c in cols
     )
@@ -638,47 +697,80 @@ def _smart_rename_columns(df):
         blob = " ".join(str(c) for c in cols).lower()
         return ("اسم" in blob or "منتج" in blob) and ("سعر" in blob or "price" in blob)
 
-    if len(cols) == 4 and not is_dirty and _clean_arabic_headers():
+    if not is_dirty and _clean_arabic_headers():
+        return df
+    if not is_dirty:
         return df
 
-    if not is_dirty and len(cols) != 4:
-        return df
-
-    # أنماط شائعة في تصديرات الكشط (الأكثر تحديداً أولاً)
-    # — تغطي: CSS class names / HTML attrs / English / Arabic keywords
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 1: الترجمة القسرية بالأنماط (CSS → اسم عمود موحّد)
+    #  الأكثر تحديداً أولاً — يمنع الأنماط العامة من سرقة أعمدة مخصصة
+    # ═══════════════════════════════════════════════════════════════════
     CSS_PATTERNS = [
-        # ── CSS class names (worldgivenchy, saeedsalah, …) ──
-        ("styles_productcard__name",  "اسم المنتج"),
-        ("productcard__name",         "اسم المنتج"),
-        ("text-sm-2",                 "سعر المنتج"),
-        ("text-sm",                   "سعر المنتج"),
-        ("abs-size href",             "رابط المنتج"),
-        ("w-full src",                "صورة المنتج"),
-        ("w-full",                    "صورة المنتج"),
-        # ── HTML attributes (standalone) ──
-        ("href",                      "رابط المنتج"),
-        ("src",                       "صورة المنتج"),
+        # ── CSS class names: عالم جيفنشي (worldgivenchy) ──
+        ("styles_productcard__name",    "اسم المنتج"),
+        ("styles_productcard__price",   "سعر المنتج"),
+        ("styles_productcard__image",   "صورة المنتج"),
+        ("styles_productcard__link",    "رابط المنتج"),
+        ("styles_productcard__url",     "رابط المنتج"),
+        ("styles_productcard__brand",   "الماركة"),
+        # ── CSS class names: سعيد صلاح وشبيهاتها ──
+        ("productcard__name",           "اسم المنتج"),
+        ("productcard__title",          "اسم المنتج"),
+        ("productcard__price",          "سعر المنتج"),
+        ("productcard__image",          "صورة المنتج"),
+        ("productcard__link",           "رابط المنتج"),
+        ("productcard__brand",          "الماركة"),
+        ("product-card__name",          "اسم المنتج"),
+        ("product-card__price",         "سعر المنتج"),
+        ("product-card__image",         "صورة المنتج"),
+        ("product-card__link",          "رابط المنتج"),
+        # ── Tailwind-ish / Salla / generic CSS ──
+        ("text-sm-2",                   "سعر المنتج"),
+        ("text-sm text-",               "سعر المنتج"),
+        ("text-sm",                     "سعر المنتج"),
+        ("text-base",                   "اسم المنتج"),
+        ("text-lg",                     "اسم المنتج"),
+        ("abs-size href",               "رابط المنتج"),
+        ("abs-size",                    "رابط المنتج"),
+        ("w-full src",                  "صورة المنتج"),
+        ("w-full h-",                   "صورة المنتج"),
+        ("w-full",                      "صورة المنتج"),
+        ("aspect-square",               "صورة المنتج"),
+        ("object-cover",                "صورة المنتج"),
+        ("object-contain",              "صورة المنتج"),
+        # ── HTML attributes (standalone) — أقل تحديداً ──
+        ("href",                        "رابط المنتج"),
+        ("src",                         "صورة المنتج"),
         # ── English keywords ──
-        ("product_name",              "اسم المنتج"),
-        ("productname",               "اسم المنتج"),
-        ("product_title",             "اسم المنتج"),
-        ("title",                     "اسم المنتج"),
-        ("price",                     "سعر المنتج"),
-        ("image_url",                 "صورة المنتج"),
-        ("image",                     "صورة المنتج"),
-        ("img",                       "صورة المنتج"),
-        ("photo",                     "صورة المنتج"),
-        ("product_url",               "رابط المنتج"),
-        ("product_link",              "رابط المنتج"),
-        ("link",                      "رابط المنتج"),
-        ("url",                       "رابط المنتج"),
-        ("name",                      "اسم المنتج"),
+        ("product_name",                "اسم المنتج"),
+        ("productname",                 "اسم المنتج"),
+        ("product_title",               "اسم المنتج"),
+        ("product_price",               "سعر المنتج"),
+        ("productprice",                "سعر المنتج"),
+        ("title",                       "اسم المنتج"),
+        ("price",                       "سعر المنتج"),
+        ("image_url",                   "صورة المنتج"),
+        ("image",                       "صورة المنتج"),
+        ("img_url",                     "صورة المنتج"),
+        ("img",                         "صورة المنتج"),
+        ("photo",                       "صورة المنتج"),
+        ("thumbnail",                   "صورة المنتج"),
+        ("product_url",                 "رابط المنتج"),
+        ("product_link",                "رابط المنتج"),
+        ("link",                        "رابط المنتج"),
+        ("url",                         "رابط المنتج"),
+        ("name",                        "اسم المنتج"),
+        ("brand",                       "الماركة"),
         # ── Arabic keywords ──
-        ("اسم",                       "اسم المنتج"),
-        ("سعر",                       "سعر المنتج"),
-        ("صورة",                      "صورة المنتج"),
-        ("صوره",                      "صورة المنتج"),
-        ("رابط",                      "رابط المنتج"),
+        ("اسم المنتج",                  "اسم المنتج"),
+        ("أسم المنتج",                  "اسم المنتج"),
+        ("اسم",                         "اسم المنتج"),
+        ("سعر",                         "سعر المنتج"),
+        ("صورة",                        "صورة المنتج"),
+        ("صوره",                        "صورة المنتج"),
+        ("رابط",                        "رابط المنتج"),
+        ("ماركة",                       "الماركة"),
     ]
 
     KNOWN_EXACT = frozenset({
@@ -696,17 +788,16 @@ def _smart_rename_columns(df):
         if s in KNOWN_EXACT:
             return True
         sl = s.lower().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-        if sl in KNOWN_EXACT_EN:
-            return True
-        return False
+        return sl in KNOWN_EXACT_EN
 
     new_cols = {}
     used = set()
 
+    # مرور أول: مطابقة أنماط CSS (الأكثر تحديداً ينتصر — الترتيب حاسم)
     for col in cols:
         if _known_header(col):
             continue
-        csl = str(col).lower()
+        csl = str(col).lower().strip()
         for needle, std in CSS_PATTERNS:
             if needle in csl:
                 if std in used:
@@ -715,18 +806,18 @@ def _smart_rename_columns(df):
                 used.add(std)
                 break
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 2: فكّ التعارضات بتحليل المحتوى
+    #  إذا عمودان تطابقا مع نفس الدور (مثلاً: src + href كلاهما URLs)
+    #  أو بقيت أعمدة Unnamed/CSS بدون تعيين → نحللها بالمحتوى
+    # ═══════════════════════════════════════════════════════════════════
     for col in cols:
         if col in new_cols or _known_header(col):
             continue
         c_str = str(col).strip()
         need_heuristic = (
             c_str.startswith("Unnamed")
-            or "__" in c_str
-            or "style" in c_str.lower()
-            or "text-" in c_str.lower()
-            or "href" in c_str.lower()
-            or "src" in c_str.lower()
-            or "w-full" in c_str.lower()
+            or _DIRTY_COL_RE.search(c_str)
         )
         if not need_heuristic:
             continue
@@ -736,7 +827,10 @@ def _smart_rename_columns(df):
             continue
         vs = [v.strip() for v in sample.tolist()]
         n = len(vs)
+        if n == 0:
+            continue
 
+        # ── أسعار: أرقام بين 0.5 و 10,000,000 ──
         numeric_count = 0
         for v in vs:
             try:
@@ -747,30 +841,27 @@ def _smart_rename_columns(df):
                     .replace("SAR", "")
                     .strip()
                 )
-                if 0 <= x <= 10_000_000:
+                if 0 < x <= 10_000_000:
                     numeric_count += 1
             except (ValueError, TypeError):
                 pass
-        if numeric_count >= n * 0.6 and "سعر المنتج" not in used:
+        if numeric_count >= n * 0.55 and "سعر المنتج" not in used:
             new_cols[col] = "سعر المنتج"
             used.add("سعر المنتج")
             continue
 
-        url_count = sum(1 for v in vs if v.startswith("http"))
-        if url_count >= n * 0.5:
+        # ── روابط: http(s)://... ──
+        url_count = sum(1 for v in vs if "http://" in v.lower() or "https://" in v.lower())
+        if url_count >= n * 0.4:
             img_count = sum(
-                1
-                for v in vs
+                1 for v in vs
                 if (
-                    ("cdn.salla" in v or "cdn." in v.lower())
-                    or ".jpg" in v.lower()
-                    or ".png" in v.lower()
-                    or ".webp" in v.lower()
-                    or ".jpeg" in v.lower()
-                    or _IMG_URL_RE.search(v.lower())
+                    _IMG_URL_RE.search(v.lower())
+                    or "cdn.salla" in v
+                    or "cdn." in v.lower()
                 )
             )
-            if img_count >= max(1, n * 0.4) and "صورة المنتج" not in used:
+            if img_count >= max(1, n * 0.35) and "صورة المنتج" not in used:
                 new_cols[col] = "صورة المنتج"
                 used.add("صورة المنتج")
             elif "رابط المنتج" not in used:
@@ -778,34 +869,39 @@ def _smart_rename_columns(df):
                 used.add("رابط المنتج")
             continue
 
-        if "اسم المنتج" not in used:
+        # ── نصوص: اسم المنتج (أكثر من 5 أحرف في العينة) ──
+        avg_len = sum(len(v) for v in vs) / max(n, 1)
+        if avg_len >= 5 and "اسم المنتج" not in used:
             new_cols[col] = "اسم المنتج"
             used.add("اسم المنتج")
-        else:
-            new_cols[col] = col
 
     if new_cols:
         df = df.rename(columns=new_cols)
 
-    # تنظيف إلزامي للأعمدة الأساسية الأربعة — يمنع NaN من كسر المحرك لاحقاً
-    for _req_col, _is_url in [
-        ("اسم المنتج",  False),
-        ("سعر المنتج",  False),
-        ("صورة المنتج", True),
-        ("رابط المنتج", True),
-    ]:
-        if _req_col in df.columns:
-            df[_req_col] = (
-                df[_req_col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                # تنظيف حرف الاقتباس والفراغات الملتصقة بالروابط
-                .str.strip('"\'') if _is_url
-                else df[_req_col].fillna("").astype(str).str.strip()
-            )
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 3: تنظيف إلزامي — NaN + استخراج URLs نظيفة
+    # ═══════════════════════════════════════════════════════════════════
+    for _req_col in ("اسم المنتج", "سعر المنتج", "صورة المنتج", "رابط المنتج", "الماركة"):
+        if _req_col not in df.columns:
+            continue
+        df[_req_col] = df[_req_col].fillna("").astype(str).str.strip()
+
+    for _url_col in ("صورة المنتج", "رابط المنتج"):
+        if _url_col not in df.columns:
+            continue
+        df[_url_col] = (
+            df[_url_col]
+            .str.strip("\"'` \t\n\r")
+            .apply(lambda v: _extract_first_url(v) if v and "http" in v.lower() else v)
+        )
 
     return df
+
+
+def _extract_first_url(text: str) -> str:
+    """يستخرج أول رابط http(s) نظيف من نص قد يحتوي فوضى ملتصقة."""
+    m = _FIRST_URL_RE.search(text)
+    return m.group(1).rstrip(".,;)>]") if m else text.strip()
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
 _NOISE_RE = re.compile(
@@ -1868,6 +1964,15 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         "skipped_samples": 0,
         "no_competitor_found": 0,
     }
+    our_df = _force_ingestion_cleanup(our_df)
+    comp_dfs = {
+        str(cname): _force_ingestion_cleanup(cdf)
+        for cname, cdf in (comp_dfs or {}).items()
+        if cdf is not None
+    }
+    if our_df is None or our_df.empty or not comp_dfs:
+        return pd.DataFrame(results), audit_stats
+
     our_col       = _name_col_for_analysis(our_df)
     our_price_col = _fcol(our_df, ["سعر المنتج","السعر","سعر","Price","price","PRICE"])
     our_id_col    = _fcol_optional(our_df, [
@@ -2084,6 +2189,15 @@ def find_missing_products(our_df, comp_dfs):
     ✅ حد ثقة مزدوج: موجود(82%) / مشابه(68%)
     ✅ منع التكرار من منافسين مختلفين
     """
+    our_df = _force_ingestion_cleanup(our_df)
+    comp_dfs = {
+        str(cname): _force_ingestion_cleanup(cdf)
+        for cname, cdf in (comp_dfs or {}).items()
+        if cdf is not None
+    }
+    if our_df is None or our_df.empty or not comp_dfs:
+        return pd.DataFrame([])
+
     our_col = _name_col_for_analysis(our_df)
 
     # ── بناء فهرس منتجاتنا الكامل ─────────────────────────────────────
