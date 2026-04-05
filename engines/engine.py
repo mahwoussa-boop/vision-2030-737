@@ -645,14 +645,40 @@ def _smart_rename_columns(df):
         return df
 
     # أنماط شائعة في تصديرات الكشط (الأكثر تحديداً أولاً)
+    # — تغطي: CSS class names / HTML attrs / English / Arabic keywords
     CSS_PATTERNS = [
-        ("styles_productcard__name", "اسم المنتج"),
-        ("productcard__name", "اسم المنتج"),
-        ("text-sm-2", "سعر المنتج"),
-        ("text-sm", "سعر المنتج"),
-        ("abs-size href", "رابط المنتج"),
-        ("w-full src", "صورة المنتج"),
-        ("w-full", "صورة المنتج"),
+        # ── CSS class names (worldgivenchy, saeedsalah, …) ──
+        ("styles_productcard__name",  "اسم المنتج"),
+        ("productcard__name",         "اسم المنتج"),
+        ("text-sm-2",                 "سعر المنتج"),
+        ("text-sm",                   "سعر المنتج"),
+        ("abs-size href",             "رابط المنتج"),
+        ("w-full src",                "صورة المنتج"),
+        ("w-full",                    "صورة المنتج"),
+        # ── HTML attributes (standalone) ──
+        ("href",                      "رابط المنتج"),
+        ("src",                       "صورة المنتج"),
+        # ── English keywords ──
+        ("product_name",              "اسم المنتج"),
+        ("productname",               "اسم المنتج"),
+        ("product_title",             "اسم المنتج"),
+        ("title",                     "اسم المنتج"),
+        ("price",                     "سعر المنتج"),
+        ("image_url",                 "صورة المنتج"),
+        ("image",                     "صورة المنتج"),
+        ("img",                       "صورة المنتج"),
+        ("photo",                     "صورة المنتج"),
+        ("product_url",               "رابط المنتج"),
+        ("product_link",              "رابط المنتج"),
+        ("link",                      "رابط المنتج"),
+        ("url",                       "رابط المنتج"),
+        ("name",                      "اسم المنتج"),
+        # ── Arabic keywords ──
+        ("اسم",                       "اسم المنتج"),
+        ("سعر",                       "سعر المنتج"),
+        ("صورة",                      "صورة المنتج"),
+        ("صوره",                      "صورة المنتج"),
+        ("رابط",                      "رابط المنتج"),
     ]
 
     KNOWN_EXACT = frozenset({
@@ -760,6 +786,25 @@ def _smart_rename_columns(df):
 
     if new_cols:
         df = df.rename(columns=new_cols)
+
+    # تنظيف إلزامي للأعمدة الأساسية الأربعة — يمنع NaN من كسر المحرك لاحقاً
+    for _req_col, _is_url in [
+        ("اسم المنتج",  False),
+        ("سعر المنتج",  False),
+        ("صورة المنتج", True),
+        ("رابط المنتج", True),
+    ]:
+        if _req_col in df.columns:
+            df[_req_col] = (
+                df[_req_col]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                # تنظيف حرف الاقتباس والفراغات الملتصقة بالروابط
+                .str.strip('"\'') if _is_url
+                else df[_req_col].fillna("").astype(str).str.strip()
+            )
+
     return df
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
