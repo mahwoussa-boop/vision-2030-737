@@ -87,19 +87,25 @@ class Progress:
     def __init__(self, stores: list[str], total_urls: int):
         self._file = PROGRESS_FILE
         self._data = {
-            "running":          True,
-            "started_at":       datetime.now().isoformat(),
-            "updated_at":       datetime.now().isoformat(),
-            "stores_total":     len(stores),
-            "stores_done":      0,
-            "urls_total":       total_urls,
-            "urls_processed":   0,
-            "rows_in_csv":      0,
-            "fetch_exceptions": 0,
-            "success_rate_pct": 0,
-            "current_store":    "",
-            "last_error":       "",
-            "output_file":      str(OUTPUT_CSV),
+            "running":           True,
+            "started_at":        datetime.now().isoformat(),
+            "updated_at":        datetime.now().isoformat(),
+            "stores_total":      len(stores),
+            "stores_done":       0,
+            "urls_total":        total_urls,
+            "urls_processed":    0,
+            "rows_in_csv":       0,
+            "fetch_exceptions":  0,
+            "success_rate_pct":  0,
+            "current_store":     "",
+            "last_error":        "",
+            "output_file":       str(OUTPUT_CSV),
+            # تتبع تقدم المتجر الحالي
+            "store_urls_total":  0,
+            "store_urls_done":   0,
+            "store_started_at":  "",
+            # نتائج كل متجر {domain: عدد_المنتجات}
+            "stores_results":    {},
         }
         self._flush()
 
@@ -294,8 +300,13 @@ async def run_scraper(
                                     headers=default_headers) as session:
         for store_url in stores:
             domain = urlparse(store_url).netloc
-            progress.update(current_store=domain,
-                            stores_done=progress._data["stores_done"])
+            progress.update(
+                current_store=domain,
+                stores_done=progress._data["stores_done"],
+                store_urls_total=0,
+                store_urls_done=0,
+                store_started_at=datetime.now().isoformat(),
+            )
             logger.info("↳ %s", domain)
 
             try:
@@ -308,29 +319,50 @@ async def run_scraper(
 
             if not product_urls:
                 logger.warning("لا روابط منتجات لـ %s", domain)
-                progress.update(stores_done=progress._data["stores_done"] + 1)
+                _res = dict(progress._data.get("stores_results") or {})
+                _res[domain] = 0
+                progress.update(
+                    stores_done=progress._data["stores_done"] + 1,
+                    stores_results=_res,
+                )
                 continue
+
+            _capped_urls = (
+                product_urls if max_products_per_store <= 0
+                else product_urls[:max_products_per_store]
+            )
+            # أعلم الـ Progress بإجمالي روابط المتجر الحالي
+            progress.update(store_urls_total=len(_capped_urls), store_urls_done=0)
 
             tasks = [
                 fetch_product(session, url, domain, sem, progress)
-                for url in (product_urls if max_products_per_store <= 0
-                            else product_urls[:max_products_per_store])
+                for url in _capped_urls
             ]
 
-            for coro in asyncio.as_completed(tasks):
+            _store_rows = 0
+            for _url_idx, coro in enumerate(asyncio.as_completed(tasks)):
                 result = await coro
+                # تحديث عداد روابط المتجر الحالي
+                progress.update(store_urls_done=_url_idx + 1)
                 if result:
                     writer.writerow(result)
                     rows_written += 1
+                    _store_rows += 1
                     if rows_written % 50 == 0:
                         csv_fh.flush()
                         progress.update(rows_in_csv=rows_written)
 
+            # تسجيل نتيجة المتجر المنتهي
+            _res = dict(progress._data.get("stores_results") or {})
+            _res[domain] = _store_rows
             progress.update(
                 stores_done=progress._data["stores_done"] + 1,
                 rows_in_csv=rows_written,
+                stores_results=_res,
+                store_urls_done=0,
+                store_urls_total=0,
             )
-            logger.info("  ✓ %s — %d منتج", domain, rows_written)
+            logger.info("  ✓ %s — %d منتج", domain, _store_rows)
 
     csv_fh.close()
     progress.done(rows_written)
