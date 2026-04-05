@@ -6,7 +6,10 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_HEADLESS=true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -23,5 +26,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Railway / Render set PORT; default 8501 for local docker run.
-# تم استخدام صيغة تضمن عدم تمرير $PORT كسلسلة نصية إذا كانت فارغة
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
+# نستخدم exec form مع متغير البيئة PORT الذي توفره Railway
+# تم استخدام script بسيط لضمان استبدال المتغير بشكل صحيح قبل التشغيل
+CMD ["sh", "-c", "STREAMLIT_SERVER_PORT=${PORT:-8501} streamlit run app.py"]
