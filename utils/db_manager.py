@@ -9,9 +9,14 @@ import hashlib
 import sqlite3, json, os
 from datetime import datetime
 
-# استخدام /tmp لضمان الكتابة على Streamlit Cloud (مجلد الكود read-only)
-_DB_NAME = "pricing_v18.db"
-DB_PATH = os.path.join("/tmp", _DB_NAME)
+# استخدام المسار المركزي من config لضمان الاستمرارية (Persistence)
+try:
+    from config import PRICING_V18_DB as DB_PATH
+except ImportError:
+    # Fallback في حال عدم التوفر
+    _DB_NAME = "pricing_v18.db"
+    _DATA_DIR = os.environ.get("DATA_DIR", "/tmp")
+    DB_PATH = os.path.join(_DATA_DIR, _DB_NAME)
 
 
 def _ts():

@@ -232,4 +232,18 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-DB_PATH          = "perfume_pricing.db"
+# ══════════════════════════════════════════════
+#  مسارات البيانات (Railway Persistence)
+# ══════════════════════════════════════════════
+DATA_DIR = _os.environ.get("DATA_DIR", "/tmp")
+# التأكد من وجود المجلد
+if not _os.path.exists(DATA_DIR):
+    try:
+        _os.makedirs(DATA_DIR, exist_ok=True)
+    except:
+        pass
+
+DB_PATH = _os.path.join(DATA_DIR, "perfume_pricing.db")
+MATCH_CACHE_DB = _os.path.join(DATA_DIR, "match_cache_v21.db")
+PRICING_V18_DB = _os.path.join(DATA_DIR, "pricing_v18.db")
+

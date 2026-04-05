@@ -5,13 +5,17 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    DATA_DIR=/data
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# إنشاء مجلد البيانات والتأكد من صلاحيات الكتابة
+RUN mkdir -p /data && chmod 777 /data
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

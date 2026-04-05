@@ -273,7 +273,11 @@ def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
     return best_brand
 
 # ─── SQLite Cache ───────────────────────────
-_DB = "match_cache_v21.db"
+try:
+    from config import MATCH_CACHE_DB as _DB
+except ImportError:
+    _DB = "match_cache_v21.db"
+
 def _init_db():
     try:
         cn = sqlite3.connect(_DB, check_same_thread=False)
