@@ -21,10 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN sed -i 's/\r$//' docker-entrypoint.sh 2>/dev/null || true \
-    && chmod +x docker-entrypoint.sh
-
 EXPOSE 8501
 
-# لا تضبط STREAMLIT_SERVER_PORT في Variables على "$PORT" — اترك المنفذ لـ PORT أو للسكربت
-ENTRYPOINT ["./docker-entrypoint.sh"]
+# Python يفرض STREAMLIT_SERVER_PORT رقماً (Railway قد يضع النص '$PORT' في المتغير)
+ENTRYPOINT ["python3", "docker_entrypoint.py"]
