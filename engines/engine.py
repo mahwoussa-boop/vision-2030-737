@@ -1987,7 +1987,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     our_id_col    = _fcol_optional(our_df, [
         "رقم المنتج","معرف المنتج","المعرف","معرف","رقم_المنتج","معرف_المنتج",
         "product_id","Product ID","Product_ID","ID","id","Id",
-        "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku",
+        "No.","no.","No","no","#",
+        "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku","رمز المنتج SKU",
         "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
     ]) or ""
     our_img_col = _fcol_optional(our_df, [
@@ -2008,12 +2009,9 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku",
             "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
         ]) or ""
-        c_img = _fcol_optional(cdf, [
-            "صورة المنتج", "صوره المنتج", "image", "Image", "product_image", "الصورة",
-        ])
-        c_url = _fcol_optional(cdf, [
-            "رابط المنتج", "الرابط", "رابط", "product_url", "link", "url", "URL",
-        ])
+        # _find_image_column أشمل من _fcol_optional — يغطي تصدير سلة وكل المرادفات
+        c_img = _find_image_column(cdf)
+        c_url = _find_url_column(cdf)
         indices[cname] = CompIndex(cdf, ccol, icol, cname, img_col=c_img, url_col=c_url)
 
     total   = len(our_df)
