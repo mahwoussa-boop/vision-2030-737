@@ -190,6 +190,71 @@ def _split_results(df):
     }
 
 
+def _merge_analysis_results(new_df: "pd.DataFrame", existing_df: "pd.DataFrame") -> "pd.DataFrame":
+    """دمج نتائج تحليل جديدة مع نتائج سابقة.
+
+    لكل منتج (معرَّف بـ معرف_المنتج أو اسمه) يُحتفظ بالمطابقة ذات أعلى نسبة تطابق.
+    المنتجات المستبعدة في التحليل الجديد لا تُستبدل إذا كان لها مطابقة في القديم.
+    """
+    if existing_df is None or existing_df.empty:
+        return new_df
+    if new_df is None or new_df.empty:
+        return existing_df
+
+    import pandas as _pd
+
+    def _key(row):
+        pid = str(row.get("معرف_المنتج", "") or "").strip()
+        if pid and pid not in ("nan", "None", "0", ""):
+            return pid
+        return str(row.get("المنتج", "") or "").strip().lower()
+
+    # بناء dict من النتائج القديمة مفتاح → صف
+    old_map = {}
+    for _, r in existing_df.iterrows():
+        k = _key(r)
+        if k:
+            old_map[k] = r
+
+    merged_rows = []
+    new_keys_seen = set()
+
+    for _, r_new in new_df.iterrows():
+        k = _key(r_new)
+        new_keys_seen.add(k)
+        score_new = float(r_new.get("نسبة_التطابق", 0) or 0)
+        decision_new = str(r_new.get("القرار", "") or "")
+
+        if k in old_map:
+            r_old = old_map[k]
+            score_old = float(r_old.get("نسبة_التطابق", 0) or 0)
+            decision_old = str(r_old.get("القرار", "") or "")
+            # احتفظ بالقديم إذا كان أفضل مطابقة (مستبعد لا يفوز على مطابقة حقيقية)
+            is_new_excluded = "مستبعد" in decision_new
+            is_old_excluded = "مستبعد" in decision_old
+            if is_new_excluded and not is_old_excluded:
+                merged_rows.append(r_old)
+            elif not is_new_excluded and is_old_excluded:
+                merged_rows.append(r_new)
+            elif score_new >= score_old:
+                merged_rows.append(r_new)
+            else:
+                merged_rows.append(r_old)
+        else:
+            merged_rows.append(r_new)
+
+    # أضف المنتجات القديمة غير الموجودة في التحليل الجديد
+    for k, r_old in old_map.items():
+        if k not in new_keys_seen:
+            merged_rows.append(r_old)
+
+    if not merged_rows:
+        return new_df
+
+    result = _pd.DataFrame(merged_rows).reset_index(drop=True)
+    return result
+
+
 def _analysis_mask_for_review_row(adf: pd.DataFrame, row: pd.Series) -> pd.Series:
     """مفتاح مطابقة صف المراجعة مع جدول التحليل الكامل."""
     try:
@@ -1492,6 +1557,11 @@ with st.sidebar:
                     _restored = restore_results_from_json(job["results"])
                     df_all = pd.DataFrame(_restored)
                     missing_df = pd.DataFrame(job.get("missing", [])) if job.get("missing") else pd.DataFrame()
+                    _prev_all_bg = (
+                        st.session_state.results.get("all", pd.DataFrame())
+                        if st.session_state.results else pd.DataFrame()
+                    )
+                    df_all = _merge_analysis_results(df_all, _prev_all_bg)
                     _r = _split_results(df_all)
                     _r["missing"] = missing_df
                     st.session_state.results     = _r
@@ -1822,7 +1892,53 @@ if page == "📊 لوحة التحكم":
                         # ── وضع الكشط التلقائي: تحميل CSV من القرص ────────
                         try:
                             _auto_df = pd.read_csv(_AUTO_CSV, encoding="utf-8-sig")
-                            comp_dfs["competitors_latest.csv"] = _auto_df
+
+                            # تحويل الأسعار من USD إلى SAR إذا كانت الأسعار بالدولار
+                            # (يحدث عندما يكشط السيرفر قبل تطبيق إصلاح العملة)
+                            if "price" in _auto_df.columns:
+                                _prices_num = pd.to_numeric(_auto_df["price"], errors="coerce").dropna()
+                                if len(_prices_num) > 0:
+                                    _avg_p = _prices_num.mean()
+                                    _max_p = _prices_num.max()
+                                    # أسعار الريال السعودي للعطور عادةً 50-5000 ر.س
+                                    # أسعار الدولار عادةً أقل بـ 3.75 مرة
+                                    # إذا كان المتوسط < 300 والأقصى < 1200 → الأرجح دولار
+                                    if _avg_p < 300 and _max_p < 1500:
+                                        _auto_df = _auto_df.copy()
+                                        _auto_df["price"] = pd.to_numeric(
+                                            _auto_df["price"], errors="coerce"
+                                        ).fillna(0) * 3.75
+                                        st.caption("💱 تم تحويل الأسعار: USD → SAR (×3.75)")
+
+                            # تقسيم بيانات الكاشط حسب المتجر لإظهار اسم المنافس الصحيح
+                            if "store" in _auto_df.columns:
+                                _store_counts = []
+                                for _store_name, _store_df in _auto_df.groupby("store", sort=False):
+                                    _sname = str(_store_name).strip() or "competitors_latest.csv"
+                                    comp_dfs[_sname] = _store_df.reset_index(drop=True)
+                                    _store_counts.append(f"{_sname}({len(_store_df)})")
+                                # #region agent log
+                                try:
+                                    import time as _tsl
+                                    with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+                                        _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H1","location":"app.py:store_split","message":"store split result","data":{"stores":_store_counts},"timestamp":int(_tsl.time()*1000)}) + "\n")
+                                except Exception:
+                                    pass
+                                # #endregion
+                                st.info(f"🏪 [DEBUG-H1] تقسيم المتاجر: {' | '.join(_store_counts)}")
+                                st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج — {', '.join(_store_counts)}")
+                            else:
+                                _missing_store_cols = list(_auto_df.columns[:15])
+                                # #region agent log
+                                try:
+                                    import time as _tsl2
+                                    with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf2:
+                                        _lf2.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H1","location":"app.py:no_store_col","message":"no store column found","data":{"cols":_missing_store_cols},"timestamp":int(_tsl2.time()*1000)}) + "\n")
+                                except Exception:
+                                    pass
+                                # #endregion
+                                st.warning(f"⚠️ [DEBUG-H1] عمود 'store' غير موجود — أعمدة CSV: {_missing_store_cols}")
+                                comp_dfs["competitors_latest.csv"] = _auto_df
                             st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج")
                         except Exception as _ae:
                             st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
@@ -1898,6 +2014,31 @@ if page == "📊 لوحة التحكم":
                                 safe_float(row.get("نسبة_التطابق", 0)),
                                 str(row.get("القرار", "")),
                             )
+
+                    # دمج مع النتائج السابقة إن وجدت (يمنع حذف مطابقات من مصادر سابقة)
+                    _prev_all = (
+                        st.session_state.results.get("all", pd.DataFrame())
+                        if st.session_state.results else pd.DataFrame()
+                    )
+                    # #region agent log
+                    try:
+                        import time as _tm2
+                        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf3:
+                            _lf3.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"app.py:merge","message":"merge before/after","data":{"new_rows":len(df_all),"prev_rows":len(_prev_all)},"timestamp":int(_tm2.time()*1000)}) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                    st.info(f"🔀 [DEBUG-H2] دمج النتائج: جديدة={len(df_all)} + سابقة={len(_prev_all)}")
+                    df_all = _merge_analysis_results(df_all, _prev_all)
+                    # #region agent log
+                    try:
+                        import time as _tm3
+                        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf4:
+                            _lf4.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"app.py:merge_after","message":"merge result","data":{"merged_rows":len(df_all)},"timestamp":int(_tm3.time()*1000)}) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                    st.info(f"✅ [DEBUG-H2] بعد الدمج: {len(df_all)} صف إجمالي")
 
                     _r = _split_results(df_all)
                     _r["missing"] = missing_df
