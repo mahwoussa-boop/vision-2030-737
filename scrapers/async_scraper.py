@@ -632,14 +632,14 @@ async def run_scraper(
     existing_rows = _load_existing_csv()
     logger.info("سجلات قديمة في CSV: %d", len(existing_rows))
 
+    progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
+
     # احسب عدد المنتجات المحفوظة مسبقاً لكل متجر (للعرض في الواجهة)
     from collections import Counter as _Counter
     _existing_by_store = _Counter(
         r.get("store", "").strip() for r in existing_rows.values() if r.get("store")
     )
     progress.update(stores_cached_counts=dict(_existing_by_store))
-
-    progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
     all_new_rows: List[Dict[str, Any]] = []
     rows_written = 0
     sem = asyncio.Semaphore(concurrency)
