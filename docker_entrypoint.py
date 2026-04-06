@@ -79,10 +79,26 @@ def _restore_data_files() -> None:
             print(f"[entrypoint] ℹ️ موجود (تخطي): {filename}")
             continue
         try:
+            content = base64.b64decode(b64_val, validate=True)
+            if not content:
+                print(f"[entrypoint] ⚠️ {env_key}: Base64 فارغ — تخطي {filename}")
+                continue
             with open(dest, "wb") as fh:
-                fh.write(base64.b64decode(b64_val))
+                fh.write(content)
             sz = os.path.getsize(dest)
+            # التحقق من صحة الترميز للملفات النصية (CSV/JSON)
+            if filename.endswith(('.csv', '.json')):
+                with open(dest, encoding='utf-8-sig', errors='strict') as _tf:
+                    _tf.read(1024)   # قراءة أولى للكشف عن تلف الترميز
             print(f"[entrypoint] ✅ Base64 → {filename} ({sz:,} bytes)")
+        except (base64.binascii.Error, ValueError) as e:
+            if os.path.exists(dest):
+                os.remove(dest)
+            print(f"[entrypoint] ❌ {env_key}: Base64 تالف — تم حذف الملف الناقص: {e}")
+        except UnicodeDecodeError as e:
+            if os.path.exists(dest):
+                os.remove(dest)
+            print(f"[entrypoint] ❌ {env_key}: ترميز {filename} خاطئ — تم حذفه: {e}")
         except Exception as e:
             print(f"[entrypoint] ❌ فشل Base64 {env_key}: {e}")
 

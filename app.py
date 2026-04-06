@@ -3041,54 +3041,115 @@ elif page == "⚠️ تحت المراجعة":
             st.warning(f"⚠️ {len(df)} منتج بمطابقة غير مؤكدة — يحتاج مراجعة بشرية أو AI")
 
             # ── تصنيف تلقائي بـ AI ────────────────────────────────────────
+            _rc_limit = min(len(df), 60)   # حد أقصى 60 منتج (6 دفعات × 10)
             col_r1, col_r2 = st.columns([2, 1])
             with col_r1:
-                if st.button("🤖 إعادة تصنيف بالذكاء الاصطناعي", type="primary", key="reclassify_review"):
-                    with st.spinner("🤖 AI يعيد تصنيف المنتجات..."):
-                        _items_rc = []
-                        for _, rr in df.head(30).iterrows():
-                            _items_rc.append({
-                                "our":       str(rr.get("المنتج","")),
-                                "comp":      str(rr.get("منتج_المنافس","")),
-                                "our_price": safe_float(rr.get("السعر",0)),
-                                "comp_price":safe_float(rr.get("سعر_المنافس",0)),
-                            })
-                        _rc_results = reclassify_review_items(_items_rc)
-                        _adf = st.session_state.get("analysis_df")
-                        if _rc_results and _adf is not None and not _adf.empty:
-                            _new_adf, _st = _apply_reclassify_to_analysis(_adf, df, _rc_results)
-                            st.session_state.analysis_df = _new_adf
-                            _r2 = _split_results(_new_adf)
-                            _prev_miss = st.session_state.results.get("missing") if st.session_state.results else None
-                            if _prev_miss is not None and not (isinstance(_prev_miss, pd.DataFrame) and _prev_miss.empty):
-                                _r2["missing"] = _prev_miss
-                            else:
-                                _r2["missing"] = pd.DataFrame()
-                            st.session_state.results = _r2
-                            _persist_analysis_after_reclassify(_new_adf)
-                            _moved = int(_st.get("applied", 0))
-                            st.success(
-                                f"✅ تم تطبيق {_moved} تعديلاً على جدول التحليل "
-                                f"(تجاهل: ثقة {_st.get('skip_conf',0)}، مراجعة {_st.get('skip_review',0)}، "
-                                f"idx {_st.get('skip_idx',0)}، بدون صف {_st.get('skip_no_row',0)})"
-                            )
-                            st.rerun()
-                        elif _rc_results:
-                            st.warning("لا يوجد جدول تحليل (analysis_df) — لم يُحفظ التصنيف")
+                if st.button(
+                    f"🤖 إعادة تصنيف بالذكاء الاصطناعي ({_rc_limit} منتج)",
+                    type="primary", key="reclassify_review"
+                ):
+                    _items_rc = []
+                    for _, rr in df.head(_rc_limit).iterrows():
+                        _items_rc.append({
+                            "our":       str(rr.get("المنتج", "")),
+                            "comp":      str(rr.get("منتج_المنافس", "")),
+                            "our_price": safe_float(rr.get("السعر", 0)),
+                            "comp_price":safe_float(rr.get("سعر_المنافس", 0)),
+                        })
+                    _n_batches = max(1, (_rc_limit + 9) // 10)
+                    _rc_prog   = st.progress(0, text="🤖 AI يحلل الدفعة 1 …")
+                    _rc_results_all: list = []
+                    for _bi, _bstart in enumerate(range(0, len(_items_rc), 10)):
+                        _rc_prog.progress(
+                            int((_bi / _n_batches) * 100),
+                            text=f"🤖 AI يحلل الدفعة {_bi + 1} من {_n_batches} …"
+                        )
+                        from engines.ai_engine import _reclassify_batch
+                        _rc_results_all.extend(
+                            _reclassify_batch(_items_rc[_bstart:_bstart + 10], offset=_bstart)
+                        )
+                    _rc_prog.progress(100, text="✅ اكتمل التحليل")
+
+                    _adf = st.session_state.get("analysis_df")
+                    if _rc_results_all and _adf is not None and not _adf.empty:
+                        _new_adf, _st = _apply_reclassify_to_analysis(
+                            _adf, df, _rc_results_all
+                        )
+                        st.session_state.analysis_df = _new_adf
+                        _r2 = _split_results(_new_adf)
+                        _prev_miss = (
+                            st.session_state.results.get("missing")
+                            if st.session_state.results else None
+                        )
+                        if _prev_miss is not None and not (
+                            isinstance(_prev_miss, pd.DataFrame) and _prev_miss.empty
+                        ):
+                            _r2["missing"] = _prev_miss
                         else:
-                            st.warning("لم يتمكن AI من إعادة التصنيف")
+                            _r2["missing"] = pd.DataFrame()
+                        st.session_state.results = _r2
+                        _persist_analysis_after_reclassify(_new_adf)
+                        _moved     = int(_st.get("applied", 0))
+                        _sk_conf   = int(_st.get("skip_conf", 0))
+                        _sk_rev    = int(_st.get("skip_review", 0))
+                        _sk_idx    = int(_st.get("skip_idx", 0))
+                        _sk_norow  = int(_st.get("skip_no_row", 0))
+                        if _moved:
+                            st.success(
+                                f"✅ نُقل {_moved} منتج إلى قسمه الصحيح — "
+                                f"AI حلّل {len(_rc_results_all)} من {_rc_limit}"
+                            )
+                        else:
+                            _skip_msg = []
+                            if _sk_conf:
+                                _skip_msg.append(f"ثقة منخفضة: {_sk_conf}")
+                            if _sk_rev:
+                                _skip_msg.append(f"بقي في المراجعة: {_sk_rev}")
+                            if _sk_idx or _sk_norow:
+                                _skip_msg.append(f"خطأ ترقيم/مطابقة: {_sk_idx + _sk_norow}")
+                            st.info(
+                                "ℹ️ AI قام بالتحليل لكن لم يُحرَّك أي منتج — "
+                                + ("; ".join(_skip_msg) if _skip_msg else
+                                   "جميع المنتجات تحتاج مراجعة يدوية")
+                            )
+                        st.rerun()
+                    elif _rc_results_all:
+                        st.warning("لا يوجد جدول تحليل (analysis_df) — لم يُحفظ التصنيف")
+                    else:
+                        st.error(
+                            "❌ لم يتمكن AI من إعادة التصنيف — "
+                            "تحقق من مفاتيح API في صفحة الإعدادات"
+                        )
             with col_r2:
                 excel_rv = export_to_excel(df, "مراجعة")
                 st.download_button("📥 Excel", data=excel_rv, file_name="review.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rv_dl")
 
             # ── فلتر بحث ──────────────────────────────────────────────────
-            search_rv = st.text_input("🔎 بحث في المنتجات", key="rv_search")
+            search_rv = st.text_input("🔎 بحث باسم المنتج أو الماركة", key="rv_search",
+                                      placeholder="اكتب جزءاً من الاسم…")
             df_rv = df.copy()
             if search_rv:
-                df_rv = df_rv[df_rv.apply(lambda r: search_rv.lower() in str(r.values).lower(), axis=1)]
+                _q = search_rv.strip().lower()
+                # يبحث في أعمدة الاسم فقط (أسرع وأدق)
+                _search_cols = [c for c in ["المنتج", "منتج_المنافس", "الماركة"]
+                                if c in df_rv.columns]
+                if _search_cols:
+                    _mask = df_rv[_search_cols].apply(
+                        lambda col: col.astype(str).str.lower().str.contains(_q, na=False)
+                    ).any(axis=1)
+                    df_rv = df_rv[_mask]
+                else:
+                    df_rv = df_rv[df_rv.apply(
+                        lambda r: _q in str(r.values).lower(), axis=1
+                    )]
 
-            st.caption(f"{len(df_rv)} منتج للمراجعة")
+            _total_rv = len(df)
+            _shown_rv = len(df_rv)
+            if search_rv:
+                st.caption(f"🔍 {_shown_rv} نتيجة من أصل {_total_rv} منتج")
+            else:
+                st.caption(f"📋 {_total_rv} منتج للمراجعة")
 
             # ── عرض المقارنة جنباً إلى جنب ────────────────────────────────
             PAGE_SIZE = 15
