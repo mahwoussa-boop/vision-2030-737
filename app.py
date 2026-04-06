@@ -2285,23 +2285,21 @@ elif page == "🔍 منتجات مفقودة":
     if st.session_state.results and "missing" in st.session_state.results:
         df = st.session_state.results["missing"]
         if df is not None and not df.empty:
-            # ── إحصاءات سريعة ──────────────────────────────────────────────
-            total_miss   = len(df)
-            has_tester   = df["نوع_متاح"].str.contains("تستر", na=False).sum()    if "نوع_متاح" in df.columns else 0
-            has_base     = df["نوع_متاح"].str.contains("العطر الأساسي", na=False).sum() if "نوع_متاح" in df.columns else 0
-            pure_missing = total_miss - has_tester - has_base
+            # ── إحصاءات سريعة (رياضيات صحيحة: مؤكد + مكرر = الإجمالي) ──────
+            total_missing     = len(df)
+            confirmed_missing = len(df[df["حالة_المنتج"].str.contains("مفقود مؤكد", na=False)]) if "حالة_المنتج" in df.columns else total_missing
+            potential_dups    = len(df[df["حالة_المنتج"].str.contains("مكرر محتمل", na=False)]) if "حالة_المنتج" in df.columns else 0
+            variants_count    = len(df[df["نوع_متاح"].str.strip() != ""])                        if "نوع_متاح"   in df.columns else 0
 
-            # إحصاءات المنطقة الرمادية (نظام الحاجز الثلاثي)
-            _gz_confirmed = df["حالة_المنتج"].str.startswith("✅", na=False).sum() if "حالة_المنتج" in df.columns else total_miss
-            _gz_gray      = df["حالة_المنتج"].str.startswith("⚠️", na=False).sum() if "حالة_المنتج" in df.columns else 0
+            # متغيرات الإحصاءات للاستخدام لاحقاً في الكود
+            _gz_confirmed = confirmed_missing
+            _gz_gray      = potential_dups
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("✅ مفقود مؤكد",       _gz_confirmed)
-            c2.metric("⚠️ مكرر محتمل",       _gz_gray)
-            c3.metric("🔍 مفقود فعلاً",      pure_missing)
-            c4.metric("🏷️ يوجد تستر",        has_tester)
-            c5.metric("✅ يوجد الأساسي",     has_base)
-            c6.metric("📦 إجمالي المنافسين", total_miss)
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            m_col1.metric("📦 إجمالي المفقودات",         total_missing)
+            m_col2.metric("✅ مفقود مؤكد",               confirmed_missing)
+            m_col3.metric("⚠️ مكرر محتمل",              potential_dups)
+            m_col4.metric("🏷️ نسخ متوفرة (تستر/أساسي)", variants_count)
 
             # ── تحليل AI الأولويات ────────────────────────────────────────
             with st.expander("🤖 تحليل AI — أولويات الإضافة", expanded=False):
@@ -2655,6 +2653,49 @@ elif page == "🔍 منتجات مفقودة":
                                 st.caption(f"• {_en}")
 
             st.caption(f"{len(filtered)} منتج — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+            # ── مقارنة بصرية مزدوجة (جدول مع صورتين) ──────────────────────
+            _has_our_img = "صورة_منتجنا_المشابه" in filtered.columns
+            _dup_rows    = filtered[filtered["حالة_المنتج"].str.contains("مكرر محتمل", na=False)] if "حالة_المنتج" in filtered.columns else pd.DataFrame()
+            with st.expander(
+                f"🔍 المقارنة البصرية المزدوجة — ⚠️ مكرر محتمل ({len(_dup_rows)} منتج)",
+                expanded=len(_dup_rows) > 0,
+            ):
+                if _dup_rows.empty:
+                    st.info("لا توجد منتجات بحالة «مكرر محتمل» في الفلتر الحالي.")
+                else:
+                    st.caption(
+                        "راجع الصورتين لاتخاذ قرار: إذا كانتا لنفس المنتج → لا تُضِف، وإلا → أضِف."
+                    )
+                    _viz_cols = [c for c in [
+                        "منتج_المنافس", "صورة_المنافس",
+                        "منتج_مشابه_لدينا", "صورة_منتجنا_المشابه",
+                        "حالة_المنتج", "سعر_المنافس", "الماركة", "المنافس",
+                        "رابط_المنافس",
+                    ] if c in _dup_rows.columns]
+                    _viz_df = _dup_rows[_viz_cols].copy()
+
+                    _img_col_cfg: dict = {}
+                    if "صورة_المنافس" in _viz_df.columns:
+                        _img_col_cfg["صورة_المنافس"] = st.column_config.ImageColumn("📸 صورة المنافس")
+                    if "صورة_منتجنا_المشابه" in _viz_df.columns:
+                        _img_col_cfg["صورة_منتجنا_المشابه"] = st.column_config.ImageColumn("📸 صورتنا (للمقارنة)")
+                    if "رابط_المنافس" in _viz_df.columns:
+                        _img_col_cfg["رابط_المنافس"] = st.column_config.LinkColumn("🔗 الرابط")
+                    _img_col_cfg["حالة_المنتج"]       = st.column_config.TextColumn("حالة المنتج",    width="medium")
+                    _img_col_cfg["منتج_مشابه_لدينا"] = st.column_config.TextColumn("مشابه لمنتجنا", width="medium")
+                    _img_col_cfg["منتج_المنافس"]      = st.column_config.TextColumn("منتج المنافس",  width="large")
+                    if "سعر_المنافس" in _viz_df.columns:
+                        _img_col_cfg["سعر_المنافس"] = st.column_config.NumberColumn("السعر (ر.س)", format="%.0f")
+
+                    st.data_editor(
+                        _viz_df,
+                        use_container_width=True,
+                        column_config=_img_col_cfg,
+                        disabled=True,
+                        key="miss_visual_compare",
+                        height=min(600, 80 + len(_viz_df) * 60),
+                    )
 
             # ── عرض المنتجات ──────────────────────────────────────────────
             PAGE_SIZE = 20
