@@ -1035,9 +1035,12 @@ def normalize_name(text):
     for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
                      ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
         t = t.replace(src, dst)
-    # 2. قاموس المرادفات (ترجمة التهجئات البديلة)
+    # 2. قاموس المرادفات — استبدال بحدود مسافات لمنع تشويه الكلمات الأطول
+    #    مثال: "بلو" لا يُستبدل داخل "بلوزة" لأن الفحص يشترط مسافة على الجانبين
+    t = ' ' + t + ' '
     for k, v in _SYN.items():
-        t = t.replace(k, v)
+        t = t.replace(' ' + k + ' ', ' ' + v + ' ')
+    t = t.strip()
     # 3. حذف كلمات الضجيج
     t = _NOISE_RE.sub(' ', t)
     # 4. حذف الأرقام المتبقية + الرموز
@@ -2986,6 +2989,22 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
     filtered_df["منتج_مشابه_لدينا"]     = ""
     filtered_df["صورة_منتجنا_المشابه"] = ""
 
+    # ── الطبقة 1.5: فهرس بنيوي لمنتجاتنا ──────────────────────────────────
+    # يُبنى مرة واحدة قبل الحلقة، ثم يُستعلم داخلها لكل منتج منافس.
+    # يعكس الفلاتر الصارمة للمحرك الرئيسي: ماركة + حجم + نوع + جنس + pline.
+    _our_struct: list = []  # (اسم_أصلي, ماركة_طبيعية, حجم, نوع, جنس, خط_إنتاج)
+    for _on in our_names:
+        _br   = extract_brand(_on)
+        _br_n = normalize(_br) if _br else ""
+        _our_struct.append((
+            _on,
+            _br_n,
+            extract_size(_on),
+            extract_type(_on),
+            extract_gender(_on),
+            extract_product_line(_on, _br),
+        ))
+
     keep_idx: list = []
     # قائمة الانتظار للفحص الأخير (score < 65% بعد كل المحاولات النصية)
     last_chance_queue: list = []  # [{"idx": int, "comp_name": str, "candidates": [str]}]
@@ -3004,6 +3023,76 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
         if not our_names:
             keep_idx.append(idx)
             continue
+
+        # ── الطبقة 1.5: الفلتر البنيوي (ماركة + حجم + نوع + جنس + pline) ───
+        # تعكس منطق المحرك الرئيسي: تعمل حين تُعرف ماركة منتج المنافس.
+        # تُخفّض عتبة القرار من 88 (global) إلى 78 لأن تأكيد الماركة يعوّض.
+        _comp_br   = extract_brand(comp_name)
+        _comp_br_n = normalize(_comp_br) if _comp_br else ""
+        _comp_sz   = extract_size(comp_name)
+        _comp_tp   = extract_type(comp_name)
+        _comp_gd   = extract_gender(comp_name)
+        _comp_pl   = extract_product_line(comp_name, _comp_br)
+
+        if _comp_br_n:
+            # تصفية منتجاتنا التي تشاركنا نفس الماركة مع توافق الحجم/النوع/الجنس
+            _brand_subset: list = []
+            for (_on, _br_n, _sz, _tp, _gd, _pl) in _our_struct:
+                if not _br_n or _br_n != _comp_br_n:
+                    continue
+                if _comp_sz > 0 and _sz > 0 and abs(_comp_sz - _sz) > 30:
+                    continue
+                if _comp_tp and _tp and _comp_tp != _tp:
+                    continue
+                if _comp_gd and _gd and _comp_gd != _gd:
+                    continue
+                _brand_subset.append((_on, _pl))
+
+            if _brand_subset:
+                _best_struct_score = 0
+                _best_struct_name  = ""
+
+                # أ) مقارنة خط الإنتاج (pline) — أدق طبقة لنفس الماركة
+                #    تطابق مع عتبة 78% كما يُطبّق المحرك الرئيسي
+                if _comp_pl:
+                    for (_on, _pl) in _brand_subset:
+                        if not _pl:
+                            continue
+                        _s = fuzz.token_sort_ratio(_comp_pl, _pl)
+                        if _s > _best_struct_score:
+                            _best_struct_score, _best_struct_name = _s, _on
+
+                # ب) إذا لم يُنتج pline نتيجة كافية، استخدم fuzzy على الاسم الكامل
+                #    المطبّع داخل الماركة (token_set_ratio — أقل عرضةً لاختلاف الترتيب)
+                if _best_struct_score < 65:
+                    _brand_names = [_on for (_on, _) in _brand_subset]
+                    _comp_norm_br = normalize_name(comp_name)
+                    if _comp_norm_br and _brand_names:
+                        _bn_norms = [(normalize_name(_n), _n) for _n in _brand_names]
+                        _bn_norm_list = [_nn for (_nn, _) in _bn_norms if _nn]
+                        if _bn_norm_list:
+                            _m_fb = rf_process.extractOne(
+                                _comp_norm_br, _bn_norm_list,
+                                scorer=fuzz.token_set_ratio,
+                            )
+                            if _m_fb and _m_fb[1] > _best_struct_score:
+                                _best_struct_score = _m_fb[1]
+                                # ربط الاسم المطبّع بالاسم الأصلي
+                                _norm_orig_map = {_nn: _n for (_nn, _n) in _bn_norms if _nn}
+                                _best_struct_name = _norm_orig_map.get(_m_fb[0], "")
+
+                # الحكم البنيوي النهائي
+                if _best_struct_score >= 78:
+                    # تأكيد: الماركة + البنية متطابقتان → المنتج موجود لدينا
+                    continue
+                if 65 <= _best_struct_score < 78:
+                    # منطقة رمادية بنيوية → نبقيه مع تحذير ونتجاوز طبقات Fuzzy
+                    filtered_df.at[idx, "حالة_المنتج"]           = f"⚠️ مكرر محتمل ({_best_struct_score:.0f}%)"
+                    filtered_df.at[idx, "منتج_مشابه_لدينا"]     = _best_struct_name
+                    filtered_df.at[idx, "صورة_منتجنا_المشابه"] = name_to_img.get(_best_struct_name, "")
+                    keep_idx.append(idx)
+                    continue
+                # _best_struct_score < 65: لا تشابه بنيوي → نكمل لطبقات Fuzzy
 
         # ── الطبقة 2أ: Token Set Ratio على الاسم الخام ─────────────────────
         m_raw = rf_process.extractOne(comp_name, our_names,
