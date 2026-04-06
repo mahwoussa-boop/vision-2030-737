@@ -513,25 +513,25 @@ def _infer_column_roles(df):
                 rename[c] = "سعر المنتج"
                 break
 
+    # أعمدة بيانات وصفية لا يجب أن تُعامَل كأسماء منتجات
+    _META_COL_NAMES = frozenset({
+        "store", "brand", "sku", "scraped_at", "date", "timestamp",
+        "id", "source", "shop", "seller", "vendor", "merchant",
+        "متجر", "مصدر", "تاريخ",
+    })
+
     # اسم
     if not has_name:
         for c, hr, ir, pr in scored:
             if c in rename:
+                continue
+            if str(c).lower().strip() in _META_COL_NAMES:
                 continue
             if pr < 0.35 and hr < 0.25 and ir < 0.2:
                 txt = " ".join(df[c].dropna().head(5).astype(str))
                 if len(txt) >= 20:
                     rename[c] = "اسم المنتج"
                     break
-
-    # #region agent log H2
-    try:
-        import json, time
-        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
-            _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"engine.py:_infer_column_roles","message":"rename_map","data":{"input_cols":list(df.columns),"rename":rename},"timestamp":int(time.time()*1000)}) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
     if rename:
         df = df.rename(columns=rename)
@@ -720,6 +720,28 @@ def _smart_rename_columns(df):
     if not is_dirty and _clean_arabic_headers():
         return df
     if not is_dirty:
+        # ── تسمية الأعمدة الإنجليزية النظيفة (مخرجات الكاشط التلقائي) ──
+        # مثال: ["store","name","price","image","url","brand","sku","scraped_at"]
+        _EN_TO_AR = {
+            "name": "اسم المنتج", "title": "اسم المنتج", "product": "اسم المنتج",
+            "price": "سعر المنتج", "image": "صورة المنتج",
+            "img": "صورة المنتج", "photo": "صورة المنتج", "thumbnail": "صورة المنتج",
+            "url": "رابط المنتج", "link": "رابط المنتج", "product_url": "رابط المنتج",
+            "brand": "الماركة",
+        }
+        _cols_lower = {str(c).lower().strip(): c for c in cols}
+        _has_arabic_name = any(
+            str(c).strip() in ("اسم المنتج", "المنتج", "أسم المنتج") for c in cols
+        )
+        if not _has_arabic_name:
+            _rn = {}
+            _used = set()
+            for _en, _ar in _EN_TO_AR.items():
+                if _en in _cols_lower and _ar not in _used:
+                    _rn[_cols_lower[_en]] = _ar
+                    _used.add(_ar)
+            if _rn:
+                df = df.rename(columns=_rn)
         return df
 
     # ═══════════════════════════════════════════════════════════════════
@@ -2041,6 +2063,14 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku","رمز المنتج SKU",
         "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
     ]) or ""
+    # #region agent log H3
+    try:
+        import json as _jl, time as _tl
+        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+            _lf.write(_jl.dumps({"sessionId":"89f8c7","hypothesisId":"H3","location":"engine.py:run_full_analysis","message":"our_cols_and_id","data":{"our_cols":list(our_df.columns)[:15],"our_col":our_col,"our_id_col":our_id_col,"our_price_col":our_price_col,"comp_keys":list(comp_dfs.keys())},"timestamp":int(_tl.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
     our_img_col = _fcol_optional(our_df, [
         "صورة المنتج", "صوره المنتج", "image", "Image", "product_image", "الصورة",
     ])
