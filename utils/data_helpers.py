@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 
 import pandas as pd
+from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
 
 # أول رابط صورة http(s) — يتوقف عند الفاصلة (إنجليزي/عربي) حتى لا يُلتقط رابطان في src واحد
 _FIRST_HTTP_IMAGE_URL = re.compile(
@@ -48,6 +49,18 @@ def first_image_url_string(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
+
+    # ── Cloudflare/Salla CDN transform URL — لا يُقسَّم بالفاصلة ──
+    # الصيغة: https://cdn.salla.sa/cdn-cgi/image/fit=scale-down,quality=80,width=400/https://actual.jpg
+    # يحتوي على https:// ثانية داخل مسار التحويل — يُعاد كرابط كامل بدون تقسيم
+    if "cdn-cgi/image" in s:
+        # استخرج الرابط الداخلي الفعلي إن وُجد (الجزء بعد مسار CDN)
+        inner = re.search(r'cdn-cgi/image/[^/]+/(https?://[^\s<>"\']+)', s)
+        if inner:
+            return inner.group(1).split()[0]
+        # أعد الرابط الكامل كما هو (لا تقطعه بالفاصلة)
+        return s.split()[0]
+
     if "http://" not in s and "https://" not in s:
         return s.split()[0]
     if not _looks_like_several_image_urls(s):
@@ -282,30 +295,54 @@ def pid_from_row(row, col):
 
 
 def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
-    """تحويل المنتجات المفقودة إلى قالب سلة الشامل المعتمد."""
+    """تحويل المنتجات المفقودة إلى قالب سلة الشامل المعتمد.
+
+    يُصدّر فقط المنتجات ذات حالة "✅ مفقود مؤكد" لمنع تكرار المنتجات في سلة.
+    ملف الـ Raw Data يحتوي على الكل (بما فيها المكرر المحتمل) للمراجعة.
+    """
     if missing_df is None or missing_df.empty:
         return pd.DataFrame()
 
-    n = len(missing_df)
-    salla_df = pd.DataFrame(index=missing_df.index)
+    # فلترة: صادَر لسلة فقط المنتجات المؤكدة (تستثني ⚠️ مكرر محتمل)
+    if "حالة_المنتج" in missing_df.columns:
+        salla_input = missing_df[
+            missing_df["حالة_المنتج"].str.startswith("✅", na=False)
+        ].copy()
+        if salla_input.empty:
+            return pd.DataFrame()
+    else:
+        salla_input = missing_df  # الملف القديم بدون العمود → يُصدَّر كله
+
+    salla_input = salla_input.reset_index(drop=True)
+    n = len(salla_input)
+    salla_df = pd.DataFrame(index=salla_input.index)
 
     def _series_or_blank(col_name: str):
-        if col_name in missing_df.columns:
-            return missing_df[col_name].fillna("").astype(str)
-        return pd.Series([""] * n, index=missing_df.index)
+        if col_name in salla_input.columns:
+            return salla_input[col_name].fillna("").astype(str)
+        return pd.Series([""] * n, index=salla_input.index)
 
     # 1) بيانات أساسية إجبارية (بعناوين سلة الحرفية)
     salla_df["النوع "] = ["منتج"] * n
     salla_df["أسم المنتج"] = _series_or_blank("منتج_المنافس")
-    salla_df["تصنيف المنتج"] = ""
+    # تصنيف: يُفضَّل العمود المُطابَق "تصنيف_سلة_الدقيق" ثم فارغ (لا افتراضي أعمى)
+    if "تصنيف_سلة_الدقيق" in salla_input.columns:
+        salla_df["تصنيف المنتج"] = _series_or_blank("تصنيف_سلة_الدقيق")
+    elif "القسم" in salla_input.columns:
+        salla_df["تصنيف المنتج"] = _series_or_blank("القسم")
+    elif "التصنيف" in salla_input.columns:
+        salla_df["تصنيف المنتج"] = _series_or_blank("التصنيف")
+    else:
+        salla_df["تصنيف المنتج"] = ""
     salla_df["صورة المنتج"] = _series_or_blank("صورة_المنافس")
     salla_df["وصف صورة المنتج"] = ""
     salla_df["نوع المنتج"] = ["منتج جاهز"] * n
     salla_df["سعر المنتج"] = _series_or_blank("سعر_المنافس")
     salla_df["الكمية المتوفرة"] = [0] * n
-    salla_df["الوصف"] = ""
+    # الوصف: يُفضَّل الوصف الآلي (HTML من AI)؛ يُعاد لفارغ إذا لم يُولَّد بعد
+    salla_df["الوصف"] = _series_or_blank("الوصف_الآلي")
     salla_df["هل يتطلب شحن؟"] = ["نعم"] * n
-    salla_df["رمز المنتج sku"] = ""
+    salla_df["رمز المنتج sku"] = _series_or_blank("معرف_المنافس")
 
     # 2) أعمدة مالية/إدارية
     salla_df["سعر التكلفة"] = ""
@@ -318,9 +355,13 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
     salla_df["الوزن"] = ""
     salla_df["وحدة الوزن"] = ""
 
-    # 3) الماركة/الحالة
+    # 3) الماركة/الحالة — يُفضَّل العمود المُطابَق "الماركة_المعتمدة" (نسخ حرفي من سلة)
     salla_df["حالة المنتج"] = ""
-    salla_df["الماركة"] = _series_or_blank("الماركة")
+    salla_df["الماركة"] = (
+        _series_or_blank("الماركة_المعتمدة")
+        if "الماركة_المعتمدة" in salla_input.columns
+        else _series_or_blank("الماركة")
+    )
 
     # 4) بقية الأعمدة القياسية
     salla_df["العنوان الترويجي"] = ""
@@ -333,3 +374,123 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
     salla_df["سبب عدم الخضوع للضريبة"] = ""
 
     return salla_df.reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  طبقة مطابقة سلة — Salla Validation Layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def map_salla_categories(
+    missing_df: pd.DataFrame,
+    categories_csv_path: str = "",
+) -> pd.DataFrame:
+    """
+    يقرأ ملف التصنيفات المعتمد ويعيّن مسار التصنيف الدقيق في سلة
+    بناءً على عمودَي (النوع) و (الجنس) في كل صف.
+
+    يُضيف عمود "تصنيف_سلة_الدقيق" إلى DataFrame.
+    """
+    if missing_df is None or missing_df.empty:
+        return missing_df
+
+    # ── تحديد مسار ملف التصنيفات ─────────────────────────────────────────────
+    if not categories_csv_path:
+        from utils.data_paths import get_catalog_data_path
+        categories_csv_path = get_catalog_data_path("تصنيفات مهووس.csv")
+        if not __import__("os").path.exists(categories_csv_path):
+            categories_csv_path = get_catalog_data_path("categories.csv")
+
+    valid_categories: list = []
+    try:
+        cat_df  = pd.read_csv(categories_csv_path, encoding="utf-8-sig")
+        cat_col = "التصنيفات" if "التصنيفات" in cat_df.columns else cat_df.columns[0]
+        valid_categories = cat_df[cat_col].dropna().astype(str).tolist()
+    except Exception:
+        pass
+
+    # خريطة بحث ثابتة: (gender, type) → كلمة بحث بالعربية
+    _SEARCH_MAP = {
+        ("رجالي",   "hair_mist"):  "عطور شعر",
+        ("نسائي",   "hair_mist"):  "عطور شعر",
+        ("للجنسين", "hair_mist"):  "عطور شعر",
+        ("",        "hair_mist"):  "عطور شعر",
+        ("رجالي",   "body_mist"):  "معطرات جسم",
+        ("نسائي",   "body_mist"):  "معطرات جسم",
+        ("",        "body_mist"):  "معطرات جسم",
+        ("رجالي",   ""):           "عطور رجالية",
+        ("نسائي",   ""):           "عطور نسائية",
+        ("للجنسين", ""):           "عطور للجنسين",
+    }
+
+    def _get_best_category(row) -> str:
+        if not valid_categories:
+            return ""
+        gender = str(row.get("الجنس", "") or "").strip()
+        type_  = str(row.get("النوع", "") or "").strip().lower()
+        search_term = _SEARCH_MAP.get((gender, type_)) \
+            or _SEARCH_MAP.get(("", type_)) \
+            or _SEARCH_MAP.get((gender, "")) \
+            or "عطور"
+        hit = rf_proc.extractOne(search_term, valid_categories, scorer=rf_fuzz.token_set_ratio)
+        if hit and hit[1] >= 60:
+            return hit[0]
+        return valid_categories[0] if valid_categories else ""
+
+    out = missing_df.copy()
+    out["تصنيف_سلة_الدقيق"] = out.apply(_get_best_category, axis=1)
+    return out
+
+
+def validate_salla_brands(
+    missing_df: pd.DataFrame,
+    brands_csv_path: str = "",
+) -> tuple:
+    """
+    يطابق ماركة كل منتج مع قائمة الماركات المعتمدة في سلة.
+
+    يُضيف عمود "الماركة_المعتمدة":
+      - إذا وُجد تطابق ≥ 85%: الاسم الحرفي من ملف سلة (نسخ حرفي).
+      - إذا لم يوجد تطابق: الاسم الأصلي يُبقى كما هو.
+
+    يُرجع: (DataFrame_المُحدَّث, قائمة_الماركات_المفقودة)
+    """
+    if missing_df is None or missing_df.empty:
+        return missing_df, []
+
+    # ── تحديد مسار ملف الماركات ──────────────────────────────────────────────
+    if not brands_csv_path:
+        from utils.data_paths import get_catalog_data_path
+        brands_csv_path = get_catalog_data_path("ماركات مهووس.csv")
+        if not __import__("os").path.exists(brands_csv_path):
+            brands_csv_path = get_catalog_data_path("brands.csv")
+
+    valid_brands: list = []
+    try:
+        brands_df   = pd.read_csv(brands_csv_path, encoding="utf-8-sig")
+        brand_col   = "اسم الماركة" if "اسم الماركة" in brands_df.columns else brands_df.columns[0]
+        valid_brands = brands_df[brand_col].dropna().astype(str).tolist()
+    except Exception:
+        pass
+
+    missing_brands: set = set()
+
+    def _get_valid_brand(brand_name) -> str:
+        bname = str(brand_name or "").strip()
+        if not bname or bname.lower() in ("nan", "none", ""):
+            return ""
+        if not valid_brands:
+            return bname
+        hit = rf_proc.extractOne(bname, valid_brands, scorer=rf_fuzz.token_set_ratio)
+        if hit and hit[1] >= 85:
+            return hit[0]  # الاسم الحرفي من ملف سلة — نسخ حرفي
+        # ماركة غير مسجلة → سجّلها لتنبيه المستخدم
+        missing_brands.add(bname)
+        return bname
+
+    out = missing_df.copy()
+    brand_src = "الماركة" if "الماركة" in out.columns else None
+    out["الماركة_المعتمدة"] = (
+        out[brand_src].apply(_get_valid_brand) if brand_src
+        else ""
+    )
+    return out, sorted(missing_brands)

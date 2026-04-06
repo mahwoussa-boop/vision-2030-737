@@ -411,6 +411,72 @@ init_db()
 
 
 # ═══════════════════════════════════════════════════════════════
+#  الرادار التسعيري — Competitor Price History
+# ═══════════════════════════════════════════════════════════════
+
+def _init_competitor_price_history():
+    """يُنشئ جدول competitor_price_history إن لم يكن موجوداً — يُستدعى تلقائياً."""
+    try:
+        conn = get_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS competitor_price_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            comp_name     TEXT    NOT NULL,
+            product_id    TEXT    NOT NULL,
+            price         REAL    NOT NULL,
+            last_seen_date TEXT   NOT NULL,
+            UNIQUE(comp_name, product_id)
+        )""")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+_init_competitor_price_history()
+
+
+def update_competitor_price(comp_name: str, product_id: str, current_price: float):
+    """
+    يحدّث سعر منتج المنافس ويُرجع:
+    - السعر القديم (float) إذا تغيّر السعر (لتتمكن الواجهة من عرض تنبيه)
+    - None إذا لم يتغير السعر أو إذا كان المنتج جديداً
+    """
+    if not comp_name or not product_id or not current_price:
+        return None
+    try:
+        today = _date()
+        conn  = get_db()
+        row   = conn.execute(
+            "SELECT price FROM competitor_price_history WHERE comp_name=? AND product_id=?",
+            (str(comp_name), str(product_id))
+        ).fetchone()
+
+        if row is None:
+            # منتج جديد — أضفه بدون تنبيه
+            conn.execute(
+                "INSERT INTO competitor_price_history (comp_name, product_id, price, last_seen_date) VALUES (?,?,?,?)",
+                (str(comp_name), str(product_id), float(current_price), today)
+            )
+            conn.commit()
+            conn.close()
+            return None
+
+        old_price = float(row["price"])
+        price_changed = abs(float(current_price) - old_price) > 0.09  # تجاهل فروق < 0.10 ر.س
+
+        # دائماً حدّث last_seen_date والسعر الجديد
+        conn.execute(
+            "UPDATE competitor_price_history SET price=?, last_seen_date=? WHERE comp_name=? AND product_id=?",
+            (float(current_price), today, str(comp_name), str(product_id))
+        )
+        conn.commit()
+        conn.close()
+
+        return round(old_price, 2) if price_changed else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
 #  v26 — Upsert Catalog + Processed Products
 # ═══════════════════════════════════════════════════════════════
 
