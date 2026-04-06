@@ -2,6 +2,7 @@
 دوال مساعدة خالصة (بدون واجهة ولا session_state) — تجهيز البيانات والنصوص.
 """
 import json
+import os
 import re
 from datetime import datetime
 
@@ -494,3 +495,99 @@ def validate_salla_brands(
         else ""
     )
     return out, sorted(missing_brands)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ذاكرة المنافسين التراكمية — Competitor Master Catalog (Upsert Logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upsert_competitors(new_comp_dfs: dict) -> pd.DataFrame:
+    """
+    يدمج الملفات الجديدة المرفوعة مع الكتالوج المركزي المحفوظ على القرص.
+
+    القواعد:
+    - إذا كان المنتج موجوداً (نفس المنافس + نفس الرابط): يُحدَّث السعر وتاريخ الرصد.
+    - إذا كان المنتج جديداً: يُضاف.
+    - لا يُحذف أي منتج قديم إطلاقاً.
+
+    يُرجع: master_df كـ dict {اسم_المتجر: DataFrame} جاهز للتمرير لـ run_full_analysis.
+    """
+    from utils.data_paths import get_master_competitors_path
+
+    master_path = get_master_competitors_path()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── دمج الملفات الجديدة إن وُجدت ──────────────────────────────────────
+    if new_comp_dfs:
+        frames = []
+        for store_name, df in new_comp_dfs.items():
+            df = df.copy()
+            # حقن اسم المتجر إذا لم يكن موجوداً
+            if "store" not in df.columns and "المنافس" not in df.columns:
+                df["store"] = store_name
+            df["تاريخ_الرصد"] = now_str
+            frames.append(df)
+        new_df = pd.concat(frames, ignore_index=True)
+    else:
+        new_df = pd.DataFrame()
+
+    # ── تحميل الكتالوج القديم ──────────────────────────────────────────────
+    if os.path.exists(master_path):
+        try:
+            master_df = pd.read_csv(master_path, encoding="utf-8-sig", low_memory=False)
+        except Exception:
+            master_df = pd.DataFrame()
+    else:
+        master_df = pd.DataFrame()
+
+    # ── دمج القديم + الجديد ────────────────────────────────────────────────
+    if new_df.empty and master_df.empty:
+        return {}
+
+    if new_df.empty:
+        combined = master_df
+    elif master_df.empty:
+        combined = new_df
+    else:
+        combined = pd.concat([master_df, new_df], ignore_index=True)
+
+    # ── تطبيع عمود الرصد حتى يُمكن الفرز عليه ───────────────────────────
+    if "تاريخ_الرصد" not in combined.columns:
+        combined["تاريخ_الرصد"] = now_str
+
+    combined["تاريخ_الرصد"] = combined["تاريخ_الرصد"].fillna(now_str).astype(str)
+    combined = combined.sort_values("تاريخ_الرصد", kind="stable")
+
+    # ── إزالة التكرار: الأحدث يربح (keep='last' بعد الفرز) ───────────────
+    store_col = "المنافس" if "المنافس" in combined.columns else (
+        "store" if "store" in combined.columns else None
+    )
+    url_col = "رابط_المنافس" if "رابط_المنافس" in combined.columns else (
+        "url" if "url" in combined.columns else None
+    )
+
+    if store_col and url_col:
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=[store_col, url_col], keep="last")
+        deduped = before - len(combined)
+    else:
+        deduped = 0
+
+    combined = combined.reset_index(drop=True)
+
+    # ── حفظ الكتالوج المتراكم ─────────────────────────────────────────────
+    try:
+        combined.to_csv(master_path, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+    # ── إرجاع dict مقسَّم حسب المتجر (لـ run_full_analysis) ──────────────
+    result: dict = {}
+    split_col = store_col  # قد يكون "store" أو "المنافس" أو None
+    if split_col and split_col in combined.columns:
+        for sname, sdf in combined.groupby(split_col, sort=False):
+            result[str(sname).strip() or "master_competitors"] = sdf.reset_index(drop=True)
+    else:
+        result["master_competitors.csv"] = combined
+
+    return result, len(combined), deduped
