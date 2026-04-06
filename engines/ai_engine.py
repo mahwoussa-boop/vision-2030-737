@@ -10,6 +10,7 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
+import hashlib
 import requests, json, re, time, traceback
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
@@ -1206,3 +1207,190 @@ def get_catalog_status() -> dict:
                                       CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
         "missing_brands": missing_stat,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  مولّد الوصف الآلي لسلة — AI Product Description Generator
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_salla_html_description(product_name: str, raw_scraped_text: str = "") -> str:
+    """
+    يستخدم Gemini لاستخراج المكونات الحقيقية من النص الخام وصياغتها بتنسيق HTML
+    الخاص بمتجر "مهووس" للعطور — مناسب للرفع المباشر على سلة.
+
+    القواعد:
+    - درجة الحرارة 0.1 — شبه حتمي لمنع التأليف في المكونات.
+    - يمنع منعاً باتاً تأليف مكونات غير موجودة في النص الخام.
+    - المخرج HTML نظيف بدون markdown أو code fences.
+    """
+    raw_section = (
+        f"\nالمعلومات المسحوبة من صفحة المنافس:\n{raw_scraped_text[:1200]}"
+        if (raw_scraped_text or "").strip()
+        else "\nلم تتوفر معلومات مسحوبة — اعتمد على اسم العطر فقط."
+    )
+
+    prompt = f"""أنت خبير عطور وكاتب محتوى محترف لمتجر "مهووس" للعطور.
+اسم العطر: {product_name}{raw_section}
+
+المطلوب:
+1. استخرج المكونات العطرية الحقيقية (القمة، القلب، القاعدة) من المعلومات المسحوبة. يمنع منعاً باتاً تأليف أي مكونات غير موجودة في المصدر. إذا لم تجد مكونات محددة اكتب فقط: مزيج عطري فاخر وسري.
+2. اكتب وصفاً تسويقياً جذاباً من سطرين يعكس شخصية العطر.
+3. أعد المخرجات بصيغة HTML نظيفة تماماً — بدون markdown وبدون كود مُغلَّق (code fences).
+
+هيكل HTML المطلوب حرفياً (لا تغيّر الوسوم):
+<h2>وصف العطر</h2>
+<p>[وصف تسويقي جذاب من سطرين]</p>
+<h3>الهرم العطري</h3>
+<ul>
+<li><strong>إفتتاحية العطر:</strong> [المكونات]</li>
+<li><strong>قلب العطر:</strong> [المكونات]</li>
+<li><strong>قاعدة العطر:</strong> [المكونات]</li>
+</ul>
+<h3>لمسة خبير من مهووس</h3>
+<p>الفوحان: [/10] | الثبات: [/10] | نصيحة: [نصيحة قصيرة للاستخدام]</p>"""
+
+    raw = _call_gemini(prompt, temperature=0.1, max_tokens=2048)
+
+    if not raw:
+        # fallback: OpenRouter ثم Cohere
+        raw = _call_openrouter(prompt) or _call_cohere(prompt)
+
+    if not raw:
+        return (
+            f"<h2>وصف العطر</h2>"
+            f"<p>{product_name} — عطر فاخر يجمع بين الأناقة والعراقة.</p>"
+            f"<h3>الهرم العطري</h3>"
+            f"<ul><li><strong>إفتتاحية العطر:</strong> مزيج عطري فاخر وسري</li>"
+            f"<li><strong>قلب العطر:</strong> مزيج عطري فاخر وسري</li>"
+            f"<li><strong>قاعدة العطر:</strong> مزيج عطري فاخر وسري</li></ul>"
+            f"<h3>لمسة خبير من مهووس</h3>"
+            f"<p>الفوحان: —/10 | الثبات: —/10 | نصيحة: ارتدِه في المناسبات الخاصة.</p>"
+        )
+
+    # تنظيف: إزالة markdown code fences إن وُجدت
+    cleaned = re.sub(r"```(?:html)?\s*", "", raw, flags=re.I)
+    cleaned = re.sub(r"```", "", cleaned).strip()
+    return cleaned
+
+
+def _parse_brand_json_block(text: str) -> dict:
+    """يستخرج كائن JSON من مخرجات Gemini (مع أو بدون code fences)."""
+    if not text or not str(text).strip():
+        return {}
+    t = str(text).strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, re.I)
+    if m:
+        try:
+            j = json.loads(m.group(1).strip())
+            if isinstance(j, dict) and "brand_name" in j:
+                return j
+        except Exception:
+            pass
+    last = t.rfind("\n{")
+    if last == -1:
+        last = t.rfind("{")
+    if last != -1:
+        tail = t[last:]
+        depth = 0
+        end = None
+        for i, c in enumerate(tail):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end:
+            try:
+                j = json.loads(tail[:end])
+                if isinstance(j, dict):
+                    return j
+            except Exception:
+                pass
+    return {}
+
+
+def _clamp_salla_brand_dict(d: dict, original_brand: str) -> dict:
+    """فرض الحدود القصوى لسلة بعد الاستلام من النموذج."""
+    bn = str(d.get("brand_name", "") or "").strip()
+    if not bn and original_brand:
+        bn = str(original_brand).strip()[:30]
+    if len(bn) > 30:
+        bn = bn[:30]
+    desc = str(d.get("description", "") or "").strip()
+    if len(desc) > 250:
+        desc = desc[:250]
+    stitle = str(d.get("seo_title", "") or "").strip()
+    if len(stitle) > 70:
+        stitle = stitle[:70]
+    sdesc = str(d.get("seo_desc", "") or "").strip()
+    if len(sdesc) > 155:
+        sdesc = sdesc[:155]
+    surl = str(d.get("seo_url", "") or "").strip().lower()
+    surl = re.sub(r"\s+", "_", surl)
+    surl = re.sub(r"[^a-z0-9_-]", "", surl)
+    if not surl or len(surl) < 3:
+        safe = re.sub(r"[^a-z0-9]+", "_", original_brand.lower().strip())[:24].strip("_")
+        if not safe:
+            safe = hashlib.md5(original_brand.encode("utf-8")).hexdigest()[:10]
+        surl = f"{safe}_mahwous"
+    elif "mahwous" not in surl:
+        surl = (surl + "_mahwous")[:80]
+    surl = surl[:80]
+    return {
+        "brand_name": bn,
+        "description": desc,
+        "seo_title": stitle,
+        "seo_url": surl,
+        "seo_desc": sdesc,
+    }
+
+
+def generate_salla_brand_info(brand_name: str) -> dict:
+    """
+    يولد بيانات الماركة (وصف، SEO) بتنسيق متوافق مع سلة مع الالتزام الصارم
+    بالحد الأقصى للأحرف: اسم 30، وصف 250، عنوان SEO 70، وصف SEO 155.
+    """
+    bn = str(brand_name or "").strip()
+    if not bn or bn.lower() in ("nan", "none"):
+        return _clamp_salla_brand_dict({}, "")
+
+    prompt = f"""أنت خبير عطور وSEO محترف لمتجر "مهووس".
+لدينا ماركة عطور جديدة مفقودة اسمها: "{bn}".
+
+المطلوب توليد بيانات الماركة بدقة وإرجاعها ككائن JSON فقط. يجب الالتزام الصارم بالحدود القصوى للأحرف (عدّ كل حرف بما فيه المسافات والعربية):
+1. "brand_name": اسم الماركة باللغتين (العربية | الإنجليزية). حد أقصى 30 حرفاً. (مثال: كريبتك | Cryptic).
+2. "description": وصف جذاب للماركة يبرز فخامتها. حد أقصى 250 حرفاً.
+3. "seo_title": عنوان صفحة SEO يدمج اسم الماركة مع "متجر مهووس". حد أقصى 70 حرفاً.
+4. "seo_url": رابط صفحة الماركة بحروف إنجليزية صغيرة فقط مع mahwous مفصولة بشرطة سفلية (مثال: cryptic_mahwous).
+5. "seo_desc": وصف صفحة الماركة للبحث. حد أقصى 155 حرفاً.
+
+أعد JSON فقط بدون markdown وبدون نص قبل أو بعد. المفاتيح بالإنجليزية كما أعلاه."""
+
+    try:
+        raw = _call_gemini(prompt, temperature=0.1, max_tokens=1024)
+        if not raw:
+            raw = _call_openrouter(prompt) or _call_cohere(prompt)
+        parsed = _parse_brand_json_block(raw) if raw else {}
+        if parsed:
+            return _clamp_salla_brand_dict(parsed, bn)
+    except Exception:
+        pass
+
+    # Fallback صارم يلتزم بالحدود القصوى
+    safe_name = bn[:14]
+    return _clamp_salla_brand_dict(
+        {
+            "brand_name": (f"{safe_name} | {safe_name}")[:30],
+            "description": (
+                f"عطور {safe_name} الفاخرة، اكتشف التميز والجاذبية مع تشكيلتنا المختارة بعناية في متجر مهووس."
+            )[:250],
+            "seo_title": (f"عطور {safe_name} الأصلية | متجر مهووس")[:70],
+            "seo_url": "",
+            "seo_desc": (
+                f"تسوق أحدث عطور {safe_name} الأصلية بأسعار تنافسية من متجر مهووس. اكتشف الفخامة الآن."
+            )[:155],
+        },
+        bn,
+    )

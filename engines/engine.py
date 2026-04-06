@@ -117,10 +117,9 @@ if not GEMINI_API_KEYS:
 
 # ─── مرادفات ذكية للعطور ────────────────────
 _SYN = {
-    "eau de parfum":"edp","او دو بارفان":"edp","أو دو بارفان":"edp",
-    "او دي بارفان":"edp","بارفان":"edp","parfum":"edp","perfume":"edp",
-    "eau de toilette":"edt","او دو تواليت":"edt","أو دو تواليت":"edt",
-    "تواليت":"edt","toilette":"edt","toilet":"edt",
+    # ── مدخلات التركيزات المُحذوفة (كانت تخلط EDP/EDT/Parfum):
+    # eau de parfum, parfum, perfume → edp  |  eau de toilette, تواليت, toilette → edt
+    # هذه الترجمات الآن في extract_type فقط — لا تعود هنا.
     "eau de cologne":"edc","كولون":"edc","cologne":"edc",
     "extrait de parfum":"extrait","parfum extrait":"extrait",
     "ديور":"dior","شانيل":"chanel","شنل":"chanel","أرماني":"armani","ارماني":"armani",
@@ -391,8 +390,16 @@ def _looks_like_image_url(s: str) -> bool:
         return True
     if any(x in vl for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
         return True
-    # CDN سلة: cdn.salla.sa/cdn-cgi/image/... — دائماً صورة
-    if "cdn.salla" in vl or "cdn-cgi/image" in vl:
+    # CDN سلة / Shopify / Cloudinary / Leesanto / متاجر أخرى — دائماً صورة
+    if any(x in vl for x in (
+        "cdn.salla", "cdn-cgi/image",
+        "cdn.shopify.com/s/files",
+        "cloudinary.com",
+        "/pub/media/catalog",
+        "leesanto.com/media",
+        "/storage/products",
+        "/uploads/products",
+    )):
         return True
     return False
 
@@ -404,26 +411,54 @@ _EMBEDDED_HTTP_IMG = re.compile(
 
 
 def _extract_image_url_from_cell(val) -> str:
-    """خلية مباشرة أو نص/HTML (وصف صورة، src=...) يضم رابط صورة."""
+    """خلية مباشرة أو نص/HTML (وصف صورة، src=...) يضم رابط صورة.
+
+    تُستدعى هذه الدالة على أعمدة صور معروفة فقط — لذا نقبل أي URL صالح حتى
+    لو لم يحمل امتداد صورة صريح (مثل CDN بدون امتداد من worldgivenchy/سعيد صلاح).
+    """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
-    s = first_image_url_string(str(val).strip())
-    if not s or s.lower() in ("nan", "none", "<na>"):
+    raw = str(val).strip()
+    if not raw or raw.lower() in ("nan", "none", "<na>"):
         return ""
-    if _looks_like_image_url(s):
-        return s.split()[0]
-    m = _EMBEDDED_HTTP_IMG.search(s)
+
+    # 1) أي URL http(s) صالح — عمود الصور يُفترض أن قيمه روابط صور
+    s = first_image_url_string(raw)
+    if s and s.lower() not in ("nan", "none", "<na>"):
+        # نقبل: رابط بامتداد صريح، أو CDN معروف، أو أي https:// صالح
+        if _looks_like_image_url(s):
+            return s.split()[0]
+        if s.startswith("http") and len(s) >= 12:
+            # URL صالح بدون امتداد (CDN حديث) — نثق بعمود الصور
+            return s.split()[0]
+
+    # 2) HTML مُضمَّن: src="..." أو src='...' — يسحب أي رابط http داخله
+    m = _EMBEDDED_HTTP_IMG.search(raw)
     if m:
         return m.group(0).strip().rstrip(".,;)]\"'")
+
+    # 3) URL من CDN منتجات شائعة (Shopify, Salla, WooCommerce, leesanto…)
     m2 = re.search(
-        r'https?://[^\s<>"\'\)]+/(?:images?|img|media|storage|uploads|files|cdn)/[^\s<>"\'\)]+',
-        s,
+        r'https?://[^\s<>"\'\)]+/(?:images?|img|media|storage|uploads|files|cdn|pub|catalog|products?|shop|s/files)/[^\s<>"\'\)]{3,}',
+        raw,
         re.I,
     )
     if m2:
         t = m2.group(0).strip().rstrip(".,;)]\"'")
         if len(t) < 800:
             return t
+
+    # 4) أي رابط http(s) داخل القيمة (آخر ملجأ)
+    m3 = re.search(r'https?://[^\s<>"\'\),،;]{10,}', raw)
+    if m3:
+        t3 = m3.group(0).strip().rstrip(".,;)]\"'")
+        if len(t3) < 500:
+            return t3
+
+    # 5) مسار نسبي (يبدأ بـ /) — الاستخدام نادر لكن موجود في بعض التصديرات
+    if raw.startswith("/") and len(raw) >= 4:
+        return raw.split()[0]
+
     return ""
 
 
@@ -1036,11 +1071,21 @@ def extract_brand(text):
     return ""
 
 def extract_type(text):
-    if not isinstance(text, str): return ""
-    n = normalize(text)
-    if "edp" in n or "extrait" in n: return "EDP"
-    if "edt" in n: return "EDT"
-    if "edc" in n: return "EDC"
+    """استخراج التركيز بترتيب صارم: Extrait > EDP > EDT > Parfum > EDC."""
+    if not isinstance(text, str):
+        return ""
+    tl = text.lower()
+    if any(x in tl for x in ['extrait', 'اكستريت', 'اكسترايت']):
+        return "Extrait"
+    if any(x in tl for x in ['edp', 'eau de parfum', 'او دو بارفيوم', 'او دي بارفيوم',
+                               'او دو برفيوم', 'او دي برفيوم']):
+        return "EDP"
+    if any(x in tl for x in ['edt', 'eau de toilette', 'او دو تواليت', 'او دي تواليت']):
+        return "EDT"
+    if any(x in tl for x in ['parfum', 'بارفيوم', 'برفيوم', 'بارفان']):
+        return "Parfum"
+    if any(x in tl for x in ['cologne', 'edc', 'كولونيا', 'كولون']):
+        return "EDC"
     return ""
 
 def extract_gender(text):
@@ -1180,18 +1225,27 @@ def classify_product(name):
     return 'retail'
 
 def _price(row):
+    def _clean_price(s: str) -> float:
+        """يستخرج رقم السعر من نص قد يحتوي على رموز عملة (SAR, $, ر.س, ﷼)."""
+        # البحث عن أول رقم + فواصل عشرية/آلاف داخل النص
+        m = re.search(r'\d[\d,]*(?:\.\d+)?', str(s))
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(0).replace(',', ''))
+        except ValueError:
+            return 0.0
+
     for c in ["السعر", "سعر المنتج", "سعر_المنتج", "Price", "price", "سعر", "PRICE", "السعر بعد الخصم"]:
         if c in row.index:
-            try: return float(str(row[c]).replace(",",""))
-            except: pass
+            v = _clean_price(str(row[c]))
+            if v > 0:
+                return v
     # احتياطي: ابحث عن أي عمود رقمي يشبه السعر
     for c in row.index:
-        try:
-            v = float(str(row[c]).replace(",",""))
-            if 1 <= v <= 99999:  # نطاق سعر معقول
-                return v
-        except:
-            pass
+        v = _clean_price(str(row[c]))
+        if 1 <= v <= 99999:
+            return v
     return 0.0
 
 def _fcol(df, cands):
@@ -1390,14 +1444,6 @@ def _name_col_for_analysis(df):
     if "المنتج" in df.columns:
         return "المنتج"
     result = _find_product_name_column(df)
-    # #region agent log H2/H3
-    try:
-        import json, time
-        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
-            _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"engine.py:_name_col_for_analysis","message":"name_col_detected","data":{"cols":list(df.columns)[:10],"detected":result},"timestamp":int(time.time()*1000)}) + "\n")
-    except Exception:
-        pass
-    # #endregion
     return result
 
 
@@ -1433,6 +1479,7 @@ def resolve_catalog_columns(df):
         "name": _find_product_name_column(df),
         "price": _fcol(df, ["سعر المنتج", "السعر", "سعر", "Price", "price", "PRICE"]),
         "id": _fcol(df, [
+            "No.", "No", "no.", "no", "NO.", "NO",
             "رقم المنتج", "معرف المنتج", "المعرف", "معرف", "رقم_المنتج", "معرف_المنتج",
             "product_id", "Product ID", "Product_ID", "ID", "id", "Id",
             "SKU", "sku", "Sku", "رمز المنتج", "رمز_المنتج", "رمز المنتج sku",
@@ -1532,7 +1579,11 @@ class CompIndex:
         self.ids        = [_pid(row, id_col) for _, row in self.df.iterrows()]
         n = len(self.df)
         if self.img_col and self.img_col in self.df.columns:
-            self.extra_imgs = self.df[self.img_col].fillna("").astype(str).str.strip().tolist()
+            # معالجة القيم الخام: تستخرج URL الصورة من HTML أو CDN أو نص مباشر
+            self.extra_imgs = [
+                _extract_image_url_from_cell(v)
+                for v in self.df[self.img_col].fillna("").astype(str).tolist()
+            ]
         else:
             self.extra_imgs = [""] * n
         if self.url_col and self.url_col in self.df.columns:
@@ -1597,7 +1648,7 @@ class CompIndex:
                 if (our_class == 'tester') != (c_class == 'tester'):
                     continue
 
-            # ═══ مقارنة الأرقام في أسماء المنتجات (نمبر 11 ≠ نمبر 10) ═══
+            # ═══ مقارنة الأرقام في أسماء المنتجات (212 ≠ CH Privée ≠ Chic) ═══
             _NUM_WORDS = {
                 'ون':'1','تو':'2','ثري':'3','فور':'4','فايف':'5',
                 'سكس':'6','سفن':'7','ايت':'8','ناين':'9','تن':'10',
@@ -1606,36 +1657,46 @@ class CompIndex:
                 'i':'1','ii':'2','iii':'3','iv':'4','v':'5',
                 'vi':'6','vii':'7','viii':'8','ix':'9','x':'10',
             }
+            # أحجام المل الشائعة — تُستثنى من أرقام هوية المنتج
+            _SZ_SET = frozenset({'25','30','40','50','55','60','75','80','90','100',
+                                  '125','150','175','200','250','300','350','400','500'})
             def _extract_product_numbers(text):
-                """Extract product-identifying numbers (not sizes)"""
+                """استخراج أرقام هوية المنتج (مثل 212، 330، 360) وليس أحجام المل"""
                 nums = set()
-                # استخراج الأرقام الرقمية
-                for m in re.finditer(r'(?:no|num|number|نمبر|رقم|№|#)\s*(\d+)', text.lower()):
-                    nums.add(m.group(1))
-                # استخراج الأرقام النصية (ون، تو، سفن...)
+                if not text:
+                    return nums
                 tl = text.lower()
+                # 1. أرقام مسبوقة بكلمة دالة (No.5، رقم 7، نمبر 11...)
+                for m in re.finditer(r'(?:no\.?|num|number|نمبر|رقم|№|#)\s*(\d+)', tl):
+                    nums.add(m.group(1))
+                # 2. أرقام نصية (ون، تو، سفن...)
                 for word, num in _NUM_WORDS.items():
-                    if f'نمبر {word}' in tl or f'number {word}' in tl or f'no {word}' in tl or f'رقم {word}' in tl:
+                    if f'نمبر {word}' in tl or f'number {word}' in tl or \
+                       f'no {word}' in tl or f'رقم {word}' in tl:
                         nums.add(num)
-                # استخراج أرقام ملتصقة بكلمات (مثل سفن7)
-                for m in re.finditer(r'[a-z؀-ۿ](\d+)', text.lower()):
+                # 3. أرقام ملتصقة بأحرف (CH212، Seven7)
+                for m in re.finditer(r'[a-z؀-ۿ](\d{2,4})\b', tl):
                     v = m.group(1)
-                    if v not in {'100','50','30','200','150','75','80','125','250','300','ml'}:
+                    if v not in _SZ_SET:
                         nums.add(v)
-                # أرقام مستقلة ليست أحجام (مثل 212, 360, 9)
-                for m in re.finditer(r'\b(\d{1,3})\b', text.lower()):
+                # 4. أرقام مستقلة 2-4 خانات ليست أحجاماً (212، 330، 360، 77...)
+                for m in re.finditer(r'\b(\d{2,4})\b', tl):
                     v = m.group(1)
-                    # استثناء الأحجام الشائعة فقط إذا كانت متبوعة بـ ml/مل
+                    if v in _SZ_SET:
+                        continue
                     pos = m.end()
-                    after = text.lower()[pos:pos+5].strip()
-                    if after.startswith('ml') or after.startswith('مل'):
-                        continue  # هذا حجم
-                    if v in {'212','360','1','2','3','4','5','6','7','8','9','11','12','13','14','15','16','17','18','19','21'}:
-                        nums.add(v)
+                    after = tl[pos:pos+6].strip()
+                    if re.match(r'^(ml|مل|g\b|gm|غ|fl|oz)', after):
+                        continue  # حجم متبوع بوحدة
+                    nums.add(v)
                 return nums
 
             our_pnums = _extract_product_numbers(our_norm)
-            c_pnums = _extract_product_numbers(self.norm_names[idx])
+            c_pnums   = _extract_product_numbers(self.norm_names[idx])
+            # منتجنا له رقم مميز (212) والمنافس لا → ليسوا نفس المنتج
+            if our_pnums and not c_pnums:
+                continue
+            # كلاهما له أرقام لكن مختلفة (212 vs 330) → رفض قاطع
             if our_pnums and c_pnums and our_pnums != c_pnums:
                 continue
 
@@ -2044,6 +2105,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         "skipped_empty": 0,
         "skipped_samples": 0,
         "no_competitor_found": 0,
+        "comp_market_size": 0,  # إجمالي منتجات المنافسين المرفوعة
     }
     our_df = _force_ingestion_cleanup(our_df)
     comp_dfs = {
@@ -2051,6 +2113,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         for cname, cdf in (comp_dfs or {}).items()
         if cdf is not None
     }
+    # حساب حجم سوق المنافسين بعد تنظيف الملفات
+    audit_stats["comp_market_size"] = sum(len(df) for df in comp_dfs.values()) if comp_dfs else 0
     if our_df is None or our_df.empty or not comp_dfs:
         return pd.DataFrame(results), audit_stats
 
@@ -2063,14 +2127,6 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku","رمز المنتج SKU",
         "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
     ]) or ""
-    # #region agent log H3
-    try:
-        import json as _jl, time as _tl
-        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
-            _lf.write(_jl.dumps({"sessionId":"89f8c7","hypothesisId":"H3","location":"engine.py:run_full_analysis","message":"our_cols_and_id","data":{"our_cols":list(our_df.columns)[:15],"our_col":our_col,"our_id_col":our_id_col,"our_price_col":our_price_col,"comp_keys":list(comp_dfs.keys())},"timestamp":int(_tl.time()*1000)}) + "\n")
-    except Exception:
-        pass
-    # #endregion
     our_img_col = _fcol_optional(our_df, [
         "صورة المنتج", "صوره المنتج", "image", "Image", "product_image", "الصورة",
     ])
@@ -2097,6 +2153,40 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     total   = len(our_df)
     pending = []
     BATCH   = 8  # خفض من 12 إلى 8 لتقليل ضغط Gemini ومنع rate limit
+
+    # ── الرادار التسعيري: استيراد دالة تحديث سعر المنافس ──────────────────
+    try:
+        from utils.db_manager import update_competitor_price as _upd_comp_price
+    except Exception:
+        _upd_comp_price = None
+
+    def _inject_price_alert(row_dict: dict) -> dict:
+        """يستدعي قاعدة البيانات لرصد تغيير سعر المنافس ويضيف حالة_السعر."""
+        if not _upd_comp_price or row_dict is None:
+            if row_dict is not None:
+                row_dict.setdefault("حالة_السعر", "")
+            return row_dict
+        try:
+            c_name  = str(row_dict.get("المنافس", "") or "")
+            c_pid   = str(row_dict.get("معرف_المنافس", "") or "").strip()
+            c_price = float(row_dict.get("سعر_المنافس", 0) or 0)
+            # استخدم اسم المنتج كمفتاح احتياطي إن لم يكن للمنافس معرّف
+            if not c_pid:
+                c_pid = str(row_dict.get("منتج_المنافس", "") or "").strip()[:80]
+            if c_name and c_pid and c_price > 0:
+                old_p = _upd_comp_price(c_name, c_pid, c_price)
+                if old_p is not None:
+                    if old_p > c_price:
+                        row_dict["حالة_السعر"] = f"📉 المنافس خفض السعر (كان: {old_p:,.0f} ر.س)"
+                    else:
+                        row_dict["حالة_السعر"] = f"📈 المنافس رفع السعر (كان: {old_p:,.0f} ر.س)"
+                else:
+                    row_dict["حالة_السعر"] = ""
+            else:
+                row_dict["حالة_السعر"] = ""
+        except Exception:
+            row_dict["حالة_السعر"] = ""
+        return row_dict
 
     def _flush():
         """يُعالج الـ pending batch ويضيف النتائج مباشرة — محمي من الأخطاء"""
@@ -2131,7 +2221,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                               best, src="gemini", all_cands=it["all_cands"],
                               our_img=it.get("our_img", ""), our_url=it.get("our_url", ""))
                 if rr is not None:
-                    results.append(rr)
+                    results.append(_inject_price_alert(rr))
             except Exception:
                 # خطأ في منتج واحد → تخطيه وأكمل
                 continue
@@ -2237,7 +2327,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                               best0, src="auto", all_cands=all_cands,
                               our_img=our_img, our_url=our_url)
             if row_result is not None:   # ← فلتر None
-                results.append(row_result)
+                results.append(_inject_price_alert(row_result))
         else:
             pending.append(dict(
                 product=product, our_price=our_price, our_id=our_id,
@@ -2642,42 +2732,73 @@ def _our_sku_set(our_df: pd.DataFrame) -> set:
 
 def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, threshold: int = 88) -> pd.DataFrame:
     """
-    محرك الحاجز الذكي: الفلتر النهائي قبل دخول المنتجات لقسم المفقودات.
-    يضمن عدم تكرار عبر مطابقة الـ SKU والـ Fuzzy Matching الصارم مع كتالوجنا.
+    محرك الحاجز الذكي v2: نظام المنطقة الرمادية (Gray Zone).
+    يصنف المفقودات إلى (مفقود مؤكد) أو (مكرر محتمل) لمنع ضياع الفرص ومنع
+    تكرار المنتجات في سلة. Zero Data Loss: لا نحذف قاطعاً إلا بتطابق ≥88% مع SKU.
+
+    عمود حالة_المنتج:
+      ✅ مفقود مؤكد (جاهز للإضافة) — لا تشابه معنا
+      ⚠️ مكرر محتمل (XX%)           — يشبه منتجاً لدينا 65-87%
     """
-    if missing_df.empty:
+    if missing_df is None or missing_df.empty:
         return missing_df
 
+    # ── فلترة الجودة الأساسية (عينات، أحجام صغيرة، مرفوضات) ───────────────
     filtered_df, _ = apply_strict_pipeline_filters(missing_df, name_col="منتج_المنافس")
-
     if filtered_df.empty:
         return filtered_df
 
     if our_df is None or our_df.empty:
+        filtered_df["حالة_المنتج"]       = "✅ مفقود مؤكد (جاهز للإضافة)"
+        filtered_df["منتج_مشابه_لدينا"] = ""
         return filtered_df.reset_index(drop=True)
 
     our_names = _our_product_names_series(our_df)
-    if not our_names:
-        return filtered_df.reset_index(drop=True)
+    our_skus  = _our_sku_set(our_df)
 
-    our_skus = _our_sku_set(our_df)
+    # ── تهيئة الأعمدة الجديدة على نسخة قابلة للتعديل ──────────────────────
+    filtered_df = filtered_df.copy()
+    filtered_df["حالة_المنتج"]       = "✅ مفقود مؤكد (جاهز للإضافة)"
+    filtered_df["منتج_مشابه_لدينا"] = ""
 
     keep_idx = []
+
     for idx, row in filtered_df.iterrows():
-        comp_sku = _norm_sku_barrier(row.get("معرف_المنافس", ""))
-        raw_sku = str(row.get("معرف_المنافس", "")).strip()
+        comp_sku  = _norm_sku_barrier(row.get("معرف_المنافس", ""))
+        raw_sku   = str(row.get("معرف_المنافس", "")).strip()
         comp_name = str(row.get("منتج_المنافس", "")).strip()
 
+        # 1. فلتر SKU القطعي — موجود بالتأكيد في كتالوجنا → حذف نهائي
         if comp_sku and (comp_sku in our_skus or raw_sku in our_skus):
             continue
 
-        match = rf_process.extractOne(comp_name, our_names, scorer=fuzz.token_set_ratio)
-        if match and match[1] >= threshold:
+        if not our_names:
+            keep_idx.append(idx)
             continue
+
+        # 2. مطابقة نصية
+        match = rf_process.extractOne(comp_name, our_names, scorer=fuzz.token_set_ratio)
+
+        if match:
+            score        = match[1]
+            matched_name = match[0]
+
+            # تطابق مؤكد (≥88%) → موجود لدينا → لا يُضاف
+            if score >= threshold:
+                continue
+
+            # المنطقة الرمادية (65-87%) → نبقيه مع تحذير للمراجعة
+            if 65 <= score < threshold:
+                filtered_df.at[idx, "حالة_المنتج"]       = f"⚠️ مكرر محتمل ({score:.0f}%)"
+                filtered_df.at[idx, "منتج_مشابه_لدينا"] = matched_name
 
         keep_idx.append(idx)
 
     if not keep_idx:
         return pd.DataFrame()
 
-    return filtered_df.loc[keep_idx].reset_index(drop=True)
+    final_df = filtered_df.loc[keep_idx].reset_index(drop=True)
+
+    # ⚠️ المنطقة الرمادية أولاً (تحتاج مراجعة)، ثم ✅ المفقود المؤكد
+    final_df = final_df.sort_values(by="حالة_المنتج", ascending=True).reset_index(drop=True)
+    return final_df
