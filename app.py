@@ -2040,6 +2040,16 @@ if page == "📊 لوحة التحكم":
                     # #endregion
                     st.info(f"✅ [DEBUG-H2] بعد الدمج: {len(df_all)} صف إجمالي")
 
+                    # #region agent log H_IMG_RESULT
+                    if "صورة_المنافس" in df_all.columns:
+                        _img_vals = df_all["صورة_المنافس"].fillna("").astype(str)
+                        _img_nonempty = int((_img_vals.str.strip() != "").sum())
+                        _sample_imgs = _img_vals[_img_vals.str.strip() != ""].head(2).tolist()
+                        st.info(f"🖼️ [DEBUG-H_IMG] صورة_المنافس: {_img_nonempty}/{len(df_all)} صف غير فارغ — أمثلة: {_sample_imgs[:1]}")
+                    else:
+                        st.warning("⚠️ [DEBUG-H_IMG] عمود صورة_المنافس غير موجود في النتائج!")
+                    # #endregion
+
                     _r = _split_results(df_all)
                     _r["missing"] = missing_df
                     st.session_state.results = _r
