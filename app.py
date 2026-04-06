@@ -1209,7 +1209,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                     "🚀 تحديث السعر (Make)",
                     key=f"send_make_{prefix}_{idx}",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     on_click=_cb_send_make,
                     args=(
                         prefix, idx, our_name, comp_name,
@@ -1222,7 +1222,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                 st.button(
                     "🗑️ استبعاد",
                     key=f"reject_bar_{prefix}_{idx}",
-                    use_container_width=True,
+                    width='stretch',
                     on_click=_cb_exclude,
                     args=(
                         prefix, idx, our_name, our_price,
@@ -1236,7 +1236,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                 if st.button(
                     "👁️ فحص بصري",
                     key=f"vision_btn_{prefix}_{idx}",
-                    use_container_width=True,
+                    width='stretch',
                     help="تحقق بصري عبر Gemini Vision: هل صورة منتجنا وصورة المنافس لنفس العطر؟",
                 ):
                     with st.spinner("🦅 Hawk-Eye يحلل الصورتين…"):
@@ -1759,7 +1759,7 @@ if page == "📊 لوحة التحكم":
                 if st.button(
                     f"{icon} {val}\n{short_lbl}",
                     key=f"dash_go_{rkey}",
-                    use_container_width=True,
+                    width='stretch',
                     help=f"انتقل إلى {sec_title}",
                 ):
                     st.session_state._nav_pending = sec_title
@@ -2836,7 +2836,7 @@ elif page == "🔍 منتجات مفقودة":
                 # ── أدوات جمع المعلومات ───────────────────────────────
                 t1, t2, t3, t4 = st.columns(4)
                 with t1:
-                    if st.button("🌸 مكونات", key=f"notes_{idx}", use_container_width=True):
+                    if st.button("🌸 مكونات", key=f"notes_{idx}", width='stretch'):
                         with st.spinner("يجلب من Fragrantica Arabia..."):
                             fi = fetch_fragrantica_info(nm_ai)
                             if fi.get("success"):
@@ -2855,7 +2855,7 @@ elif page == "🔍 منتجات مفقودة":
                             else:
                                 st.warning("لم يتم العثور على بيانات")
                 with t2:
-                    if st.button("🖼️ صور المنتج", key=f"imgs_{idx}", use_container_width=True):
+                    if st.button("🖼️ صور المنتج", key=f"imgs_{idx}", width='stretch'):
                         with st.spinner("🔍 يبحث عن صور..."):
                             img_result = fetch_product_images(nm_ai, brand)
                             images = img_result.get("images", [])
@@ -2868,7 +2868,7 @@ elif page == "🔍 منتجات مفقودة":
                                     with img_cols[ci]:
                                         if not is_search and url.startswith("http") and any(
                                             ext in url.lower() for ext in [".jpg",".png",".webp",".jpeg"]):
-                                            try:    st.image(url, caption=f"📸 {src}", use_container_width=True)
+                                            try:    st.image(url, caption=f"📸 {src}", width='stretch')
                                             except: st.markdown(f"[🔗 {src}]({url})")
                                         else:
                                             st.markdown(f"[🔍 ابحث في {src}]({url})")
@@ -2878,7 +2878,7 @@ elif page == "🔍 منتجات مفقودة":
                                 st.warning("لم يتم العثور على صور")
 
                 with t3:
-                    if st.button("🔎 تحقق مهووس", key=f"mhw_{idx}", use_container_width=True):
+                    if st.button("🔎 تحقق مهووس", key=f"mhw_{idx}", width='stretch'):
                         with st.spinner("يبحث في mahwous.com..."):
                             r_m = search_mahwous(nm_ai)
                             if r_m.get("success"):
@@ -2892,7 +2892,7 @@ elif page == "🔍 منتجات مفقودة":
                                 st.warning("تعذر البحث")
 
                 with t4:
-                    if st.button("💹 سعر السوق", key=f"mkt_m_{idx}", use_container_width=True):
+                    if st.button("💹 سعر السوق", key=f"mkt_m_{idx}", width='stretch'):
                         with st.spinner("🌐 يبحث في السوق..."):
                             r_s = search_market_price(nm_ai, price)
                             if r_s.get("success"):
@@ -2915,7 +2915,7 @@ elif page == "🔍 منتجات مفقودة":
                 # ── إجراءات ───────────────────────────────────────────
                 a1, a2, a3, a4 = st.columns(4)
                 with a1:
-                    if st.button("✍️ خبير الوصف", key=f"expert_{idx}", type="primary", use_container_width=True):
+                    if st.button("✍️ خبير الوصف", key=f"expert_{idx}", type="primary", width='stretch'):
                         with st.spinner("🤖 خبير مهووس يكتب الوصف الكامل..."):
                             fi_cached = st.session_state.get(f"frag_info_{idx}")
                             if not fi_cached:
@@ -2928,7 +2928,7 @@ elif page == "🔍 منتجات مفقودة":
                 with a2:
                     _has_desc = f"desc_{idx}" in st.session_state
                     _make_lbl = "📤 إرسال Make + وصف" if _has_desc else "📤 إرسال Make"
-                    if st.button(_make_lbl, key=f"mk_m_{idx}", type="primary" if _has_desc else "secondary", use_container_width=True):
+                    if st.button(_make_lbl, key=f"mk_m_{idx}", type="primary" if _has_desc else "secondary", width='stretch'):
                         _desc_send  = st.session_state.get(f"desc_{idx}","")
                         _fi_send    = st.session_state.get(f"frag_info_{idx}",{})
                         _img_url    = _fi_send.get("image_url","") if _fi_send else ""
@@ -2964,7 +2964,7 @@ elif page == "🔍 منتجات مفقودة":
                             st.error(res["message"])
 
                 with a3:
-                    if st.button("🤖 تكرار؟", key=f"dup_{idx}", use_container_width=True):
+                    if st.button("🤖 تكرار؟", key=f"dup_{idx}", width='stretch'):
                         with st.spinner("..."):
                             our_prods = []
                             if st.session_state.analysis_df is not None:
@@ -2978,7 +2978,7 @@ elif page == "🔍 منتجات مفقودة":
                             st.info(_dup_resp if r_dup.get("success") else "فشل")
 
                 with a4:
-                    if st.button("🗑️ تجاهل", key=f"ign_{idx}", use_container_width=True):
+                    if st.button("🗑️ تجاهل", key=f"ign_{idx}", width='stretch'):
                         log_decision(nm_ai,"missing","ignored","تجاهل",0,price,-price,comp)
                         _ign = f"missing_{name}_{idx}"
                         st.session_state.hidden_products.add(_ign)
@@ -3598,7 +3598,7 @@ elif page == "🕷️ كشط المنافسين":
             )
         with _col_add:
             st.button("➕ إضافة", on_click=_cb_add_store, key="btn_add_store",
-                      use_container_width=True)
+                      width='stretch')
 
         _stores_list = _load_stores()
         if _stores_list:
@@ -3614,7 +3614,7 @@ elif page == "🕷️ كشط المنافسين":
                     )
                 with _r2:
                     st.button("🗑️", key=f"del_{_si}", on_click=_cb_remove_store,
-                              args=(_si,), use_container_width=True, help=f"حذف {_surl}")
+                              args=(_si,), width='stretch', help=f"حذف {_surl}")
         else:
             st.warning("لا توجد متاجر — أضف رابطاً للبدء")
             st.info(
@@ -3666,7 +3666,7 @@ elif page == "🕷️ كشط المنافسين":
                 st.button(
                     "⏳ الكشط يعمل بالفعل…" if _is_running else "🚀 بدء الكشط (تزايدي)",
                     type="primary", on_click=_cb_start,
-                    key="btn_start_incr", use_container_width=True,
+                    key="btn_start_incr", width='stretch',
                     disabled=_is_running,
                     help="يكشط فقط المنتجات الجديدة أو المحدَّثة — البيانات القديمة تُحفظ",
                 )
@@ -3674,7 +3674,7 @@ elif page == "🕷️ كشط المنافسين":
                 st.button(
                     "🔄 كشط كامل (يُعيد الكل)",
                     type="secondary", on_click=_cb_start_full,
-                    key="btn_start_full", use_container_width=True,
+                    key="btn_start_full", width='stretch',
                     disabled=_is_running,
                     help="يكشط جميع المنتجات من جديد بغض النظر عن التغييرات",
                 )
@@ -3844,11 +3844,11 @@ elif page == "🕷️ كشط المنافسين":
                             file_name="competitors_latest.csv",
                             mime="text/csv",
                             key="sc_dl_mon",
-                            use_container_width=True,
+                            width='stretch',
                         )
                 with _go2:
                     if st.button("🚀 انتقل للمطابقة", key="sc_go_mon",
-                                 type="primary", use_container_width=True):
+                                 type="primary", width='stretch'):
                         st.session_state._nav_pending = "📊 لوحة التحكم"
                         st.session_state["_use_auto_scraper"] = True
                         st.rerun()
@@ -3974,13 +3974,13 @@ elif page == "🕷️ كشط المنافسين":
                     "⏸️ تعطيل" if _sch_on else "▶️ تفعيل الجدولة",
                     on_click=_cb_toggle_sch, key="btn_tog_sch",
                     type="primary" if not _sch_on else "secondary",
-                    use_container_width=True,
+                    width='stretch',
                 )
             with _sb2:
                 st.button(
                     "🚀 تشغيل الآن",
                     on_click=_cb_run_sched_now, key="btn_run_sch_now",
-                    use_container_width=True, disabled=_is_running,
+                    width='stretch', disabled=_is_running,
                 )
 
         except Exception as _sch_ex:
