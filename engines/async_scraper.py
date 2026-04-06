@@ -88,6 +88,9 @@ _OG_TITLE_RE  = re.compile(
 _OG_PRICE_RE  = re.compile(
     r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
+_OG_CURRENCY_RE = re.compile(
+    r'<meta[^>]+property=["\']product:price:currency["\'][^>]+content=["\']([^"\']+)["\']', re.I
+)
 _OG_IMAGE_RE  = re.compile(
     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
@@ -95,6 +98,18 @@ _PRICE_META_RE = re.compile(
     r'<meta[^>]+(?:itemprop|property)=["\'](?:price|product:price:amount)["\'][^>]+content=["\']([^"\']+)["\']',
     re.I,
 )
+_PRICE_META_CURRENCY_RE = re.compile(
+    r'<meta[^>]+(?:itemprop|property)=["\'](?:priceCurrency|product:price:currency)["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_PRICE_CLASS_RE = re.compile(
+    r'<[^>]+class=["\'][^"\']*(?:product-price|price|amount|text-sm-2)[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+    re.I | re.S,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+# يمكن تجاوز سعر الصرف عبر متغير البيئة USD_TO_SAR (مثل: export USD_TO_SAR=3.80)
+import os as _os_scraper
+_USD_TO_SAR = float(_os_scraper.environ.get("USD_TO_SAR", "3.75"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -167,23 +182,27 @@ class Progress:
     def __init__(self, stores: List[str], total_urls: int):
         self._file = PROGRESS_FILE
         self._data: Dict[str, Any] = {
-            "running":           True,
-            "started_at":        datetime.now().isoformat(),
-            "updated_at":        datetime.now().isoformat(),
-            "stores_total":      len(stores),
-            "stores_done":       0,
-            "urls_total":        total_urls,
-            "urls_processed":    0,
-            "rows_in_csv":       0,
-            "fetch_exceptions":  0,
-            "success_rate_pct":  0,
-            "current_store":     "",
-            "last_error":        "",
-            "output_file":       str(OUTPUT_CSV),
-            "store_urls_total":  0,
-            "store_urls_done":   0,
-            "store_started_at":  "",
-            "stores_results":    {},
+            "running":              True,
+            "started_at":           datetime.now().isoformat(),
+            "updated_at":           datetime.now().isoformat(),
+            "stores_total":         len(stores),
+            "stores_done":          0,
+            "urls_total":           total_urls,
+            "urls_processed":       0,
+            "rows_in_csv":          0,
+            "fetch_exceptions":     0,
+            "success_rate_pct":     0,
+            "current_store":        "",
+            "last_error":           "",
+            "output_file":          str(OUTPUT_CSV),
+            "store_urls_total":     0,
+            "store_urls_done":      0,
+            "store_started_at":     "",
+            "stores_results":       {},
+            # عدد المنتجات المحفوظة مسبقاً لكل متجر (من الكشط السابق)
+            "stores_cached_counts": {},
+            # المتاجر التي فشل استخراج Sitemap لها
+            "stores_sitemap_failed":[],
         }
         self._flush()
 
@@ -229,7 +248,28 @@ def _parse_price(raw: Any) -> Optional[float]:
         return None
     if isinstance(raw, (int, float)):
         return float(raw) if float(raw) > 0 else None
-    s = re.sub(r"[^\d.,]", "", str(raw).replace(",", ""))
+    # ترجمة الأرقام العربية-الهندية
+    s0 = str(raw).strip().translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
+    s0 = s0.replace("٬", ",").replace("،", ",")
+    s = re.sub(r"[^\d.,]", "", s0)
+    if not s:
+        return None
+    # تحديد الفاصل العشري بناءً على موقع آخر فاصل:
+    #   "1.500,50" → comma أخيراً → decimal=',', thousands='.'
+    #   "1,500.50" → dot أخيراً  → decimal='.', thousands=','
+    dot_idx   = s.rfind('.')
+    comma_idx = s.rfind(',')
+    if dot_idx >= 0 and comma_idx >= 0:
+        if comma_idx > dot_idx:
+            s = s.replace('.', '').replace(',', '.')   # أوروبي
+        else:
+            s = s.replace(',', '')                     # إنجليزي
+    elif comma_idx >= 0:
+        parts = s.split(',')
+        if len(parts) == 2 and len(parts[-1]) == 3:
+            s = s.replace(',', '')    # فاصل آلاف
+        else:
+            s = s.replace(',', '.')   # فاصل عشري
     if not s:
         return None
     try:
@@ -237,6 +277,58 @@ def _parse_price(raw: Any) -> Optional[float]:
         return v if v > 0 else None
     except ValueError:
         return None
+
+
+def _strip_tags(text: str) -> str:
+    return _TAG_RE.sub(" ", str(text or "")).strip()
+
+
+def _currency_hint(text: str) -> str:
+    t = str(text or "").upper()
+    if not t:
+        return ""
+    if any(x in t for x in ("SAR", "ر.س", "﷼", "ريال")):
+        return "SAR"
+    if "USD" in t or "$" in t:
+        return "USD"
+    return ""
+
+
+def _price_to_sar(price: Optional[float], currency: str = "", raw_text: str = "") -> Optional[float]:
+    if price is None or price <= 0:
+        return None
+    c = str(currency or "").strip().upper()
+    if not c:
+        c = _currency_hint(raw_text)
+    if c == "USD":
+        return round(float(price) * _USD_TO_SAR, 2)
+    return float(price)
+
+
+def _pick_price_candidate(candidates: List[tuple]) -> Optional[float]:
+    """اختر السعر مع تفضيل SAR، ثم حوّل USD→SAR عند الحاجة."""
+    if not candidates:
+        return None
+    for p, cur, raw in candidates:
+        if str(cur or "").strip().upper() == "SAR":
+            v = _price_to_sar(p, cur, raw)
+            if v and v > 0:
+                return v
+    for p, cur, raw in candidates:
+        v = _price_to_sar(p, cur, raw)
+        if v and v > 0:
+            return v
+    return None
+
+
+def _extract_price_from_common_classes(html: str) -> Optional[tuple]:
+    """Fallback: ابحث في كلاسات الأسعار الشائعة (Salla/Zid وغيرها)."""
+    for m in _PRICE_CLASS_RE.finditer(html or ""):
+        raw = _strip_tags(m.group(1))
+        p = _parse_price(raw)
+        if p and p > 0:
+            return p, _currency_hint(raw), raw
+    return None
 
 
 def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
@@ -258,21 +350,30 @@ def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
         if not name:
             continue
 
-        # سعر
+        # سعر + عملة (تفضيل SAR ثم تحويل USD عند اللزوم)
+        price_candidates: List[tuple] = []
         offers = node.get("offers") or node.get("Offers") or {}
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        if isinstance(offers, dict):
-            otype = offers.get("@type", "")
-            if otype == "AggregateOffer":
-                price_raw = offers.get("lowPrice") or offers.get("highPrice") or offers.get("price")
+        offers_list = offers if isinstance(offers, list) else [offers]
+        for off in offers_list:
+            if isinstance(off, dict):
+                otype = str(off.get("@type", "") or "")
+                if otype == "AggregateOffer":
+                    price_raw = off.get("lowPrice") or off.get("highPrice") or off.get("price")
+                else:
+                    price_raw = off.get("price")
+                cur = off.get("priceCurrency") or off.get("currency") or node.get("priceCurrency") or ""
             else:
-                price_raw = offers.get("price")
-        else:
-            price_raw = offers
-        if price_raw is None:
-            price_raw = node.get("price")
-        price = _parse_price(price_raw)
+                price_raw = off
+                cur = node.get("priceCurrency") or ""
+            p = _parse_price(price_raw)
+            if p and p > 0:
+                price_candidates.append((p, str(cur or ""), str(price_raw or "")))
+        if not price_candidates:
+            p = _parse_price(node.get("price"))
+            if p and p > 0:
+                price_candidates.append((p, str(node.get("priceCurrency") or ""), str(node.get("price") or "")))
+
+        price = _pick_price_candidate(price_candidates)
         if price is None or price <= 0:
             continue
 
@@ -342,7 +443,9 @@ def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
     image_m = _OG_IMAGE_RE.search(html)
     if not name_m or not price_m:
         return None
-    price = _parse_price(price_m.group(1))
+    cur_m = _OG_CURRENCY_RE.search(html) or _PRICE_META_CURRENCY_RE.search(html)
+    cur = cur_m.group(1).strip() if cur_m else ""
+    price = _price_to_sar(_parse_price(price_m.group(1)), cur, price_m.group(1))
     if price is None:
         return None
     return {
@@ -356,12 +459,35 @@ def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, Any]]:
-    """Fallback أخير: أنماط سعر واسم في HTML الخام."""
-    price_m = re.search(r'"price"\s*:\s*"?([\d.,]+)"?', html, re.I)
-    if not price_m:
-        return None
-    price = _parse_price(price_m.group(1))
-    if price is None:
+    """Fallback أخير: JSON snippets/meta/classes للأسعار."""
+    candidates: List[tuple] = []
+
+    # 1) JSON snippets: price + priceCurrency
+    for pm in re.finditer(r'"price"\s*:\s*"?([\d.,]+)"?', html or "", re.I):
+        raw = pm.group(1)
+        around = (html or "")[max(0, pm.start() - 220): pm.end() + 220]
+        cm = re.search(r'"priceCurrency"\s*:\s*"([A-Za-z]{3})"', around, re.I)
+        cur = cm.group(1).strip() if cm else _currency_hint(around)
+        p = _parse_price(raw)
+        if p and p > 0:
+            candidates.append((p, cur, raw))
+
+    # 2) meta tags
+    meta_price_m = _OG_PRICE_RE.search(html or "") or _PRICE_META_RE.search(html or "")
+    if meta_price_m:
+        cur_m = _OG_CURRENCY_RE.search(html or "") or _PRICE_META_CURRENCY_RE.search(html or "")
+        cur = cur_m.group(1).strip() if cur_m else _currency_hint(meta_price_m.group(1))
+        p = _parse_price(meta_price_m.group(1))
+        if p and p > 0:
+            candidates.append((p, cur, meta_price_m.group(1)))
+
+    # 3) common classes: .product-price / .price / .amount / .text-sm-2
+    class_hit = _extract_price_from_common_classes(html or "")
+    if class_hit:
+        candidates.append(class_hit)
+
+    price = _pick_price_candidate(candidates)
+    if price is None or price <= 0:
         return None
     name_m = _OG_TITLE_RE.search(html)
     if not name_m:
@@ -381,13 +507,55 @@ def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, 
     }
 
 
+_DESC_META_RE = re.compile(
+    r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\'][^>]*content=["\']([^"\']{10,})["\']',
+    re.I,
+)
+_DESC_CONTENT_RE = re.compile(
+    r'<meta\s+content=["\']([^"\']{10,})["\'][^>]*(?:name|property)=["\'](?:description|og:description)["\']',
+    re.I,
+)
+# الأعمدة التي تحتوي على وصف المنتج في الصفحة
+_DESC_DIV_RE = re.compile(
+    r'<(?:div|section|p)[^>]+class=["\'][^"\']*(?:description|details|product-info|product-body)[^"\']*["\'][^>]*>'
+    r'([\s\S]{30,1200}?)</(?:div|section|p)>',
+    re.I,
+)
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _extract_raw_description(html: str) -> str:
+    """يستخرج النص الخام لوصف المنتج من meta description أو div الوصف."""
+    if not html:
+        return ""
+    # 1) meta description / og:description
+    for pattern in (_DESC_META_RE, _DESC_CONTENT_RE):
+        m = pattern.search(html)
+        if m:
+            txt = m.group(1).strip()
+            if len(txt) >= 20:
+                return txt[:1500]
+    # 2) div/section ذو class وصفي
+    m2 = _DESC_DIV_RE.search(html)
+    if m2:
+        raw = _HTML_TAG_RE.sub(" ", m2.group(1))
+        raw = re.sub(r'\s+', ' ', raw).strip()
+        if len(raw) >= 30:
+            return raw[:1500]
+    return ""
+
+
 def extract_product(html: str, page_url: str) -> Optional[Dict[str, Any]]:
-    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex."""
-    return (
+    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex.
+    يُضيف raw_description لاستخدامه لاحقاً في توليد الوصف عبر AI."""
+    result = (
         _extract_from_jsonld(html, page_url)
         or _extract_from_og(html, page_url)
         or _extract_from_html_patterns(html, page_url)
     )
+    if result is not None:
+        result.setdefault("raw_description", _extract_raw_description(html))
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -424,7 +592,7 @@ async def fetch_product(
             loop = asyncio.get_running_loop()
             html = await loop.run_in_executor(None, try_all_sync_fallbacks, url)
 
-        progress.update(urls_processed=progress._data["urls_processed"] + 1)
+        progress.update(urls_processed=progress._data.get("urls_processed", 0) + 1)
 
         if not html:
             cb[store_domain] = cb.get(store_domain, 0) + 1
@@ -486,6 +654,13 @@ async def run_scraper(
     logger.info("سجلات قديمة في CSV: %d", len(existing_rows))
 
     progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
+
+    # احسب عدد المنتجات المحفوظة مسبقاً لكل متجر (للعرض في الواجهة)
+    from collections import Counter as _Counter
+    _existing_by_store = _Counter(
+        r.get("store", "").strip() for r in existing_rows.values() if r.get("store")
+    )
+    progress.update(stores_cached_counts=dict(_existing_by_store))
     all_new_rows: List[Dict[str, Any]] = []
     rows_written = 0
     sem = asyncio.Semaphore(concurrency)
@@ -499,7 +674,8 @@ async def run_scraper(
     default_headers = get_browser_headers()
 
     async with aiohttp.ClientSession(
-        connector=connector, timeout=timeout, headers=default_headers
+        connector=connector, timeout=timeout, headers=default_headers,
+        cookies={'currency': 'SAR'},   # إجبار منصة سلة على عرض الأسعار بالريال السعودي
     ) as session:
         for store_url in stores:
             domain = urlparse(store_url).netloc
@@ -521,12 +697,16 @@ async def run_scraper(
                 entries = []
 
             if not entries:
-                logger.warning("لا روابط منتجات لـ %s", domain)
+                logger.warning("لا روابط منتجات لـ %s (فشل Sitemap)", domain)
                 _res = dict(progress._data.get("stores_results") or {})
                 _res[domain] = 0
+                _failed = list(progress._data.get("stores_sitemap_failed") or [])
+                if domain not in _failed:
+                    _failed.append(domain)
                 progress.update(
                     stores_done=progress._data["stores_done"] + 1,
                     stores_results=_res,
+                    stores_sitemap_failed=_failed,
                 )
                 continue
 
@@ -541,12 +721,14 @@ async def run_scraper(
                 urls_to_fetch.append(entry.url)
 
             if not urls_to_fetch and entries:
+                _cached_n = _existing_by_store.get(domain, 0)
                 logger.info(
-                    "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى",
-                    domain, len(entries),
+                    "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى، محفوظ مسبقاً: %d",
+                    domain, len(entries), _cached_n,
                 )
                 _res = dict(progress._data.get("stores_results") or {})
-                _res[domain] = 0
+                # نستخدم قيمة سالبة كإشارة للـ UI: "محفوظ — بلا تحديث"
+                _res[domain] = -_cached_n
                 progress.update(
                     stores_done=progress._data["stores_done"] + 1,
                     stores_results=_res,
