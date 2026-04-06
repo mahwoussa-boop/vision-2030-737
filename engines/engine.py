@@ -2803,17 +2803,33 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
         return filtered_df
 
     if our_df is None or our_df.empty:
-        filtered_df["حالة_المنتج"]       = "✅ مفقود مؤكد (جاهز للإضافة)"
-        filtered_df["منتج_مشابه_لدينا"] = ""
+        filtered_df["حالة_المنتج"]           = "✅ مفقود مؤكد (جاهز للإضافة)"
+        filtered_df["منتج_مشابه_لدينا"]     = ""
+        filtered_df["صورة_منتجنا_المشابه"] = ""
         return filtered_df.reset_index(drop=True)
 
     our_names = _our_product_names_series(our_df)
     our_skus  = _our_sku_set(our_df)
 
+    # ── بناء قاموس صور منتجاتنا للمقارنة البصرية ──────────────────────────
+    our_name_col = _name_col_for_analysis(our_df)
+    our_img_col  = _find_image_column(our_df)
+    name_to_img: dict = {}
+    if our_name_col and our_img_col:
+        for _, _r in our_df.iterrows():
+            _n = str(_r.get(our_name_col, "")).strip()
+            _v = _r.get(our_img_col)
+            _img = _extract_image_url_from_cell(_v) if _v else ""
+            if not _img:
+                _img = _first_image_url_from_row(_r)
+            if _n and _img and _n not in name_to_img:
+                name_to_img[_n] = _img
+
     # ── تهيئة الأعمدة الجديدة على نسخة قابلة للتعديل ──────────────────────
     filtered_df = filtered_df.copy()
-    filtered_df["حالة_المنتج"]       = "✅ مفقود مؤكد (جاهز للإضافة)"
-    filtered_df["منتج_مشابه_لدينا"] = ""
+    filtered_df["حالة_المنتج"]           = "✅ مفقود مؤكد (جاهز للإضافة)"
+    filtered_df["منتج_مشابه_لدينا"]     = ""
+    filtered_df["صورة_منتجنا_المشابه"] = ""
 
     keep_idx = []
 
@@ -2843,8 +2859,9 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
 
             # المنطقة الرمادية (65-87%) → نبقيه مع تحذير للمراجعة
             if 65 <= score < threshold:
-                filtered_df.at[idx, "حالة_المنتج"]       = f"⚠️ مكرر محتمل ({score:.0f}%)"
-                filtered_df.at[idx, "منتج_مشابه_لدينا"] = matched_name
+                filtered_df.at[idx, "حالة_المنتج"]           = f"⚠️ مكرر محتمل ({score:.0f}%)"
+                filtered_df.at[idx, "منتج_مشابه_لدينا"]     = matched_name
+                filtered_df.at[idx, "صورة_منتجنا_المشابه"] = name_to_img.get(matched_name, "")
 
         keep_idx.append(idx)
 
