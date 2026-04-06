@@ -42,50 +42,40 @@ _MEDIA_KEYS_EMPTY_ON_NA = frozenset({
 
 def first_image_url_string(s: str) -> str:
     """
-    عندما تُخزّن عدة روابط صور في خلية واحدة مفصولة بفاصلة (شائع في تصدير سلة/إكسيل)،
-    أرجع أول رابط http يبدو ملف صورة — حتى يعمل <img src> والمتصفح.
-
-    إن كان الرابط واحداً (مثل صور المنافسين مع فاصلة داخل ?query)، يُعاد كما هو دون تقسيم.
+    أرجع أول رابط http يبدو ملف صورة، مع دعم استثنائي لروابط Cloudflare/Salla CDN
+    التي تحتوي على فواصل في مسارها (مثل fit=scale-down,width=500).
     """
     s = (s or "").strip()
     if not s:
         return ""
 
-    # ── Cloudflare/Salla CDN transform URL — لا يُقسَّم بالفاصلة ──
-    # الصيغة: https://cdn.salla.sa/cdn-cgi/image/fit=scale-down,quality=80,width=400/https://actual.jpg
-    # يحتوي على https:// ثانية داخل مسار التحويل — يُعاد كرابط كامل بدون تقسيم
-    if "cdn-cgi/image" in s:
-        # استخرج الرابط الداخلي الفعلي إن وُجد (الجزء بعد مسار CDN)
+    # فصل الروابط المتعددة إن وجدت (إكسيل يدمجها بفاصلة)
+    if "http" in s.lower():
+        start = s.lower().find("http")
+        next_http = s.lower().find("http", start + 4)
+        if next_http > 0:
+            s = s[:next_http].rstrip(",، \t\n\r")
+
+    # معالجة روابط CDN سلة التي لا تقبل التقسيم العادي
+    if "cdn-cgi/image" in s or "cdn.salla" in s:
         inner = re.search(r'cdn-cgi/image/[^/]+/(https?://[^\s<>"\']+)', s)
         if inner:
-            return inner.group(1).split()[0]
-        # أعد الرابط الكامل كما هو (لا تقطعه بالفاصلة)
-        return s.split()[0]
+            return inner.group(1).rstrip(".,;)>]")
+        # إرجاع الرابط الكامل المستخرج بدون تقسيم
+        m = re.search(r"(https?://[^\s\"\'<>]+)", s)
+        return m.group(1).rstrip(".,;)>]") if m else s.split()[0]
 
     if "http://" not in s and "https://" not in s:
         return s.split()[0]
-    if not _looks_like_several_image_urls(s):
-        return s.split()[0]
-    m = _FIRST_HTTP_IMAGE_URL.search(s)
+
+    # للروابط العادية (يتم إزالة الفواصل كإجراء احتياطي فقط إذا لم يكن CDN)
+    m = re.search(r"(https?://[^\s<>\"\'\,\u060c؛;]+?\.(?:webp|jpg|jpeg|png|gif|avif))", s, re.I)
     if m:
-        return m.group(0).strip().rstrip(".,;)]\"'")
-    # احتياط: فواصل غير إنجليزية أو نص بدون امتداد واضح في الـ regex
-    norm = s.replace("\u060c", ",").replace("،", ",").replace("؛", ";").replace("\n", ",")
-    for sep in (",", ";"):
-        if sep not in norm:
-            continue
-        for part in norm.split(sep):
-            part = part.strip()
-            if not part.startswith("http"):
-                continue
-            base = part.split("?")[0].lower()
-            if any(base.endswith(ext) for ext in (".webp", ".jpg", ".jpeg", ".png", ".gif", ".avif")):
-                return part.split()[0]
-        for part in norm.split(sep):
-            part = part.strip()
-            if part.startswith("http"):
-                return part.split()[0]
-    return s.split()[0]
+        return m.group(1).rstrip(".,;)>]")
+
+    # fallback أخير
+    m2 = re.search(r"(https?://[^\s\"\'<>]+)", s)
+    return m2.group(1).rstrip(".,;)>]") if m2 else s.split()[0]
 
 
 def _strip_media_val(v):
