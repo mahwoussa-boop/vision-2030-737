@@ -107,7 +107,9 @@ _PRICE_CLASS_RE = re.compile(
     re.I | re.S,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
-_USD_TO_SAR = 3.75
+# يمكن تجاوز سعر الصرف عبر متغير البيئة USD_TO_SAR (مثل: export USD_TO_SAR=3.80)
+import os as _os_scraper
+_USD_TO_SAR = float(_os_scraper.environ.get("USD_TO_SAR", "3.75"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -246,9 +248,28 @@ def _parse_price(raw: Any) -> Optional[float]:
         return None
     if isinstance(raw, (int, float)):
         return float(raw) if float(raw) > 0 else None
-    s0 = str(raw).strip().replace("٬", ",").replace("،", ",")
+    # ترجمة الأرقام العربية-الهندية
+    s0 = str(raw).strip().translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
+    s0 = s0.replace("٬", ",").replace("،", ",")
     s = re.sub(r"[^\d.,]", "", s0)
-    s = s.replace(",", "")
+    if not s:
+        return None
+    # تحديد الفاصل العشري بناءً على موقع آخر فاصل:
+    #   "1.500,50" → comma أخيراً → decimal=',', thousands='.'
+    #   "1,500.50" → dot أخيراً  → decimal='.', thousands=','
+    dot_idx   = s.rfind('.')
+    comma_idx = s.rfind(',')
+    if dot_idx >= 0 and comma_idx >= 0:
+        if comma_idx > dot_idx:
+            s = s.replace('.', '').replace(',', '.')   # أوروبي
+        else:
+            s = s.replace(',', '')                     # إنجليزي
+    elif comma_idx >= 0:
+        parts = s.split(',')
+        if len(parts) == 2 and len(parts[-1]) == 3:
+            s = s.replace(',', '')    # فاصل آلاف
+        else:
+            s = s.replace(',', '.')   # فاصل عشري
     if not s:
         return None
     try:
@@ -571,7 +592,7 @@ async def fetch_product(
             loop = asyncio.get_running_loop()
             html = await loop.run_in_executor(None, try_all_sync_fallbacks, url)
 
-        progress.update(urls_processed=progress._data["urls_processed"] + 1)
+        progress.update(urls_processed=progress._data.get("urls_processed", 0) + 1)
 
         if not html:
             cb[store_domain] = cb.get(store_domain, 0) + 1
