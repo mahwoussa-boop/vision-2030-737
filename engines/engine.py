@@ -1820,22 +1820,31 @@ _OR_FREE = [
 
 def _ai_batch(batch):
     """
+    Chain-of-Thought AI matching: يُرجع (indices, reasons) بدلاً من أرقام فقط.
+
     batch: [{"our":str, "price":float, "candidates":[...]}]
-    → [int]  (0-based index | -1=no match)
-    يحاول Gemini أولاً ثم OpenRouter تلقائياً — لا يتوقف أبداً
+    → Tuple[List[int], List[str]]
+      - indices: 0-based index لأفضل مرشح، أو -1 إذا لم يوجد تطابق
+      - reasons: تبريرات AI موجزة (سطر واحد لكل منتج)
+
+    الأولوية: Gemini → OpenRouter → Fuzzy fallback — لا يتوقف أبداً
     """
     if not batch:
-        return []
+        return [], []
 
-    # ── cache ────────────────────────────────────────────────────────────
+    # ── cache (يحفظ الـ tuple كاملاً) ───────────────────────────────────
     ck = hashlib.md5(json.dumps(
         [{"o": x["our"], "c": [c["name"] for c in x["candidates"]]} for x in batch],
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     cached = _cget(ck)
     if cached is not None:
-        return cached
+        # دعم الـ cache القديم (قائمة أرقام) والجديد (tuple/list of 2)
+        if isinstance(cached, (list, tuple)) and len(cached) == 2 and isinstance(cached[0], list):
+            return cached[0], cached[1]
+        if isinstance(cached, list):
+            return cached, [""] * len(cached)
 
-    # ── بناء الـ prompt ───────────────────────────────────────────────────
+    # ── بناء الـ prompt — Chain of Thought ──────────────────────────────
     lines = []
     for i, it in enumerate(batch):
         cands = "\n".join(
@@ -1846,41 +1855,66 @@ def _ai_batch(batch):
         lines.append(f"[{i+1}] منتجنا: «{it['our']}» ({it['price']:.0f}ر.س)\n{cands}")
 
     prompt = (
-        "خبير عطور فاخرة. لكل منتج اختر رقم المرشح المطابق تماماً أو 0 إذا لا يوجد.\n"
-        "الشروط: نفس الماركة + نفس الحجم ±5ml + نفس EDP/EDT + نفس الجنس\n\n"
+        "أنت خبير عطور فاخرة. مهمتك مطابقة منتجنا مع أفضل مرشح من المنافسين.\n"
+        "الشروط الصارمة للتطابق: نفس الماركة، نفس الحجم (±5ml)، نفس التركيز (EDP/EDT)، ونفس الجنس.\n\n"
         + "\n\n".join(lines)
-        + f'\n\nJSON فقط: {{"results":[r1,r2,...,r{len(batch)}]}}'
+        + '\n\nأعد كائن JSON فقط بالصيغة التالية (بدون أي نصوص إضافية):\n'
+        + '{"results": [{"index": رقم_المرشح_الصحيح, "reason": "تبرير قصير جداً في سطر واحد"}, ...]}\n'
+        + 'ملاحظة: index هو رقم المرشح (1، 2، الخ). إذا لم يوجد تطابق تام اجعل index = 0.'
     )
 
     def _parse(txt):
-        """يحلل استجابة AI إلى قائمة أرقام"""
+        """
+        يحلل استجابة Chain-of-Thought إلى (indices, reasons).
+        يدعم صيغتين:
+          - جديدة: {"results": [{"index": N, "reason": "..."}, ...]}
+          - قديمة fallback: {"results": [N1, N2, ...]}
+        """
         try:
             clean = re.sub(r'```json|```', '', txt).strip()
             s = clean.find('{'); e = clean.rfind('}') + 1
             if s < 0 or e <= s:
-                return None
+                return None, None
             raw = json.loads(clean[s:e]).get("results", [])
-            out = []
+            if not raw:
+                return None, None
+
+            out_indices: list = []
+            out_reasons: list = []
+
             for j, it in enumerate(batch):
-                n = raw[j] if j < len(raw) else 1
+                entry = raw[j] if j < len(raw) else None
+                # صيغة جديدة: {"index": N, "reason": "..."}
+                if isinstance(entry, dict):
+                    n = entry.get("index", 1)
+                    reason = str(entry.get("reason", "")).strip()
+                else:
+                    # صيغة قديمة: رقم مباشر
+                    n = entry if entry is not None else 1
+                    reason = ""
                 try:
                     n = int(float(str(n)))
                 except Exception:
                     n = 1
                 if 1 <= n <= len(it["candidates"]):
-                    out.append(n - 1)
+                    out_indices.append(n - 1)
                 elif n == 0:
-                    out.append(-1)
+                    out_indices.append(-1)
                 else:
-                    out.append(0)
-            return out if len(out) == len(batch) else None
+                    out_indices.append(0)
+                out_reasons.append(reason)
+
+            if len(out_indices) == len(batch):
+                return out_indices, out_reasons
+            return None, None
         except Exception:
-            return None
+            return None, None
 
     # ── 1. Gemini ─────────────────────────────────────────────────────────
+    # نزيد maxOutputTokens لاستيعاب الـ reasons في JSON
     g_payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 300, "topP": 1, "topK": 1}
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 600, "topP": 1, "topK": 1}
     }
     for key in (GEMINI_API_KEYS or []):
         if not key:
@@ -1889,24 +1923,22 @@ def _ai_batch(batch):
             r = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
             if r.status_code == 200:
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                out = _parse(txt)
-                if out:
-                    _cset(ck, out)
-                    return out
+                out_i, out_r = _parse(txt)
+                if out_i is not None:
+                    _cset(ck, [out_i, out_r])
+                    return out_i, out_r
             elif r.status_code == 429:
-                # rate limit → انتظر أطول ثم جرب نفس المفتاح مرة أخرى
                 time.sleep(3)
                 try:
                     r2 = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
                     if r2.status_code == 200:
                         txt = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
-                        out = _parse(txt)
-                        if out:
-                            _cset(ck, out)
-                            return out
+                        out_i, out_r = _parse(txt)
+                        if out_i is not None:
+                            _cset(ck, [out_i, out_r])
+                            return out_i, out_r
                 except Exception:
                     pass
-            # 403/400 → جرب المفتاح التالي فوراً
         except Exception:
             continue
 
@@ -1919,17 +1951,17 @@ def _ai_batch(batch):
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 300,
+                    "max_tokens": 600,
                 }, headers={
                     "Authorization": f"Bearer {or_key}",
                     "HTTP-Referer": "https://mahwous.com",
                 }, timeout=30)
                 if r.status_code == 200:
                     txt = r.json()["choices"][0]["message"]["content"]
-                    out = _parse(txt)
-                    if out:
-                        _cset(ck, out)
-                        return out
+                    out_i, out_r = _parse(txt)
+                    if out_i is not None:
+                        _cset(ck, [out_i, out_r])
+                        return out_i, out_r
                 elif r.status_code in (404, 400):
                     continue
                 elif r.status_code in (401, 402):
@@ -1938,17 +1970,19 @@ def _ai_batch(batch):
                 continue
 
     # ── 3. Fuzzy fallback — لا يتوقف أبداً ──────────────────────────────
-    # عند فشل كل AI → قرر حسب score الـ fuzzy
-    out = []
+    out_i, out_r = [], []
     for it in batch:
         cands = it.get("candidates", [])
         if not cands:
-            out.append(-1)
+            out_i.append(-1)
+            out_r.append("لا مرشحين متاحين")
         elif cands[0].get("score", 0) >= 88:
-            out.append(0)   # ثقة عالية → خذ الأول
+            out_i.append(0)
+            out_r.append(f"تطابق fuzzy عالٍ ({cands[0].get('score',0):.0f}%)")
         else:
-            out.append(-1)  # ثقة منخفضة → مراجعة
-    return out
+            out_i.append(-1)
+            out_r.append(f"أفضل نتيجة fuzzy ({cands[0].get('score',0):.0f}%) أقل من الحد الأدنى")
+    return out_i, out_r
 
 
 # ═══════════════════════════════════════════════════════
@@ -2007,7 +2041,11 @@ def _excluded_match_row(
 # ═══════════════════════════════════════════════════════
 def _row(product, our_price, our_id, brand, size, ptype, gender,
          best=None, override=None, src="", all_cands=None,
-         our_img="", our_url=""):
+         our_img="", our_url="", ai_reason=""):
+    """
+    يبني صف النتيجة النهائي.
+    ai_reason: تبرير Chain-of-Thought من Gemini (سطر واحد موجز).
+    """
     sz_str = f"{int(size)}ml" if size else ""
     if best is None:
         return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
@@ -2019,7 +2057,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
                     جميع_المنافسين=[], مصدر_المطابقة=src or "—",
                     تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
                     صورة_منتجنا=our_img or "", رابط_منتجنا=our_url or "",
-                    رابط_المنافس="")
+                    رابط_المنافس="", تبرير_AI=str(ai_reason or "").strip())
 
     cp    = float(best.get("price") or 0)
     score = float(best.get("score") or 0)
@@ -2084,7 +2122,8 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
                 تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
                 صورة_منتجنا=our_img or "", رابط_منتجنا=our_url or "",
                 صورة_المنافس=comp_img,
-                رابط_المنافس=str(best.get("product_url") or best.get("url") or "").strip())
+                رابط_المنافس=str(best.get("product_url") or best.get("url") or "").strip(),
+                تبرير_AI=str(ai_reason or "").strip())
 
 
 # ═══════════════════════════════════════════════════════
@@ -2189,23 +2228,27 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         return row_dict
 
     def _flush():
-        """يُعالج الـ pending batch ويضيف النتائج مباشرة — محمي من الأخطاء"""
+        """يُعالج الـ pending batch ويضيف النتائج — محمي من الأخطاء، يحمل تبريرات Chain-of-Thought"""
         if not pending:
             return
         try:
-            idxs = _ai_batch(pending)
+            idxs, reasons = _ai_batch(pending)
         except Exception:
             # فشل AI → fallback: استخدم أفضل مرشح fuzzy
-            idxs = []
+            idxs, reasons = [], []
             for it in pending:
                 cands = it.get("candidates", [])
                 if cands and cands[0].get("score", 0) >= 88:
                     idxs.append(0)
+                    reasons.append(f"تطابق fuzzy ({cands[0].get('score',0):.0f}%) — فشل AI")
                 else:
                     idxs.append(-1)
+                    reasons.append("فشل AI والـ fuzzy دون الحد الأدنى")
+
         for j, it in enumerate(pending):
             try:
-                ci = idxs[j] if j < len(idxs) else 0
+                ci     = idxs[j]   if j < len(idxs)   else 0
+                reason = reasons[j] if j < len(reasons) else ""
                 if ci < 0:
                     # AI غير متأكد → أعطِ أفضل مرشح كمراجعة
                     best_fallback = it["candidates"][0] if it["candidates"] else None
@@ -2213,13 +2256,15 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                               it["brand"], it["size"], it["ptype"], it["gender"],
                               best_fallback, "⚠️ تحت المراجعة", "ai_uncertain",
                               all_cands=it["all_cands"],
-                              our_img=it.get("our_img", ""), our_url=it.get("our_url", ""))
+                              our_img=it.get("our_img", ""), our_url=it.get("our_url", ""),
+                              ai_reason=reason)
                 else:
                     best = it["candidates"][ci]
                     rr = _row(it["product"], it["our_price"], it["our_id"],
                               it["brand"], it["size"], it["ptype"], it["gender"],
                               best, src="gemini", all_cands=it["all_cands"],
-                              our_img=it.get("our_img", ""), our_url=it.get("our_url", ""))
+                              our_img=it.get("our_img", ""), our_url=it.get("our_url", ""),
+                              ai_reason=reason)
                 if rr is not None:
                     results.append(_inject_price_alert(rr))
             except Exception:

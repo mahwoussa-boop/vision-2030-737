@@ -10,6 +10,7 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
+import base64
 import hashlib
 import requests, json, re, time, traceback
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
@@ -1394,3 +1395,129 @@ def generate_salla_brand_info(brand_name: str) -> dict:
         },
         bn,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  🦅 Hawk-Eye Vision — التحقق البصري عبر Gemini Vision
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_base64_from_url(url: str, timeout: int = 10) -> str | None:
+    """
+    يحمّل صورة من URL ويحوّلها إلى Base64.
+
+    Returns:
+        سلسلة Base64 عند النجاح، أو None عند أي فشل (الشبكة، MIME، إلخ).
+    """
+    if not (url or "").strip():
+        return None
+    try:
+        resp = requests.get(
+            url.strip(),
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MahwousVision/1.0)"},
+        )
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        # رفض الردود غير الصورية (HTML، JSON، إلخ)
+        if not any(t in content_type for t in ("image/", "application/octet-stream")):
+            return None
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception:
+        return None
+
+
+def visual_verify_match(
+    our_img_url: str,
+    comp_img_url: str,
+    product_name: str,
+) -> dict:
+    """
+    يقارن بصرياً بين صورتين عبر Gemini Vision للتأكد من تطابق العطر الفعلي.
+
+    يفيد في حلّ حالات "المنطقة الرمادية" حيث الأسماء متشابهة لكن قد تكون
+    إصدارات مختلفة (مثال: نفس الماركة بحجم زجاجة مختلف أو لون مختلف).
+
+    Args:
+        our_img_url:  رابط صورة منتجنا.
+        comp_img_url: رابط صورة منتج المنافس.
+        product_name: اسم العطر المفترض (للسياق في الـ Prompt).
+
+    Returns:
+        dict مع المفاتيح:
+            - match  (bool):   هل الصورتان لنفس العطر تماماً؟
+            - reason (str):    تبرير مرئي موجز (سطر واحد).
+            - source (str):    مصدر القرار ("gemini_vision" | "fallback").
+    """
+    # ── التحقق من توفر الصور ────────────────────────────────────────────
+    if not our_img_url or not comp_img_url:
+        return {"match": False, "reason": "الصور غير متوفرة للتحقق البصري.", "source": "fallback"}
+
+    our_b64  = get_base64_from_url(our_img_url)
+    comp_b64 = get_base64_from_url(comp_img_url)
+
+    if not our_b64:
+        return {"match": False, "reason": "فشل تحميل صورة منتجنا.", "source": "fallback"}
+    if not comp_b64:
+        return {"match": False, "reason": "فشل تحميل صورة المنافس.", "source": "fallback"}
+
+    # ── بناء الـ Prompt ──────────────────────────────────────────────────
+    prompt = (
+        f'أنت خبير في التعرف البصري على زجاجات العطور الفاخرة.\n'
+        f'أمامك صورتان لعطر يُفترض أنه: "{product_name}".\n'
+        f'دقّق جيداً في:\n'
+        f'  1. شكل ولون الزجاجة والسائل داخلها.\n'
+        f'  2. شكل الغطاء ومادته.\n'
+        f'  3. الملصق (Label) وخط الكتابة عليه.\n'
+        f'هل الصورتان لنفس العطر تماماً (نفس الإصدار والتركيز والحجم)?\n'
+        f'أرجع JSON فقط — لا أي نص قبله أو بعده:\n'
+        f'{{"is_identical": true/false, "visual_reason": "تبرير دقيق من سطر واحد"}}'
+    )
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": our_b64}},
+                {"inline_data": {"mime_type": "image/jpeg", "data": comp_b64}},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200},
+    }
+
+    # ── استدعاء Gemini Vision (يجرّب كل مفتاح متاح) ────────────────────
+    vision_model = "gemini-1.5-flash"
+    vision_url_tpl = (
+        "https://generativelanguage.googleapis.com/v1beta"
+        f"/models/{vision_model}:generateContent?key={{key}}"
+    )
+    for key in (GEMINI_API_KEYS or []):
+        if not key:
+            continue
+        try:
+            r = requests.post(
+                vision_url_tpl.format(key=key),
+                json=payload,
+                timeout=30,
+            )
+            if r.status_code != 200:
+                continue
+            raw_txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            clean   = re.sub(r"```json|```", "", raw_txt).strip()
+            s = clean.find("{"); e = clean.rfind("}") + 1
+            if s < 0 or e <= s:
+                continue
+            data = json.loads(clean[s:e])
+            return {
+                "match":  bool(data.get("is_identical", False)),
+                "reason": str(data.get("visual_reason", "")).strip(),
+                "source": "gemini_vision",
+            }
+        except Exception:
+            continue
+
+    # ── Graceful fallback — لا ينهار التطبيق أبداً ────────────────────
+    return {
+        "match":  False,
+        "reason": "تعذّر الاتصال بـ Gemini Vision — يُرجى إعادة المحاولة لاحقاً.",
+        "source": "fallback",
+    }
