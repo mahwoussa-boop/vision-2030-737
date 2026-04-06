@@ -9,13 +9,6 @@ from datetime import datetime
 import pandas as pd
 from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
 
-# أول رابط صورة http(s) — يتوقف عند الفاصلة (إنجليزي/عربي) حتى لا يُلتقط رابطان في src واحد
-_FIRST_HTTP_IMAGE_URL = re.compile(
-    r"https?://[^\s<>\"\'\,\u060c؛;]+?"
-    r"\.(?:webp|jpg|jpeg|png|gif|avif)"
-    r"(?:\?[^\s<>\"\'\,\u060c؛;]*)?",
-    re.I,
-)
 # تسلسل شائع في سلة/إكسيل: ...jpg,https://...
 _AFTER_EXT_COMMA_HTTP = re.compile(
     r"\.(?:webp|jpg|jpeg|png|gif|avif)\s*[,،]\s*https?://",
@@ -46,34 +39,25 @@ def first_image_url_string(s: str) -> str:
     التي تحتوي على فواصل في مسارها (مثل fit=scale-down,width=500).
     """
     s = (s or "").strip()
-    if not s:
-        return ""
+    if not s: return ""
 
-    # فصل الروابط المتعددة إن وجدت (إكسيل يدمجها بفاصلة)
+    # فصل الروابط المتعددة المدمجة بمسافة أو فاصلة دون تدمير روابط CDN
     if "http" in s.lower():
         start = s.lower().find("http")
         next_http = s.lower().find("http", start + 4)
         if next_http > 0:
             s = s[:next_http].rstrip(",، \t\n\r")
 
-    # معالجة روابط CDN سلة التي لا تقبل التقسيم العادي
     if "cdn-cgi/image" in s or "cdn.salla" in s:
         inner = re.search(r'cdn-cgi/image/[^/]+/(https?://[^\s<>"\']+)', s)
         if inner:
             return inner.group(1).rstrip(".,;)>]")
-        # إرجاع الرابط الكامل المستخرج بدون تقسيم
         m = re.search(r"(https?://[^\s\"\'<>]+)", s)
         return m.group(1).rstrip(".,;)>]") if m else s.split()[0]
 
-    if "http://" not in s and "https://" not in s:
-        return s.split()[0]
-
-    # للروابط العادية (يتم إزالة الفواصل كإجراء احتياطي فقط إذا لم يكن CDN)
     m = re.search(r"(https?://[^\s<>\"\'\,\u060c؛;]+?\.(?:webp|jpg|jpeg|png|gif|avif))", s, re.I)
-    if m:
-        return m.group(1).rstrip(".,;)>]")
+    if m: return m.group(1).rstrip(".,;)>]")
 
-    # fallback أخير
     m2 = re.search(r"(https?://[^\s\"\'<>]+)", s)
     return m2.group(1).rstrip(".,;)>]") if m2 else s.split()[0]
 
@@ -549,12 +533,8 @@ def upsert_competitors(new_comp_dfs: dict) -> pd.DataFrame:
     combined = combined.sort_values("تاريخ_الرصد", kind="stable")
 
     # ── إزالة التكرار: الأحدث يربح (keep='last' بعد الفرز) ───────────────
-    store_col = "المنافس" if "المنافس" in combined.columns else (
-        "store" if "store" in combined.columns else None
-    )
-    url_col = "رابط_المنافس" if "رابط_المنافس" in combined.columns else (
-        "url" if "url" in combined.columns else None
-    )
+    store_col = next((c for c in ["المنافس", "store", "متجر"] if c in combined.columns), None)
+    url_col = next((c for c in ["رابط_المنافس", "رابط المنتج", "url", "link", "رابط"] if c in combined.columns), None)
 
     if store_col and url_col:
         before = len(combined)
