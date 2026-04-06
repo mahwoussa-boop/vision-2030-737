@@ -482,13 +482,55 @@ def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, 
     }
 
 
+_DESC_META_RE = re.compile(
+    r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\'][^>]*content=["\']([^"\']{10,})["\']',
+    re.I,
+)
+_DESC_CONTENT_RE = re.compile(
+    r'<meta\s+content=["\']([^"\']{10,})["\'][^>]*(?:name|property)=["\'](?:description|og:description)["\']',
+    re.I,
+)
+# الأعمدة التي تحتوي على وصف المنتج في الصفحة
+_DESC_DIV_RE = re.compile(
+    r'<(?:div|section|p)[^>]+class=["\'][^"\']*(?:description|details|product-info|product-body)[^"\']*["\'][^>]*>'
+    r'([\s\S]{30,1200}?)</(?:div|section|p)>',
+    re.I,
+)
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _extract_raw_description(html: str) -> str:
+    """يستخرج النص الخام لوصف المنتج من meta description أو div الوصف."""
+    if not html:
+        return ""
+    # 1) meta description / og:description
+    for pattern in (_DESC_META_RE, _DESC_CONTENT_RE):
+        m = pattern.search(html)
+        if m:
+            txt = m.group(1).strip()
+            if len(txt) >= 20:
+                return txt[:1500]
+    # 2) div/section ذو class وصفي
+    m2 = _DESC_DIV_RE.search(html)
+    if m2:
+        raw = _HTML_TAG_RE.sub(" ", m2.group(1))
+        raw = re.sub(r'\s+', ' ', raw).strip()
+        if len(raw) >= 30:
+            return raw[:1500]
+    return ""
+
+
 def extract_product(html: str, page_url: str) -> Optional[Dict[str, Any]]:
-    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex."""
-    return (
+    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex.
+    يُضيف raw_description لاستخدامه لاحقاً في توليد الوصف عبر AI."""
+    result = (
         _extract_from_jsonld(html, page_url)
         or _extract_from_og(html, page_url)
         or _extract_from_html_patterns(html, page_url)
     )
+    if result is not None:
+        result.setdefault("raw_description", _extract_raw_description(html))
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -600,7 +642,8 @@ async def run_scraper(
     default_headers = get_browser_headers()
 
     async with aiohttp.ClientSession(
-        connector=connector, timeout=timeout, headers=default_headers
+        connector=connector, timeout=timeout, headers=default_headers,
+        cookies={'currency': 'SAR'},   # إجبار منصة سلة على عرض الأسعار بالريال السعودي
     ) as session:
         for store_url in stores:
             domain = urlparse(store_url).netloc
