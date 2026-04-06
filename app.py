@@ -15,8 +15,10 @@ app.py - نظام التسعير الذكي مهووس v26.0
 ✅ لوحة تحكم الأتمتة متصلة بالتنقل (v26.0)
 ✅ محرك كشط غير متزامن (Async Scraper + Detached Process)
 ✅ فحص ذاتي عند الإقلاع (Health Check)
+✅ حفظ ملف المتجر الأساسي محلياً (Local Persistence v26.1)
 """
 import html
+import os
 import streamlit as st
 import pandas as pd
 import threading
@@ -76,7 +78,9 @@ from utils.data_helpers import (safe_results_for_json, restore_results_from_json
                                 competitor_product_url_from_row,
                                 format_missing_for_salla,
                                 map_salla_categories,
-                                validate_salla_brands)
+                                validate_salla_brands,
+                                upsert_competitors)
+from utils.data_paths import get_master_competitors_path
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
@@ -86,6 +90,9 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
+
+# ── مسار حفظ كتالوج المتجر الأساسي (Local Persistence) ──────────────────────
+OUR_CATALOG_PATH = os.path.join("data", "saved_our_catalog.csv")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1835,10 +1842,37 @@ if page == "📊 لوحة التحكم":
     st.subheader("📂 رفع الملفات وبدء التحليل")
 
     our_file = st.file_uploader(
-        "📦 ملف منتجاتنا (CSV/Excel)",
+        "📦 ملف منتجاتنا (CSV/Excel) — اختياري إذا تم الرفع مسبقاً",
         type=["csv", "xlsx", "xls"],
         key="dash_our_file",
     )
+
+    # ── منطق Local Persistence لكتالوج المتجر ────────────────────────────
+    our_df = None
+    _our_file_name = "saved_our_catalog.csv"
+
+    if our_file is not None:
+        _our_df_raw, _our_err = read_file(our_file)
+        try:
+            our_file.seek(0)
+        except Exception:
+            pass
+        if _our_err:
+            st.error(f"❌ {_our_err}")
+        else:
+            our_df = _our_df_raw
+            _our_file_name = our_file.name
+            os.makedirs("data", exist_ok=True)
+            our_df.to_csv(OUR_CATALOG_PATH, index=False, encoding="utf-8-sig")
+            st.success(f"✅ تم تحديث الكتالوج الأساسي وحفظه بنجاح! ({len(our_df):,} منتج)")
+    elif os.path.exists(OUR_CATALOG_PATH):
+        try:
+            our_df = pd.read_csv(OUR_CATALOG_PATH, encoding="utf-8-sig")
+            st.info(f"💾 يتم استخدام الكتالوج المحفوظ مسبقاً ({len(our_df):,} منتج) — ارفع ملفاً جديداً لتحديثه.")
+        except Exception as _load_err:
+            st.warning(f"⚠️ تعذّر تحميل الكتالوج المحفوظ: {_load_err}")
+    else:
+        st.warning("⚠️ لم يتم العثور على كتالوج محفوظ. يرجى رفع ملف متجرك لأول مرة.")
 
     # ── جسر الكشط التلقائي (Auto-Scraper Bridge) ─────────────────────────
     import os as _os_dash
@@ -1882,31 +1916,49 @@ if page == "📊 لوحة التحكم":
     )
 
     if not _use_auto:
+        # ── حالة الكتالوج المتراكم للمنافسين ────────────────────────────
+        _master_path = get_master_competitors_path()
+        _master_rows = 0
+        if os.path.exists(_master_path):
+            try:
+                with open(_master_path, encoding="utf-8-sig") as _mf:
+                    _master_rows = sum(1 for _ in _mf) - 1
+            except Exception:
+                pass
+            st.markdown(
+                f'<div style="background:#0a1a2a;border:1px solid #1565C0;border-radius:8px;'
+                f'padding:10px 14px;margin:6px 0;font-size:.88rem">'
+                f'🗄️ <b>كتالوج المنافسين المتراكم جاهز</b> — '
+                f'{_master_rows:,} منتج محفوظ من جلسات سابقة<br>'
+                f'<span style="color:#9e9e9e;font-size:.78rem">'
+                f'ارفع ملفات جديدة لإضافة منافسين أو تحديث الأسعار، أو اضغط "بدء التحليل" مباشرةً</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="background:#1a1a1a;border:1px dashed #555;border-radius:8px;'
+                'padding:8px 14px;margin:6px 0;font-size:.82rem;color:#888">'
+                '🗄️ لا يوجد كتالوج منافسين محفوظ بعد — ارفع ملف منافس واحد على الأقل للبدء</div>',
+                unsafe_allow_html=True,
+            )
+
         comp_files = st.file_uploader(
-            "🏪 ملفات المنافسين (متعدد)",
+            "🏪 ملفات المنافسين — اختياري لتحديث/إضافة منافسين جدد",
             type=["csv", "xlsx", "xls"],
             accept_multiple_files=True,
             key="dash_comp_files",
         )
     else:
         comp_files = None  # غير مستخدم عند التحميل التلقائي
+        _master_path = None
+        _master_rows = 0
         st.success(
             f"✅ سيُستخدم الملف الآلي: `{_AUTO_CSV}` ({_auto_rows:,} منتج)"
         )
 
-    if our_file is not None:
-        try:
-            our_file.seek(0)
-        except Exception:
-            pass
-        _odf, _oe = read_file(our_file)
-        try:
-            our_file.seek(0)
-        except Exception:
-            pass
-        if not _oe and _odf is not None:
-            with st.expander("📋 تعرف تلقائي على أعمدة ملف المتجر", expanded=False):
-                _render_column_mapping_expander(_odf, "dash_map_our")
+    if our_df is not None:
+        with st.expander("📋 تعرف تلقائي على أعمدة ملف المتجر", expanded=False):
+            _render_column_mapping_expander(our_df, "dash_map_our")
     if comp_files:
         for _ci, cf in enumerate(comp_files):
             try:
@@ -1937,24 +1989,40 @@ if page == "📊 لوحة التحكم":
     if st.button("🚀 بدء التحليل", type="primary", key="dash_btn_start_analysis"):
         # ── حارس المدخلات (يدعم الوضعين: يدوي وتلقائي) ──────────────────
         _auto_mode = bool(st.session_state.get("dash_use_auto_scraper")) and _auto_available
-        if not our_file:
-            st.warning("⚠️ ارفع ملف منتجاتنا أولاً")
-        elif not _auto_mode and not comp_files:
-            st.warning("⚠️ ارفع ملف منافس واحد على الأقل، أو فعّل الكشط التلقائي")
+        _master_path_btn = get_master_competitors_path()
+        _master_exists = os.path.exists(_master_path_btn)
+        if our_df is None or (hasattr(our_df, "empty") and our_df.empty):
+            st.error("⚠️ يرجى رفع ملف المتجر لأول مرة للبدء.")
+        elif not _auto_mode and not comp_files and not _master_exists:
+            st.warning("⚠️ ارفع ملف منافس واحد على الأقل — لا يوجد كتالوج منافسين محفوظ بعد")
         else:
             _prep_ok = False
-            our_df = None
             comp_dfs = {}
             job_id = None
             comp_names = ""
             with st.spinner("⏳ جاري قراءة الملفات وتحديث الكتالوج..."):
-                our_df, err = read_file(our_file)
-                if err:
-                    st.error(f"❌ {err}")
+                # our_df قد يكون محمّلاً مسبقاً (من ملف مرفوع جديد أو من القرص)
+                if our_file is not None:
+                    _fresh_df, err = read_file(our_file)
+                    try:
+                        our_file.seek(0)
+                    except Exception:
+                        pass
+                    if err:
+                        st.error(f"❌ {err}")
+                        our_df = None
+                    else:
+                        our_df = _fresh_df
                 else:
+                    err = None  # our_df محمّل من القرص مسبقاً
+                if our_df is not None and not (hasattr(our_df, "empty") and our_df.empty):
                     our_df = apply_user_column_map(our_df, **_effective_column_map(our_df, "dash_map_our"))
                     if max_rows > 0:
                         our_df = our_df.head(int(max_rows))
+                if our_df is None or (hasattr(our_df, "empty") and our_df.empty):
+                    err = "تعذّر تحميل بيانات المتجر"
+                if err is None or err == "":
+                    err = False  # لمنع دخول شرط الخطأ أدناه
 
                     comp_dfs = {}
                     if _auto_mode:
@@ -1993,8 +2061,9 @@ if page == "📊 لوحة التحكم":
                         except Exception as _ae:
                             st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
                     else:
-                        # ── وضع الرفع اليدوي ─────────────────────────────
-                        for _ci, cf in enumerate(comp_files):
+                        # ── وضع الرفع اليدوي + الذاكرة التراكمية ─────────
+                        _new_comp_dfs = {}
+                        for _ci, cf in enumerate(comp_files or []):
                             cdf, cerr = read_file(cf)
                             if cerr:
                                 st.warning(f"⚠️ {cf.name}: {cerr}")
@@ -2002,7 +2071,26 @@ if page == "📊 لوحة التحكم":
                                 cdf = apply_user_column_map(
                                     cdf, **_effective_column_map(cdf, f"dash_map_comp_{_ci}")
                                 )
-                                comp_dfs[cf.name] = cdf
+                                _new_comp_dfs[cf.name] = cdf
+
+                        # دمج الجديد مع الكتالوج المتراكم على القرص
+                        try:
+                            _upsert_result = upsert_competitors(_new_comp_dfs)
+                            comp_dfs, _master_total, _deduped = _upsert_result
+                            if _new_comp_dfs:
+                                st.caption(
+                                    f"🗄️ تم تحديث الكتالوج المتراكم: "
+                                    f"{_master_total:,} منتج إجمالي "
+                                    f"({_deduped:,} تكرار حُذف)"
+                                )
+                            else:
+                                st.caption(
+                                    f"🗄️ يتم استخدام الكتالوج المتراكم المحفوظ: "
+                                    f"{_master_total:,} منتج من جلسات سابقة"
+                                )
+                        except Exception as _ue:
+                            st.warning(f"⚠️ تعذّر تحديث الكتالوج المتراكم: {_ue}")
+                            comp_dfs = _new_comp_dfs  # احتياطي: الملفات الجديدة فقط
 
                     if not comp_dfs:
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
@@ -2033,7 +2121,7 @@ if page == "📊 لوحة التحكم":
                 if bg_mode:
                     t = threading.Thread(
                         target=_run_analysis_background,
-                        args=(job_id, our_df, comp_dfs, our_file.name, comp_names),
+                        args=(job_id, our_df, comp_dfs, _our_file_name, comp_names),
                         daemon=True,
                     )
                     add_script_run_ctx(t)
@@ -2077,7 +2165,7 @@ if page == "📊 لوحة التحكم":
                     st.session_state.results = _r
                     st.session_state.analysis_df = df_all
                     log_analysis(
-                        our_file.name,
+                        _our_file_name,
                         comp_names,
                         len(our_df),
                         int((df_all.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
