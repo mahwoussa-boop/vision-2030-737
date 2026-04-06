@@ -1,4 +1,5 @@
-"""
++/
+"
 app.py - نظام التسعير الذكي مهووس v26.0
 # SYSTEM STATUS: LOCKED & AUTONOMOUS — Fire and Forget Mode
 ✅ معالجة خلفية مع حفظ تلقائي
@@ -50,7 +51,8 @@ from engines.ai_engine import (call_ai, verify_match, analyze_product,
                                 generate_mahwous_description, _parse_seo_json_block,
                                 reclassify_review_items, ai_deep_analysis,
                                 generate_salla_html_description,
-                                generate_salla_brand_info)
+                                generate_salla_brand_info,
+                                visual_verify_match)
 from engines.automation import (AutomationEngine, ScheduledSearchManager,
                                  auto_push_decisions, auto_process_review_items,
                                  log_automation_decision, get_automation_log,
@@ -1146,6 +1148,18 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
           {ts_badge(ts_now)}
         </div>""", unsafe_allow_html=True)
 
+        # ── 🤖 تبرير AI (Chain-of-Thought) — يظهر كـ Expander أنيق ────────
+        _ai_reason = str(row.get("تبرير_AI", "") or "").strip()
+        if _ai_reason:
+            with st.expander("🧠 تبرير AI", expanded=False):
+                st.markdown(
+                    f'<div style="background:rgba(108,99,255,.10);border:1px solid rgba(108,99,255,.35);'
+                    f'border-radius:8px;padding:8px 12px;font-size:.82rem;color:#c5c2ff;line-height:1.6">'
+                    f'<span style="color:#6C63FF;font-weight:700">🔍 سبب المطابقة:</span> '
+                    f'{_ai_reason}</div>',
+                    unsafe_allow_html=True,
+                )
+
         # شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم
         all_comps = row.get("جميع_المنافسين", row.get("جميع المنافسين", []))
         if isinstance(all_comps, list) and len(all_comps) > 0:
@@ -1174,7 +1188,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
 
             _comp_url_make = (_comp_url_v or str(row.get("رابط_المنافس", "") or "")).strip()
 
-            act_col1, act_col2, act_col3, _act_sp = st.columns([2.5, 2.5, 2, 4])
+            act_col1, act_col2, act_col3, act_col4 = st.columns([2.5, 2.5, 1.7, 1.7])
             with act_col1:
                 st.number_input(
                     "🎯 السعر المستهدف (ر.س)",
@@ -1209,6 +1223,49 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                         comp_price, diff, comp_src, _pid_cb,
                     ),
                 )
+            with act_col4:
+                # ── 👁️ زر الفحص البصري (Hawk-Eye Vision) ─────────────────
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                _vkey = f"_vision_{prefix}_{idx}"
+                if st.button(
+                    "👁️ فحص بصري",
+                    key=f"vision_btn_{prefix}_{idx}",
+                    use_container_width=True,
+                    help="تحقق بصري عبر Gemini Vision: هل صورة منتجنا وصورة المنافس لنفس العطر؟",
+                ):
+                    with st.spinner("🦅 Hawk-Eye يحلل الصورتين…"):
+                        try:
+                            _vr = visual_verify_match(
+                                _our_img_v, _comp_img_v, our_name
+                            )
+                            st.session_state[_vkey] = _vr
+                        except Exception as _ve:
+                            st.session_state[_vkey] = {
+                                "match": False,
+                                "reason": f"خطأ داخلي: {_ve}",
+                                "source": "fallback",
+                            }
+
+            # عرض نتيجة الفحص البصري إن وُجدت
+            _vision_res = st.session_state.get(_vkey)
+            if _vision_res:
+                _v_match  = _vision_res.get("match", False)
+                _v_reason = _vision_res.get("reason", "")
+                _v_src    = _vision_res.get("source", "")
+                _v_bg     = "rgba(0,200,83,.10)" if _v_match else "rgba(255,71,87,.10)"
+                _v_bdr    = "#00C853"             if _v_match else "#FF1744"
+                _v_icon   = "✅ تطابق بصري مؤكد" if _v_match else "❌ صور مختلفة"
+                _v_src_lbl = "🤖 Gemini Vision" if _v_src == "gemini_vision" else "⚠️ لم يكتمل الفحص"
+                st.markdown(
+                    f'<div style="background:{_v_bg};border:1px solid {_v_bdr};'
+                    f'border-radius:8px;padding:8px 14px;margin:6px 0;font-size:.82rem">'
+                    f'<b style="color:{"#00C853" if _v_match else "#FF5252"}">{_v_icon}</b>'
+                    f'<span style="color:#aaa"> — {_v_reason}</span>'
+                    f'<span style="float:left;color:#666;font-size:.7rem">{_v_src_lbl}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
             # عرض نتيجة الإجراء (خطأ فقط؛ النجاح يُعرض كـ toast أعلى الصفحة)
             _act_res = st.session_state.pop(f"_act_{prefix}_{idx}", None)
             if _act_res:
@@ -3567,6 +3624,7 @@ elif page == "🕷️ كشط المنافسين":
 
             # تفاصيل المتاجر
             _sl = _load_stores()
+            _sitemap_failed = list(_prog.get("stores_sitemap_failed") or [])
             if _sl:
                 st.markdown("**تفاصيل المتاجر:**")
                 _items = []
@@ -3574,6 +3632,7 @@ elif page == "🕷️ كشط المنافسين":
                     _d = _u.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
                     _cnt = _s_res.get(_d)
                     if _d == _current and _running:
+                        # 🔄 يعمل الآن
                         _bw = int(min(_u_done / _u_tot, 1.0) * 100) if _u_tot > 1 else 0
                         _items.append(
                             f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
@@ -3584,18 +3643,43 @@ elif page == "🕷️ كشط المنافسين":
                             f'<div style="width:{_bw}%;height:100%;background:#4fc3f7;border-radius:2px"></div>'
                             f'</div></div>'
                         )
-                    elif _cnt is not None:
+                    elif _cnt is not None and _cnt > 0:
+                        # ✅ كُشط ومنتجات جديدة
                         _items.append(
                             f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
                             f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
                             f'✅ <span style="color:#aaa">{_i+1}. {_d}</span>'
-                            f'<span style="color:#00C853"> — {_cnt:,} منتج</span></div>'
+                            f'<span style="color:#00C853"> — {_cnt:,} منتج جديد/محدَّث</span></div>'
+                        )
+                    elif _cnt is not None and _cnt < 0:
+                        # 💾 محفوظ مسبقاً — بلا تحديث (lastmod لم يتغير)
+                        _saved = abs(_cnt)
+                        _items.append(
+                            f'<div style="background:#0d1a0d;border:1px solid #1a3a1a;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'💾 <span style="color:#81c784">{_i+1}. {_d}</span>'
+                            f'<span style="color:#66bb6a"> — {_saved:,} منتج محفوظ (بلا تحديث)</span></div>'
+                        )
+                    elif _cnt == 0 and _d in _sitemap_failed:
+                        # ⚠️ فشل Sitemap — لا روابط منتجات
+                        _items.append(
+                            f'<div style="background:#1a0a0a;border:1px solid #3a1a1a;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'⚠️ <span style="color:#ef9a9a">{_i+1}. {_d}</span>'
+                            f'<span style="color:#e57373"> — فشل استخراج Sitemap</span></div>'
+                        )
+                    elif _cnt == 0:
+                        # ✅ انتهى — صفر منتج جديد (قد يكون محفوظاً من قبل)
+                        _items.append(
+                            f'<div style="background:#0a1a0a;border:1px dashed #2a3a2a;'
+                            f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                            f'✅ <span style="color:#666">{_i+1}. {_d} — 0 منتج جديد</span></div>'
                         )
                     elif _i < _s_done:
                         _items.append(
                             f'<div style="background:#0a1a0a;border:1px dashed #2a3a2a;'
                             f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
-                            f'✅ <span style="color:#666">{_i+1}. {_d} — 0 منتج</span></div>'
+                            f'✅ <span style="color:#555">{_i+1}. {_d}</span></div>'
                         )
                     elif _running:
                         _items.append(
