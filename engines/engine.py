@@ -729,9 +729,6 @@ _DIRTY_COL_RE = re.compile(
     r"|className|cls\b|src\b|href\b)",
     re.I,
 )
-_FIRST_URL_RE = re.compile(r"(https?://[^\s\"\'<>,،]+)")
-
-
 def _smart_rename_columns(df):
     """التعرف العميق والترجمة القسرية لأعمدة الكشط العشوائية (CSS/HTML/Tailwind).
 
@@ -976,9 +973,21 @@ def _smart_rename_columns(df):
 
 
 def _extract_first_url(text: str) -> str:
-    """يستخرج أول رابط http(s) نظيف من نص قد يحتوي فوضى ملتصقة."""
-    m = _FIRST_URL_RE.search(text)
-    return m.group(1).rstrip(".,;)>]") if m else text.strip()
+    """يستخرج أول رابط http(s) نظيف من نص قد يحتوي فوضى ملتصقة مع الحفاظ على روابط سلة."""
+    if not text or "http" not in text.lower():
+        return str(text).strip()
+
+    # إذا كان هناك عدة روابط مفصولة بفاصلة (مثل تصدير الإكسل)، نفصل عند بداية الرابط الثاني
+    start = text.lower().find("http")
+    next_http = text.lower().find("http", start + 4)
+    if next_http > 0:
+        text = text[:next_http].rstrip(",، \t\n\r")
+
+    # استخراج الرابط بالكامل دون قصه عند الفاصلة (لأن سلة تستخدم فواصل في روابطها)
+    m = re.search(r"(https?://[^\s\"\'<>]+)", text)
+    if m:
+        return m.group(1).rstrip(".,;)>]")
+    return text.strip()
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
 _NOISE_RE = re.compile(
