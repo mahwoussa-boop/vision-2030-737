@@ -180,23 +180,27 @@ class Progress:
     def __init__(self, stores: List[str], total_urls: int):
         self._file = PROGRESS_FILE
         self._data: Dict[str, Any] = {
-            "running":           True,
-            "started_at":        datetime.now().isoformat(),
-            "updated_at":        datetime.now().isoformat(),
-            "stores_total":      len(stores),
-            "stores_done":       0,
-            "urls_total":        total_urls,
-            "urls_processed":    0,
-            "rows_in_csv":       0,
-            "fetch_exceptions":  0,
-            "success_rate_pct":  0,
-            "current_store":     "",
-            "last_error":        "",
-            "output_file":       str(OUTPUT_CSV),
-            "store_urls_total":  0,
-            "store_urls_done":   0,
-            "store_started_at":  "",
-            "stores_results":    {},
+            "running":              True,
+            "started_at":           datetime.now().isoformat(),
+            "updated_at":           datetime.now().isoformat(),
+            "stores_total":         len(stores),
+            "stores_done":          0,
+            "urls_total":           total_urls,
+            "urls_processed":       0,
+            "rows_in_csv":          0,
+            "fetch_exceptions":     0,
+            "success_rate_pct":     0,
+            "current_store":        "",
+            "last_error":           "",
+            "output_file":          str(OUTPUT_CSV),
+            "store_urls_total":     0,
+            "store_urls_done":      0,
+            "store_started_at":     "",
+            "stores_results":       {},
+            # عدد المنتجات المحفوظة مسبقاً لكل متجر (من الكشط السابق)
+            "stores_cached_counts": {},
+            # المتاجر التي فشل استخراج Sitemap لها
+            "stores_sitemap_failed":[],
         }
         self._flush()
 
@@ -628,6 +632,13 @@ async def run_scraper(
     existing_rows = _load_existing_csv()
     logger.info("سجلات قديمة في CSV: %d", len(existing_rows))
 
+    # احسب عدد المنتجات المحفوظة مسبقاً لكل متجر (للعرض في الواجهة)
+    from collections import Counter as _Counter
+    _existing_by_store = _Counter(
+        r.get("store", "").strip() for r in existing_rows.values() if r.get("store")
+    )
+    progress.update(stores_cached_counts=dict(_existing_by_store))
+
     progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
     all_new_rows: List[Dict[str, Any]] = []
     rows_written = 0
@@ -665,12 +676,16 @@ async def run_scraper(
                 entries = []
 
             if not entries:
-                logger.warning("لا روابط منتجات لـ %s", domain)
+                logger.warning("لا روابط منتجات لـ %s (فشل Sitemap)", domain)
                 _res = dict(progress._data.get("stores_results") or {})
                 _res[domain] = 0
+                _failed = list(progress._data.get("stores_sitemap_failed") or [])
+                if domain not in _failed:
+                    _failed.append(domain)
                 progress.update(
                     stores_done=progress._data["stores_done"] + 1,
                     stores_results=_res,
+                    stores_sitemap_failed=_failed,
                 )
                 continue
 
@@ -685,12 +700,14 @@ async def run_scraper(
                 urls_to_fetch.append(entry.url)
 
             if not urls_to_fetch and entries:
+                _cached_n = _existing_by_store.get(domain, 0)
                 logger.info(
-                    "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى",
-                    domain, len(entries),
+                    "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى، محفوظ مسبقاً: %d",
+                    domain, len(entries), _cached_n,
                 )
                 _res = dict(progress._data.get("stores_results") or {})
-                _res[domain] = 0
+                # نستخدم قيمة سالبة كإشارة للـ UI: "محفوظ — بلا تحديث"
+                _res[domain] = -_cached_n
                 progress.update(
                     stores_done=progress._data["stores_done"] + 1,
                     stores_results=_res,

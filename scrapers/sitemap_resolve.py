@@ -336,6 +336,14 @@ async def resolve_product_urls(
                 all_entries.extend(entries)
                 break
 
+    # 4) Shopify /products.json API
+    if not all_entries:
+        all_entries.extend(await _fallback_shopify_api(session, base, max_products))
+
+    # 5) HTML crawl of /products page
+    if not all_entries:
+        all_entries.extend(await _fallback_html_product_page(session, base))
+
     # إزالة التكرار مع الحفاظ على الترتيب
     seen = set()
     unique: List[SitemapEntry] = []
@@ -399,6 +407,14 @@ async def resolve_product_entries(
                 all_entries.extend(entries)
                 break
 
+    # ── Fallback 4: Shopify /products.json API ─────────────────────────────
+    if not all_entries:
+        all_entries.extend(await _fallback_shopify_api(session, base, max_products))
+
+    # ── Fallback 5: crawl /products page for anchor hrefs ──────────────────
+    if not all_entries:
+        all_entries.extend(await _fallback_html_product_page(session, base))
+
     seen = set()
     unique: List[SitemapEntry] = []
     for e in all_entries:
@@ -414,6 +430,83 @@ async def resolve_product_entries(
         product_entries = product_entries[:max_products]
 
     return product_entries
+
+
+async def _fallback_shopify_api(
+    session: aiohttp.ClientSession,
+    base: str,
+    max_products: int = 0,
+) -> List[SitemapEntry]:
+    """Shopify /products.json — صفحات متعددة حتى max_products."""
+    entries: List[SitemapEntry] = []
+    page = 1
+    limit = 250
+    try:
+        while True:
+            url = f"{base}/products.json?limit={limit}&page={page}"
+            try:
+                async with session.get(url, headers=get_browser_headers(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json(content_type=None)
+            except Exception:
+                break
+            products = data.get("products") or []
+            if not products:
+                break
+            for p in products:
+                handle = p.get("handle", "")
+                if handle:
+                    entries.append(SitemapEntry(url=f"{base}/products/{handle}"))
+            if len(products) < limit:
+                break
+            page += 1
+            if max_products > 0 and len(entries) >= max_products:
+                break
+    except Exception:
+        pass
+    return entries
+
+
+async def _fallback_html_product_page(
+    session: aiohttp.ClientSession,
+    base: str,
+) -> List[SitemapEntry]:
+    """
+    يجلب صفحة /products أو الصفحة الرئيسية ويستخرج روابط المنتجات من <a href>.
+    مناسب للمتاجر التي تعجز عن تقديم Sitemap.
+    """
+    entries: List[SitemapEntry] = []
+    candidates_pages = ["/products", "/shop", "/store", "/"]
+    _product_href_re = re.compile(
+        r'href=["\']([^"\']*(?:/p\d{5,}|/products?/[^"\'/?#]{4,}|/item/[^"\'/?#]{4,}))["\']',
+        re.I,
+    )
+    for path in candidates_pages:
+        try:
+            async with session.get(
+                f"{base}{path}", headers=get_browser_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    continue
+                html = await r.text(errors="ignore")
+        except Exception:
+            continue
+        found = _product_href_re.findall(html)
+        if not found:
+            continue
+        seen_local: set = set()
+        for href in found:
+            full = href if href.startswith("http") else f"{base}{href}"
+            full = full.split("?")[0].rstrip("/")
+            if full not in seen_local:
+                seen_local.add(full)
+                entries.append(SitemapEntry(url=full))
+        if entries:
+            logger.info("_fallback_html_product_page %s → %d روابط من %s", base, len(entries), path)
+            break
+    return entries
 
 
 # ══════════════════════════════════════════════════════════════════════════
