@@ -72,10 +72,10 @@ except:
         "جيمي تشو","لاليك","بوليس","فيكتور رولف",
         "كلوي","بالنسياغا","ميو ميو",
     ]
-WORD_REPLACEMENTS = {}
-MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
-PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
-OPENROUTER_API_KEY = ""
+    WORD_REPLACEMENTS = {}
+    MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
+    PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
+    OPENROUTER_API_KEY = ""
 
 # ─── مفاتيح Gemini: config أولاً (يدمج secrets.toml + env)؛ إن فارغ استخدم env فقط ───
 import os as _os
@@ -2757,6 +2757,146 @@ def _norm_sku_barrier(s) -> str:
         return t
 
 
+# ── أنماط Slug الشائعة في روابط المنافسين ──────────────────────────────────
+_SLUG_RE = re.compile(r'\s*/p\d+\s*|\s*/\d{4,}\s*', re.IGNORECASE)
+
+
+def _clean_comp_slug(name: str) -> str:
+    """إزالة أنماط URL-Slug مثل /p12345 أو /98765 من أسماء المنافسين."""
+    return _SLUG_RE.sub(' ', name).strip()
+
+
+# ── كاش مترجم الأسماء الصامت ────────────────────────────────────────────────
+_bilingual_kw_cache: dict = {}
+
+
+def _translate_to_bilingual_keywords(name: str) -> str:
+    """
+    المترجم الصامت (Silent Name Translator):
+    يستخدم Gemini Flash لاستخلاص «الماركة + الموديل» فقط
+    بالإنجليزية والعربية معاً، لتجسير الفجوة بين لغتَي الكتالوج.
+
+    مثال: 'Givenchy Pour Homme Eau de Toilette 100ml for Men'
+          → 'Givenchy Pour Homme جيفنشي بور هوم'
+
+    يُعيد النص الأصلي إذا لم تتوفر مفاتيح API أو فشل الطلب.
+    """
+    if name in _bilingual_kw_cache:
+        return _bilingual_kw_cache[name]
+    if not (GEMINI_API_KEYS or []):
+        _bilingual_kw_cache[name] = name
+        return name
+    prompt = (
+        f"استخرج فقط اسم الماركة واسم موديل العطر من النص التالي، "
+        f"اكتبه مرة بالإنجليزية ومرة بالعربية في سطر واحد، لا تضف أي شيء آخر:\n"
+        f"«{name}»\n"
+        "مثال على الإخراج المطلوب: Givenchy Pour Homme جيفنشي بور هوم"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 60,
+                             "topP": 1, "topK": 1},
+    }
+    for key in (GEMINI_API_KEYS or []):
+        if not key:
+            continue
+        try:
+            r = _req.post(f"{_GURL}?key={key}", json=payload, timeout=10)
+            if r.status_code == 200:
+                result = (r.json()
+                          .get("candidates", [{}])[0]
+                          .get("content", {})
+                          .get("parts", [{}])[0]
+                          .get("text", "")
+                          .strip())
+                if result:
+                    _bilingual_kw_cache[name] = result
+                    return result
+        except Exception:
+            continue
+    _bilingual_kw_cache[name] = name
+    return name
+
+
+def _last_chance_ai_batch(pending: list) -> list:
+    """
+    فحص الفرصة الأخيرة (دفعي — Last Chance AI Check):
+    يسأل Gemini Flash عن عدة منتجات «مفقودة» في دفعة واحدة:
+    «هل هذا المنتج موجود فعلاً في قائمتنا؟»
+
+    pending: [{"comp": str, "candidates": [str, ...]}]
+    Returns: [matched_name: str | None]  بنفس الطول
+    """
+    if not pending or not (GEMINI_API_KEYS or []):
+        return [None] * len(pending)
+
+    lines = []
+    for i, item in enumerate(pending):
+        cands = "\n".join(
+            f"    {j + 1}. {c}" for j, c in enumerate(item["candidates"])
+        )
+        lines.append(
+            f"[{i + 1}] المنتج: «{item['comp']}»\n"
+            f"القائمة:\n{cands}"
+        )
+    prompt = (
+        "أنت خبير عطور. لكل منتج أدناه، حدد إذا كان موجوداً بالفعل في "
+        "قائمته المرفقة (نفس الماركة ونفس الموديل — بصرف النظر عن "
+        "اختلاف اللغة أو الحجم الطفيف).\n\n"
+        + "\n\n".join(lines)
+        + '\n\nأعد JSON فقط بهذه الصيغة (بدون أي نصوص إضافية):\n'
+        + '{"results": [{"match": رقم_المنتج_أو_0, "confidence": 0_إلى_100}, ...]}'
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400,
+                             "topP": 1, "topK": 1},
+    }
+
+    def _parse_lc(txt: str) -> list | None:
+        try:
+            clean = re.sub(r'```json|```', '', txt).strip()
+            s = clean.find('{')
+            e = clean.rfind('}') + 1
+            if s < 0 or e <= s:
+                return None
+            raw = json.loads(clean[s:e]).get("results", [])
+            if not raw:
+                return None
+            out = []
+            for i, item in enumerate(pending):
+                entry = raw[i] if i < len(raw) else {}
+                m_idx = int(entry.get("match", 0)) if isinstance(entry, dict) else 0
+                conf  = int(entry.get("confidence", 0)) if isinstance(entry, dict) else 0
+                if 1 <= m_idx <= len(item["candidates"]) and conf >= 75:
+                    out.append(item["candidates"][m_idx - 1])
+                else:
+                    out.append(None)
+            return out if len(out) == len(pending) else None
+        except Exception:
+            return None
+
+    for key in (GEMINI_API_KEYS or []):
+        if not key:
+            continue
+        try:
+            r = _req.post(f"{_GURL}?key={key}", json=payload, timeout=20)
+            if r.status_code == 200:
+                txt = (r.json()
+                       .get("candidates", [{}])[0]
+                       .get("content", {})
+                       .get("parts", [{}])[0]
+                       .get("text", ""))
+                result = _parse_lc(txt)
+                if result is not None:
+                    return result
+            elif r.status_code == 429:
+                time.sleep(2)
+        except Exception:
+            continue
+    return [None] * len(pending)
+
+
 def _our_product_names_series(our_df: pd.DataFrame):
     c = _name_col_for_analysis(our_df)
     if c and c in our_df.columns:
@@ -2786,18 +2926,25 @@ def _our_sku_set(our_df: pd.DataFrame) -> set:
 
 def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, threshold: int = 88) -> pd.DataFrame:
     """
-    محرك الحاجز الذكي v2: نظام المنطقة الرمادية (Gray Zone).
-    يصنف المفقودات إلى (مفقود مؤكد) أو (مكرر محتمل) لمنع ضياع الفرص ومنع
-    تكرار المنتجات في سلة. Zero Data Loss: لا نحذف قاطعاً إلا بتطابق ≥88% مع SKU.
+    محرك الحاجز الذكي v3: ثنائي اللغة + Last Chance AI.
+    ─────────────────────────────────────────────────────
+    يحل مشكلة False-Positives في المفقودات بسبب تباين اللغة (عربي/إنجليزي)
+    عبر ثلاث طبقات دفاعية متتالية:
+
+      الطبقة 1 — تنظيف Slug: إزالة /p12345 من أسماء المنافسين قبل المقارنة.
+      الطبقة 2 — مطابقة مزدوجة: Token Set Ratio على الاسم الخام + النسخة
+                 المطبّعة (التي تترجم الماركات عبر قاموس _SYN)، يُؤخذ أعلى النتيجتين.
+      الطبقة 3 — Last Chance AI: المنتجات التي لم تُكتشف (<65%) تُرسل دفعةً
+                 واحدة لـ Gemini Flash ليقرر إذا كانت موجودة فعلاً في قائمتنا.
 
     عمود حالة_المنتج:
-      ✅ مفقود مؤكد (جاهز للإضافة) — لا تشابه معنا
+      ✅ مفقود مؤكد (جاهز للإضافة) — لا تشابه معنا بعد كل الفحوصات
       ⚠️ مكرر محتمل (XX%)           — يشبه منتجاً لدينا 65-87%
     """
     if missing_df is None or missing_df.empty:
         return missing_df
 
-    # ── فلترة الجودة الأساسية (عينات، أحجام صغيرة، مرفوضات) ───────────────
+    # ── الطبقة 0: فلترة الجودة الأساسية (عينات، أحجام صغيرة، مرفوضات) ──
     filtered_df, _ = apply_strict_pipeline_filters(missing_df, name_col="منتج_المنافس")
     if filtered_df.empty:
         return filtered_df
@@ -2810,6 +2957,14 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
 
     our_names = _our_product_names_series(our_df)
     our_skus  = _our_sku_set(our_df)
+
+    # ── بناء نسخ مطبّعة من أسماء منتجاتنا (تترجم الماركات عبر _SYN) ──────
+    our_names_norm: list = [normalize_name(n) for n in our_names]
+    # خريطة: نص_مطبّع → اسم_أصلي (أول تطابق يفوز)
+    norm_to_orig: dict = {}
+    for orig, norm in zip(our_names, our_names_norm):
+        if norm and norm not in norm_to_orig:
+            norm_to_orig[norm] = orig
 
     # ── بناء قاموس صور منتجاتنا للمقارنة البصرية ──────────────────────────
     our_name_col = _name_col_for_analysis(our_df)
@@ -2831,14 +2986,18 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
     filtered_df["منتج_مشابه_لدينا"]     = ""
     filtered_df["صورة_منتجنا_المشابه"] = ""
 
-    keep_idx = []
+    keep_idx: list = []
+    # قائمة الانتظار للفحص الأخير (score < 65% بعد كل المحاولات النصية)
+    last_chance_queue: list = []  # [{"idx": int, "comp_name": str, "candidates": [str]}]
 
     for idx, row in filtered_df.iterrows():
-        comp_sku  = _norm_sku_barrier(row.get("معرف_المنافس", ""))
-        raw_sku   = str(row.get("معرف_المنافس", "")).strip()
-        comp_name = str(row.get("منتج_المنافس", "")).strip()
+        comp_sku = _norm_sku_barrier(row.get("معرف_المنافس", ""))
+        raw_sku  = str(row.get("معرف_المنافس", "")).strip()
 
-        # 1. فلتر SKU القطعي — موجود بالتأكيد في كتالوجنا → حذف نهائي
+        # ── الطبقة 1: تنظيف Slug من الاسم ─────────────────────────────────
+        comp_name = _clean_comp_slug(str(row.get("منتج_المنافس", "")).strip())
+
+        # ── فلتر SKU القطعي ─────────────────────────────────────────────────
         if comp_sku and (comp_sku in our_skus or raw_sku in our_skus):
             continue
 
@@ -2846,24 +3005,102 @@ def smart_missing_barrier(missing_df: pd.DataFrame, our_df: pd.DataFrame, thresh
             keep_idx.append(idx)
             continue
 
-        # 2. مطابقة نصية
-        match = rf_process.extractOne(comp_name, our_names, scorer=fuzz.token_set_ratio)
+        # ── الطبقة 2أ: Token Set Ratio على الاسم الخام ─────────────────────
+        m_raw = rf_process.extractOne(comp_name, our_names,
+                                       scorer=fuzz.token_set_ratio)
 
-        if match:
-            score        = match[1]
-            matched_name = match[0]
+        # ── الطبقة 2ب: Token Set Ratio على الاسم المطبّع (يترجم الماركات) ──
+        comp_norm = normalize_name(comp_name)
+        m_norm = None
+        if comp_norm and our_names_norm:
+            _nm = rf_process.extractOne(comp_norm, our_names_norm,
+                                         scorer=fuzz.token_set_ratio)
+            if _nm and _nm[0] in norm_to_orig:
+                m_norm = (norm_to_orig[_nm[0]], _nm[1])
 
-            # تطابق مؤكد (≥88%) → موجود لدينا → لا يُضاف
-            if score >= threshold:
+        # اختر أعلى نتيجة بين الخامة والمطبّعة
+        best_score = 0
+        best_name  = ""
+        if m_raw:
+            best_score, best_name = m_raw[1], m_raw[0]
+        if m_norm and m_norm[1] > best_score:
+            best_score, best_name = m_norm[1], m_norm[0]
+
+        # تطابق مؤكد (≥ threshold) → موجود لدينا → لا يُضاف
+        if best_score >= threshold:
+            continue
+
+        # المنطقة الرمادية (65 – threshold-1%) → نبقيه مع تحذير للمراجعة
+        if 65 <= best_score < threshold:
+            filtered_df.at[idx, "حالة_المنتج"]           = f"⚠️ مكرر محتمل ({best_score:.0f}%)"
+            filtered_df.at[idx, "منتج_مشابه_لدينا"]     = best_name
+            filtered_df.at[idx, "صورة_منتجنا_المشابه"] = name_to_img.get(best_name, "")
+            keep_idx.append(idx)
+            continue
+
+        # ── الطبقة 2ج: الاسم < 65% → جرب المترجم الصامت ──────────────────
+        translated = _translate_to_bilingual_keywords(comp_name)
+        if translated and translated != comp_name:
+            t_norm = normalize_name(translated)
+            m_tr_raw = rf_process.extractOne(translated, our_names,
+                                              scorer=fuzz.token_set_ratio)
+            m_tr_norm = None
+            if t_norm and our_names_norm:
+                _tn = rf_process.extractOne(t_norm, our_names_norm,
+                                             scorer=fuzz.token_set_ratio)
+                if _tn and _tn[0] in norm_to_orig:
+                    m_tr_norm = (norm_to_orig[_tn[0]], _tn[1])
+
+            tr_score = 0
+            tr_name  = ""
+            if m_tr_raw:
+                tr_score, tr_name = m_tr_raw[1], m_tr_raw[0]
+            if m_tr_norm and m_tr_norm[1] > tr_score:
+                tr_score, tr_name = m_tr_norm[1], m_tr_norm[0]
+
+            if tr_score >= threshold:
+                # المترجم كشف أنه موجود → لا يُضاف
+                continue
+            if 65 <= tr_score < threshold:
+                filtered_df.at[idx, "حالة_المنتج"]           = f"⚠️ مكرر محتمل ({tr_score:.0f}%)"
+                filtered_df.at[idx, "منتج_مشابه_لدينا"]     = tr_name
+                filtered_df.at[idx, "صورة_منتجنا_المشابه"] = name_to_img.get(tr_name, "")
+                keep_idx.append(idx)
                 continue
 
-            # المنطقة الرمادية (65-87%) → نبقيه مع تحذير للمراجعة
-            if 65 <= score < threshold:
-                filtered_df.at[idx, "حالة_المنتج"]           = f"⚠️ مكرر محتمل ({score:.0f}%)"
-                filtered_df.at[idx, "منتج_مشابه_لدينا"]     = matched_name
-                filtered_df.at[idx, "صورة_منتجنا_المشابه"] = name_to_img.get(matched_name, "")
+        # ── الطبقة 3: ترشيح لـ Last Chance AI Check ────────────────────────
+        # أقرب 5 منتجات من كتالوجنا كمرشحين للـ AI
+        top5_raw = rf_process.extract(comp_name, our_names,
+                                       scorer=fuzz.token_set_ratio, limit=5)
+        top5_norm: list = []
+        if comp_norm and our_names_norm:
+            _t5n = rf_process.extract(comp_norm, our_names_norm,
+                                       scorer=fuzz.token_set_ratio, limit=5)
+            top5_norm = [norm_to_orig[m[0]] for m in _t5n
+                         if m[0] in norm_to_orig]
 
+        candidates = list(dict.fromkeys(
+            [m[0] for m in top5_raw] + top5_norm
+        ))[:5]
+
+        last_chance_queue.append({
+            "idx": idx,
+            "comp_name": comp_name,
+            "candidates": candidates,
+        })
         keep_idx.append(idx)
+
+    # ── الطبقة 3: تشغيل Last Chance AI Batch ───────────────────────────────
+    if last_chance_queue and (GEMINI_API_KEYS or []):
+        lc_inputs  = [{"comp": it["comp_name"], "candidates": it["candidates"]}
+                      for it in last_chance_queue]
+        lc_results = _last_chance_ai_batch(lc_inputs)
+
+        for item, ai_match in zip(last_chance_queue, lc_results):
+            if ai_match:
+                # AI أكد أنه موجود → احذفه من القائمة النهائية
+                if item["idx"] in keep_idx:
+                    keep_idx.remove(item["idx"])
 
     if not keep_idx:
         return pd.DataFrame()

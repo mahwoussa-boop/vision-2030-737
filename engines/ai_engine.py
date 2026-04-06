@@ -1485,10 +1485,10 @@ def visual_verify_match(
     }
 
     # ── استدعاء Gemini Vision (يجرّب كل مفتاح متاح) ────────────────────
-    vision_model = "gemini-1.5-flash"
+    # gemini-2.0-flash يدعم الرؤية + أسرع وأرخص من 1.5-flash
     vision_url_tpl = (
         "https://generativelanguage.googleapis.com/v1beta"
-        f"/models/{vision_model}:generateContent?key={{key}}"
+        f"/models/{_GM}:generateContent?key={{key}}"
     )
     for key in (GEMINI_API_KEYS or []):
         if not key:
