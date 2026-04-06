@@ -1,5 +1,4 @@
-+/
-"
+"""
 app.py - نظام التسعير الذكي مهووس v26.0
 # SYSTEM STATUS: LOCKED & AUTONOMOUS — Fire and Forget Mode
 ✅ معالجة خلفية مع حفظ تلقائي
