@@ -361,9 +361,10 @@ def send_new_products(products: List[Dict]) -> Dict:
             "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
-        # حقل صورة اختياري
-        if p.get("image_url"):
-            item["صورة المنتج"] = str(p["image_url"])
+        # صورة — فقط روابط صور مباشرة (بامتداد صورة) لا روابط بحث
+        _raw_img = str(p.get("image_url", "") or "").strip()
+        if _raw_img and any(ext in _raw_img.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+            item["صورة المنتج"] = _raw_img
 
         result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
@@ -404,7 +405,7 @@ def send_missing_products(products: List[Dict]) -> Dict:
         )
         pid   = _clean_pid(p.get("product_id", p.get("معرف_المنتج", "")))
 
-        if not name:
+        if not name or price <= 0:
             skipped += 1
             continue
 
@@ -413,15 +414,17 @@ def send_missing_products(products: List[Dict]) -> Dict:
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      int(round(float(price))) if price else 0,
+            "سعر المنتج":      int(round(float(price))),
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
             "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
             "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
             "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
-        if p.get("image_url"):
-            item["صورة المنتج"] = str(p["image_url"])
+        # صورة — فقط روابط صور مباشرة (بامتداد صورة) لا روابط بحث
+        _raw_img = str(p.get("image_url", "") or "").strip()
+        if _raw_img and any(ext in _raw_img.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+            item["صورة المنتج"] = _raw_img
 
         result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:

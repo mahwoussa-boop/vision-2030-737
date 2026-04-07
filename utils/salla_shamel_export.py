@@ -440,12 +440,26 @@ def export_to_salla_shamel(
         else:
             category = _best_category_from_rules(pname, gender, ptype)
 
-        # ── الماركة — من ملف سلة الرسمي ──────────────────────────────────
+        # ── الماركة — BrandManager (fuzzy + كشف الجديدة) ─────────────────
         preset_brand = str(r.get("الماركة_المعتمدة", "") or "").strip()
         if preset_brand and preset_brand not in ("nan", "none"):
             brand_out = preset_brand
         else:
-            brand_out = _best_brand_from_csv(brand) if brand else ""
+            raw_brand_val = brand if brand else ""
+            if raw_brand_val:
+                try:
+                    from utils.brand_manager import resolve_brand
+                    brand_out, _is_new = resolve_brand(raw_brand_val, auto_generate=True)
+                    if _is_new:
+                        _logger.info(
+                            "salla_shamel_export: ماركة جديدة مكتشفة — «%s» → «%s»",
+                            raw_brand_val, brand_out,
+                        )
+                except Exception as _bm_err:
+                    _logger.warning("BrandManager fallback: %s", _bm_err)
+                    brand_out = _best_brand_from_csv(raw_brand_val)
+            else:
+                brand_out = ""
 
         # ── الوصف — HTML نقي (لا Markdown) ──────────────────────────────
         if generate_descriptions:
@@ -510,3 +524,55 @@ def export_to_salla_shamel(
 
     # UTF-8 مع BOM
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  دوال مساعدة للواجهة — إدارة الماركات الجديدة
+# ══════════════════════════════════════════════════════════════════════════════
+
+def export_new_brands_salla_csv() -> bytes:
+    """
+    يُصدّر Brands_Salla.csv للماركات الجديدة المكتشفة في هذه الجلسة.
+    يجب رفعه على سلة *قبل* ملف المنتجات CSV.
+    """
+    from utils.brand_manager import export_new_brands_csv
+    return export_new_brands_csv()
+
+
+def get_new_brands_summary() -> dict:
+    """
+    يُعيد ملخص الماركات الجديدة للعرض في الواجهة.
+
+    Returns:
+        {"count": int, "brands": [{"name":..., "seo_url":..., "visual_prompt":...}]}
+    """
+    from utils.brand_manager import get_new_brands_list, get_visual_prompt
+    brands_data = get_new_brands_list()
+    return {
+        "count": len(brands_data),
+        "brands": [
+            {
+                "name":          bd.get("brand_name", ""),
+                "description":   bd.get("description", ""),
+                "seo_url":       bd.get("seo_url", ""),
+                "seo_title":     bd.get("seo_title", ""),
+                "visual_prompt": bd.get("logo_prompt") or get_visual_prompt(
+                    bd.get("brand_name", "")
+                ),
+            }
+            for bd in brands_data
+        ],
+    }
+
+
+def invalidate_brand_cache() -> None:
+    """
+    يُفرغ ذاكرة التخزين المؤقت للماركات — يُستدعى بعد رفع ملف brands.csv جديد.
+    يُصفّر كلاً من LRU cache الموجود ومفتاح BrandManager.
+    """
+    _load_valid_brands.cache_clear()
+    try:
+        from utils.brand_manager import reload_brands_file
+        reload_brands_file()
+    except Exception:
+        pass
