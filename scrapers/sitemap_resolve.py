@@ -191,31 +191,49 @@ def _parse_sitemap_xml(xml_text: str) -> Tuple[List[SitemapEntry], List[str]]:
     return entries, sub_sitemaps
 
 
+_SITEMAP_CONCURRENCY = 10  # الحد الأقصى لطلبات sitemap المتزامنة في نفس الوقت
+
+
 async def _fetch_and_parse_sitemap(
-    session: aiohttp.ClientSession, url: str, depth: int = 0, max_depth: int = 3
+    session: aiohttp.ClientSession,
+    url: str,
+    depth: int = 0,
+    max_depth: int = 3,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[SitemapEntry]:
-    """يجلب ويحلل sitemap (يتتبع sitemapindex بشكل متكرر حتى max_depth)."""
+    """يجلب ويحلل sitemap (يتتبع sitemapindex بشكل متكرر حتى max_depth).
+    يستخدم سيمافوراً لتقييد التزامن ومنع انفجار coroutines عند sitemapindex ضخم.
+    """
     if depth > max_depth:
         return []
 
-    xml = await _fetch_xml(session, url)
-    if not xml:
-        return []
+    # إنشاء السيمافور عند أول استدعاء — يُمرَّر للاستدعاءات الفرعية
+    if sem is None:
+        sem = asyncio.Semaphore(_SITEMAP_CONCURRENCY)
 
-    if "<urlset" not in xml[:2000] and "<sitemapindex" not in xml[:2000]:
-        return []
+    async with sem:
+        xml = await _fetch_xml(session, url)
+        if not xml:
+            return []
 
-    entries, sub_sitemaps = _parse_sitemap_xml(xml)
+        if "<urlset" not in xml[:2000] and "<sitemapindex" not in xml[:2000]:
+            return []
+
+        entries, sub_sitemaps = _parse_sitemap_xml(xml)
 
     if sub_sitemaps:
-        tasks = [
-            _fetch_and_parse_sitemap(session, sub_url, depth + 1, max_depth)
-            for sub_url in sub_sitemaps
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, list):
-                entries.extend(r)
+        # تقسيم الطلبات الفرعية إلى دفعات لمنع إنشاء آلاف coroutines دفعة واحدة
+        batch_size = _SITEMAP_CONCURRENCY
+        for i in range(0, len(sub_sitemaps), batch_size):
+            batch = sub_sitemaps[i:i + batch_size]
+            tasks = [
+                _fetch_and_parse_sitemap(session, sub_url, depth + 1, max_depth, sem)
+                for sub_url in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, list):
+                    entries.extend(r)
 
     return entries
 
