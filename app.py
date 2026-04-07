@@ -81,15 +81,15 @@ from utils.data_helpers import (safe_results_for_json, restore_results_from_json
                                 validate_salla_brands,
                                 upsert_competitors)
 from utils.data_paths import get_master_competitors_path
-from utils.db_manager import (init_db, log_event, log_decision,
+from utils.db_manager import (initialize_database, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
                                get_price_history, get_price_changes,
                                save_job_progress, get_job_progress, get_last_job,
                                save_hidden_product, get_hidden_product_keys,
-                               init_db_v26, upsert_our_catalog, upsert_comp_catalog,
+                               upsert_our_catalog, upsert_comp_catalog,
                                save_processed, get_processed, undo_processed,
-                               get_processed_keys, migrate_db_v26)
+                               get_processed_keys)
 
 # ── مسار حفظ كتالوج المتجر الأساسي (Local Persistence) ──────────────────────
 OUR_CATALOG_PATH = os.path.join("data", "saved_our_catalog.csv")
@@ -137,25 +137,29 @@ if "health_check_done" not in st.session_state:
             "ok": True, "warnings": [], "errors": [], "details": {}
         }
 
-# ── تشغيل خيط المجدول التلقائي (مرة واحدة على مستوى العملية — لا كل جلسة) ──
-# start_scheduler_thread آمن للاستدعاء المتعدد: يفحص is_alive() داخلياً
-# ويُشغّل الخيط مرة واحدة فقط بغض النظر عن عدد جلسات المستخدمين
+# ── تهيئة قاعدة البيانات (مرة واحدة لكل عملية — محمية بعلم _DB_INITIALIZED) ──
 try:
-    from scrapers.scheduler import start_scheduler_thread
-    start_scheduler_thread()
-except Exception:
-    pass
+    initialize_database()
+except Exception as _dbe:
+    st.error(f"خطأ حرج في قاعدة البيانات: {_dbe}")
 
-# أخطاء حرجة فقط تُعرض عالمياً (مثل DB تالفة) — التحذيرات تُعرض في الشريط الجانبي
+# ── تشغيل خيط المجدول مرة واحدة لكل عملية (process-level) ──────────────────
+@st.cache_resource
+def _start_scheduler_once():
+    """يُشغّل خيط المجدول مرة واحدة فقط لكل عملية Streamlit."""
+    try:
+        from scrapers.scheduler import start_scheduler_thread
+        start_scheduler_thread()
+    except Exception:
+        pass
+    return True
+
+_start_scheduler_once()
+
+# أخطاء حرجة فقط تُعرض عالمياً (مثل DB تالفة)
 _hs = st.session_state.get("health_status", {})
 for _hc_err in _hs.get("errors", []):
     st.error(f"⚠️ فحص النظام: {_hc_err}")
-try:
-    init_db()
-    init_db_v26()
-    migrate_db_v26()  # v26.0 — ترحيل آمن (idempotent)
-except Exception as e:
-    st.error(f"Database Initialization Error: {e}")
 
 # ── Session State ─────────────────────────
 _defaults = {
@@ -375,6 +379,10 @@ def _persist_analysis_after_reclassify(adf: pd.DataFrame):
 
 
 # ── تحميل تلقائي للنتائج المحفوظة عند فتح التطبيق ──
+# العلم _results_from_session: True = بيانات الجلسة الحالية | False = تحميل من جلسة سابقة
+if "results_from_session" not in st.session_state:
+    st.session_state["results_from_session"] = False
+
 if st.session_state.results is None and not st.session_state.job_running:
     _auto_job = get_last_job()
     if _auto_job and _auto_job["status"] == "done" and _auto_job.get("results"):
@@ -387,6 +395,9 @@ if st.session_state.results is None and not st.session_state.job_running:
             st.session_state.results     = _auto_r
             st.session_state.analysis_df = _auto_df
             st.session_state.job_id      = _auto_job.get("job_id")
+            st.session_state["results_from_session"] = False
+            # حفظ وقت التحليل السابق لعرضه في الواجهة
+            st.session_state["results_loaded_at"] = _auto_job.get("updated_at", "")
 
 
 # ── دوال مساعدة ───────────────────────────
@@ -1644,6 +1655,9 @@ with st.sidebar:
                     st.session_state.analysis_df = df_all
                 st.session_state.last_audit_stats = job.get("audit") or {}
                 st.session_state.job_running = False
+                # علّم البيانات بأنها من الجلسة الحالية
+                st.session_state["results_from_session"] = True
+                st.session_state["results_loaded_at"]    = job.get("updated_at", "")
                 st.balloons()
                 st.rerun()
             elif job["status"].startswith("error"):
@@ -1655,6 +1669,24 @@ with st.sidebar:
     st.markdown("---")
     if st.session_state.results:
         r = st.session_state.results
+        # شارة تُوضّح مصدر البيانات المعروضة
+        if st.session_state.get("results_from_session"):
+            st.markdown(
+                '<div style="background:#0a2a0a;border:1px solid #00C853;border-radius:6px;'
+                'padding:4px 8px;font-size:.72rem;margin-bottom:4px">'
+                '🟢 <b>بيانات الجلسة الحالية</b></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            _loaded_at = st.session_state.get("results_loaded_at", "")
+            _ts_label  = str(_loaded_at)[:16] if _loaded_at else "تشغيل سابق"
+            st.markdown(
+                f'<div style="background:#1a1a1a;border:1px dashed #888;border-radius:6px;'
+                f'padding:4px 8px;font-size:.72rem;margin-bottom:4px">'
+                f'🕐 <b>بيانات محملة من:</b> {_ts_label}<br>'
+                f'<span style="color:#aaa">ارفع ملفات جديدة للتحليل الحالي</span></div>',
+                unsafe_allow_html=True,
+            )
         st.markdown("**📊 ملخص:**")
         for key, icon, label in [
             ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
@@ -2127,6 +2159,8 @@ if page == "📊 لوحة التحكم":
                     add_script_run_ctx(t)
                     t.start()
                     st.session_state.job_running = True
+                    st.session_state["results_from_session"] = True
+                    st.session_state["results_loaded_at"]    = ""
                     st.success(f"✅ بدأ التحليل في الخلفية (Job: {job_id})")
                     st.rerun()
                 else:
