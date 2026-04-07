@@ -597,15 +597,9 @@ def fetch_product_images(product_name, brand=""):
                 images.append({"url": url, "source": "DuckDuckGo", "alt": product_name})
                 if len(images) >= 2: break
 
-    # ── إذا لم نجد صور مباشرة، نُعيد رابط بحث ──────────────────────────
-    if not images:
-        search_url = f"https://www.fragranticarabia.com/?s={requests.utils.quote(product_name)}"
-        images.append({
-            "url": search_url,
-            "source": "بحث Fragrantica",
-            "alt": product_name,
-            "is_search": True
-        })
+    # ── إذا لم نجد صور مباشرة، نُعيد قائمة فارغة (لا نُرجع روابط بحث) ──────
+    # رابط البحث مثل fragranticarabia.com/?s=... ليس رابط صورة مباشراً
+    # وسلة سترفض الملف إذا أدرجناه كصورة منتج
 
     return {
         "images": images,
@@ -1766,24 +1760,40 @@ def _clamp_salla_brand_dict(d: dict, original_brand: str) -> dict:
 
 def generate_salla_brand_info(brand_name: str) -> dict:
     """
-    يولد بيانات الماركة (وصف، SEO) بتنسيق متوافق مع سلة مع الالتزام الصارم
-    بالحد الأقصى للأحرف: اسم 30، وصف 250، عنوان SEO 70، وصف SEO 155.
+    يولد بيانات الماركة الكاملة بتنسيق متوافق مع أعمدة سلة الرسمية.
+
+    الأعمدة المستهدفة (من Brands_Salla.csv):
+      - brand_name   : اسم الماركة (max 30 حرف)
+      - description  : وصف مختصر (max 255 حرف)
+      - logo_url     : رابط الشعار (فارغ — سلة لا تقبل رفع روابط خارجية مباشرة)
+      - seo_title    : عنوان صفحة العلامة (max 70 حرف)
+      - seo_url      : رابط SEO (lowercase_snake + _mahwous)
+      - seo_desc     : وصف الصفحة للبحث (max 155 حرف)
+      - logo_prompt  : برومت AI لتوليد لوجو الماركة
     """
     bn = str(brand_name or "").strip()
     if not bn or bn.lower() in ("nan", "none"):
         return _clamp_salla_brand_dict({}, "")
 
-    prompt = f"""أنت خبير عطور وSEO محترف لمتجر "مهووس".
-لدينا ماركة عطور جديدة مفقودة اسمها: "{bn}".
+    # ── Prompt محسّن مع Few-Shot من brands.csv الحقيقي ───────────────────
+    prompt = f"""أنت خبير عطور وSEO عالمي تعمل لمتجر "مهووس" للعطور الفاخرة في السعودية.
+اكتشفنا ماركة عطور جديدة غير مسجّلة اسمها: "{bn}".
 
-المطلوب توليد بيانات الماركة بدقة وإرجاعها ككائن JSON فقط. يجب الالتزام الصارم بالحدود القصوى للأحرف (عدّ كل حرف بما فيه المسافات والعربية):
-1. "brand_name": اسم الماركة باللغتين (العربية | الإنجليزية). حد أقصى 30 حرفاً. (مثال: كريبتك | Cryptic).
-2. "description": وصف جذاب للماركة يبرز فخامتها. حد أقصى 250 حرفاً.
-3. "seo_title": عنوان صفحة SEO يدمج اسم الماركة مع "متجر مهووس". حد أقصى 70 حرفاً.
-4. "seo_url": رابط صفحة الماركة بحروف إنجليزية صغيرة فقط مع mahwous مفصولة بشرطة سفلية (مثال: cryptic_mahwous).
-5. "seo_desc": وصف صفحة الماركة للبحث. حد أقصى 155 حرفاً.
+نماذج جودة من ملف ماركاتنا (احتذِ بها في الطول والأسلوب):
+- جيفنشي | Givenchy → "جيفنشي هي علامة فرنسية فاخرة متخصصة في الأزياء والعطور ومستحضرات التجميل. تأسست عام 1952 بواسطة هوبير دو جيفنشي، تتميز بتصاميمها العصرية والفاخرة."
+- فيرساتشي | Versace → "دار فيرساتشي الإيطالية للرفاهية تأسست عام 1978، تقدم تصاميمًا جريئة في الأزياء والإكسسوارات والعطور والديكور."
+- أتلييه دي أور Atelier Des Ors → "دار عطور فرنسية فاخرة تأسست عام 2015، متخصصة في عطور نادرة مزينة بذهب حقيقي، تجمع الأصالة والحداثة بتوقيع باريسي."
 
-أعد JSON فقط بدون markdown وبدون نص قبل أو بعد. المفاتيح بالإنجليزية كما أعلاه."""
+الحدود الصارمة (عدّ كل حرف بما فيه المسافات والرموز):
+1. "brand_name": الاسم باللغتين (العربي | English) — حد أقصى 30 حرفاً.
+2. "description": وصف إبداعي يجسّد روح الماركة وفخامتها — حد أقصى 255 حرفاً.
+3. "seo_title": عطور [اسم] + جملة تسويقية + من متجر مهووس — حد أقصى 70 حرفاً.
+4. "seo_url": اسم الماركة بالإنجليزية (lowercase_snake) + "_mahwous" — مثال: dior_mahwous.
+5. "seo_desc": ملخص احترافي لجذب جوجل — حد أقصى 155 حرفاً.
+6. "logo_prompt": برومت إنجليزي لجلب لوجو الماركة بـ AI (جملة وصفية احترافية).
+
+⚠️ أعد JSON فقط — بدون markdown، بدون أي نص قبله أو بعده.
+المفاتيح حرفياً: brand_name, description, seo_title, seo_url, seo_desc, logo_prompt"""
 
     try:
         raw = _call_gemini(prompt, temperature=0.1, max_tokens=1024)
@@ -1791,26 +1801,42 @@ def generate_salla_brand_info(brand_name: str) -> dict:
             raw = _call_openrouter(prompt) or _call_cohere(prompt)
         parsed = _parse_brand_json_block(raw) if raw else {}
         if parsed:
-            return _clamp_salla_brand_dict(parsed, bn)
-    except Exception:
-        pass
+            result = _clamp_salla_brand_dict(parsed, bn)
+            result["logo_url"]    = str(parsed.get("logo_url",    "") or "").strip()
+            result["logo_prompt"] = str(parsed.get("logo_prompt", "") or "").strip()
+            return result
+    except Exception as _e:
+        _log_err("generate_salla_brand_info", str(_e)[:80])
 
-    # Fallback صارم يلتزم بالحدود القصوى
+    # ── Fallback — يلتزم بالحدود ─────────────────────────────────────────
     safe_name = bn[:14]
-    return _clamp_salla_brand_dict(
+    en_part   = safe_name
+    if "|" in bn:
+        parts   = [p.strip() for p in bn.split("|")]
+        en_part = next((p for p in parts if re.search(r"[a-zA-Z]", p)), parts[-1])
+    slug = re.sub(r"[^a-z0-9]+", "_", en_part.lower().strip())[:18].strip("_") or "brand"
+    result = _clamp_salla_brand_dict(
         {
-            "brand_name": (f"{safe_name} | {safe_name}")[:30],
+            "brand_name":  (f"{safe_name} | {en_part}")[:30],
             "description": (
-                f"عطور {safe_name} الفاخرة، اكتشف التميز والجاذبية مع تشكيلتنا المختارة بعناية في متجر مهووس."
-            )[:250],
-            "seo_title": (f"عطور {safe_name} الأصلية | متجر مهووس")[:70],
-            "seo_url": "",
-            "seo_desc": (
-                f"تسوق أحدث عطور {safe_name} الأصلية بأسعار تنافسية من متجر مهووس. اكتشف الفخامة الآن."
+                f"عطور {safe_name} الفاخرة الأصيلة — اكتشف التميز والجاذبية مع تشكيلتنا "
+                f"المختارة بعناية في متجر مهووس للعطور."
+            )[:255],
+            "seo_title":   (f"عطور {safe_name} الأصلية | متجر مهووس")[:70],
+            "seo_url":     f"{slug}_mahwous",
+            "seo_desc":    (
+                f"تسوق عطور {safe_name} الأصلية بأسعار تنافسية من متجر مهووس. "
+                f"ضمان الأصالة وتوصيل سريع لجميع مناطق المملكة."
             )[:155],
         },
         bn,
     )
+    result["logo_url"]    = ""
+    result["logo_prompt"] = (
+        f"Professional luxury perfume brand logo for {en_part}, "
+        f"minimalist gold and black design, white background, high resolution."
+    )
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
