@@ -394,7 +394,7 @@ def comp_strip(all_comps):
 def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
               confidence_level="green", confidence_score=0, product_id="", image_url="",
-              comp_url="", title_override="", gray_zone_html=""):
+              comp_url="", title_override="", gray_zone_html="", dup_compare_html=""):
     """بطاقة المنتج المفقود — image_url / comp_url اختياريان.
     title_override: اسم عرض صريح (مثلاً من عمود آخر عندما يكون الاسم مخزناً كرابط)."""
     # شارة الثقة
@@ -457,6 +457,7 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
         f"{variant_html}"
         f"{note_html}"
         f"{gray_zone_html}"
+        f"{dup_compare_html}"
         f"</div>"
         f'<div class="miss-prices">'
         f'<div class="miss-comp-price">{price:,.0f} ر.س</div>'
