@@ -247,10 +247,17 @@ PAGE_PROMPTS = {
 اجب بالعربية باحترافية وايجاز يمكنك استخدام markdown.""",
 "verify": MATCHING_FEW_SHOT_AR + """انت خبير تحقق من منتجات العطور دقيق جداً (متجر مهووس).
 
-قواعد المطابقة المنطقية (إلزامية):
-- **match = false** إذا اختلف أحدٌ مما يلي: الحجم (مل)، التركيز (EDP/EDT/Parfum/Elixir…)، خط العطر (مثل Sauvage vs Sauvage Elixir)، الجنس، أو الماركة — حتى لو تطابق الاسم ظاهرياً. عندها confidence منخفضة (مثلاً 0–25) والسبب يوضح اختلاف الحجم/التركيز.
-- **match = true** فقط عند تطابق الماركة + خط العطر + **نفس الحجم** + **نفس التركيز** + الجنس المناسب.
-- مثال صارم: 50 مل مقابل 100 مل → **match:false** (مطابقة 0% منطقياً).
+قواعد المطابقة المنطقية (إلزامية — لا استثناء):
+- **match = false + confidence = 0** إذا اختلف أيٌّ مما يلي:
+  * الحجم (مل): 50ml ≠ 100ml حتى لو الاسم متطابق تماماً.
+  * التركيز: EDT ≠ EDP ≠ Parfum ≠ Extrait ≠ Elixir ≠ Body Mist ≠ Hair Mist.
+  * خط العطر: Sauvage ≠ Sauvage Elixir ≠ Sauvage Parfum.
+  * الماركة أو الجنس.
+  * وجود كلمات (بديل/مستوحى/tester/تستر) في أحدهما دون الآخر.
+- **match = false + confidence = 0** إذا كان الحجم موجوداً في أحدهما ومفقوداً في الآخر.
+- **قاعدة ذهبية:** إذا لم تجد تطابقاً دقيقاً 100% في الحجم والتركيز والماركة والخط، لا تُخمّن. أرجع confidence = 0 وصنّف المنتج كـ "مفقود". التخمين أسوأ من الإقرار بعدم التطابق.
+- **match = true** فقط عند: نفس الماركة + نفس الخط + نفس الحجم + نفس التركيز + الجنس متوافق.
+- الحد الأدنى لقبول المطابقة: confidence ≥ 85. أي مطابقة بأقل من 85% = "مفقود".
 
 تحقق من: الماركة + اسم المنتج + الحجم (ml) + النوع (EDP/EDT/Parfum…) + الجنس.
 اجب JSON فقط بدون اي نص اضافي:
@@ -259,13 +266,24 @@ PAGE_PROMPTS = {
 اجب JSON فقط:
 {"market_price":0,"price_range":{"min":0,"max":0},"competitors":[{"name":"","price":0}],"recommendation":"","confidence":0}""",
 "reclassify": MATCHING_FEW_SHOT_AR + """انت نظام تصنيف دقيق لمنتجات العطور (متجر مهووس).
-«نفس المنتج» يعني **نفس SKU**: نفس الماركة + نفس خط العطر + نفس الحجم (مل) + نفس التركيز. إذا اختلف الحجم أو التركيز فليس «نفس المنتج» → صنّف كمفقود أو مراجعة لا كسعر أعلى/أقل.
 
-القسم الصحيح:
-- سعر اعلى: **نفس المنتج (SKU)** وسعرنا أعلى بأكثر من 10 ريال
-- سعر اقل: **نفس المنتج (SKU)** وسعرنا أقل بأكثر من 10 ريال
-- موافق: **نفس المنتج** + الفرق 10 ريال أو أقل + مطابقة منطقية صحيحة
-- مفقود: ليس نفس المنتج (مثلاً حجم أو تركيز مختلف) أو غير موجود لدينا
+تعريف «نفس المنتج (SKU)»: نفس الماركة + نفس خط العطر + نفس الحجم (مل) + نفس التركيز.
+أي اختلاف في الحجم أو التركيز أو الخط → ليس نفس المنتج → صنّف كـ "مفقود".
+
+قواعد صارمة (لا استثناء):
+- إذا أحد المنتجَين يحتوي (بديل/مستوحى/tester/تستر) والآخر لا → "مفقود" (confidence = 0).
+- إذا الحجم موجود في أحدهما ومفقود في الآخر → "مفقود" (confidence = 0).
+- إذا الحجمان مختلفان (مثل 50ml vs 100ml) → "مفقود" (confidence = 0).
+- إذا التركيزان مختلفان (EDT ≠ EDP ≠ Parfum ≠ Extrait…) → "مفقود" (confidence = 0).
+- الحد الأدنى للقبول كـ "نفس المنتج": confidence ≥ 85. أقل من ذلك → "مفقود".
+- إذا لم تجد تطابقاً دقيقاً، لا تُخمّن — صنّف كـ "مفقود" مباشرة.
+
+الأقسام الصحيحة:
+- سعر اعلى: نفس المنتج (SKU) + سعرنا أعلى بأكثر من 10 ريال
+- سعر اقل: نفس المنتج (SKU) + سعرنا أقل بأكثر من 10 ريال
+- موافق:    نفس المنتج (SKU) + الفرق ≤ 10 ريال
+- مفقود:   أي اختلاف في SKU أو confidence < 85
+
 يجب أن يطابق idx الرقم داخل [1]،[2]،... في قائمة المدخلات (واحد لكل سطر مرسل).
 اجب JSON فقط:
 {"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":""},...]}"""
@@ -876,6 +894,14 @@ _VM_INCOMPATIBLE: frozenset = frozenset([
 # فارق الحجم المسموح به (ml) قبل الرفض
 _VM_SIZE_TOLERANCE_ML: float = 10.0
 
+# ── قاعدة الكلمات المحظورة (Blacklist) ──────────────────────────────────────
+# أحدهما بديل/تستر والآخر أصلي = رفض قاطع بغض النظر عن باقي البيانات
+_VM_BLACKLIST_RE = re.compile(
+    r'\b(?:بديل|بدائل|مستوحى|مستوحاة|inspired\s+by|alternative|'
+    r'tester|تستر|تسترز|testers)\b',
+    re.I | re.UNICODE,
+)
+
 
 def _vm_extract_size(name: str) -> float | None:
     """يستخرج أول حجم (ml) من الاسم. يُرجع None إذا لم يجد."""
@@ -904,15 +930,21 @@ def verify_perfume_match(name1: str, name2: str) -> dict:
     """
     طبقة تحقق Python صارمة (Hard Rules) — تعمل قبل AI وبعده.
 
-    قواعد الرفض الصارمة:
+    قواعد الرفض الصارمة (بالأولوية):
     ──────────────────────────────────────────────────────────
-    1. الحجم: إذا استُخرج من كلا الاسمَين والفارق > 10ml → REJECT.
+    0. Blacklist: إذا أحدهما يحتوي (بديل/مستوحى/tester/تستر) والآخر لا → REJECT.
+       المنتج الأصلي لا يطابق بديلاً أو تستراً أبداً.
+
+    1. عدم تماثل الحجم: إذا كان الحجم موجوداً في أحدهما ومفقوداً في الآخر → REJECT.
+       مثال: "سوفاج 100مل" vs "Sauvage EDP" → مرفوض (لا تماثل).
+
+    2. اختلاف الحجم: إذا كلاهما له حجم والفارق > 10ml → REJECT.
        مثال: 200ml vs 100ml → فارق 100ml → مرفوض.
 
-    2. التركيز: إذا تعرّف النظام على تركيز مختلف في الاسمَين → REJECT.
+    3. التركيز: إذا تعرّف النظام على تركيز مختلف في الاسمَين → REJECT.
        مثال: EDT vs Parfum | EDP vs EDT | Elixir vs EDP → مرفوضة.
 
-    إذا لم يُستخرج أحد الجانبَين → لا قرار (ok=True) والـ AI يحكم.
+    إذا لم يُستخرج أي من الجانبَين → لا قرار (ok=True) والـ AI يحكم.
     ──────────────────────────────────────────────────────────
     Returns:
         {
@@ -932,28 +964,58 @@ def verify_perfume_match(name1: str, name2: str) -> dict:
     conc1 = _vm_extract_conc(n1)
     conc2 = _vm_extract_conc(n2)
 
-    # ── قاعدة 1: الحجم ────────────────────────────────────────────────────
+    # ── قاعدة 0: Blacklist — بديل/تستر vs أصلي ───────────────────────────
+    bl1 = bool(_VM_BLACKLIST_RE.search(n1))
+    bl2 = bool(_VM_BLACKLIST_RE.search(n2))
+    if bl1 != bl2:
+        tag = "بديل/مستوحى" if ("بديل" in n1.lower() or "بديل" in n2.lower()
+                                  or "مستوح" in n1.lower() or "مستوح" in n2.lower()
+                                  or "inspired" in n1.lower() or "inspired" in n2.lower()) else "تستر"
+        return {
+            "ok":     False,
+            "reason": (
+                f"[Blacklist] أحد المنتجَين يحتوي كلمة محظورة ({tag}) "
+                f"والآخر لا — مطابقة أصلي ببديل/تستر مرفوضة"
+            ),
+            "size1": size1, "size2": size2,
+            "conc1": conc1, "conc2": conc2,
+        }
+
+    # ── قاعدة 1: عدم تماثل الحجم ─────────────────────────────────────────
+    if (size1 is None) != (size2 is None):
+        has_size = size1 if size1 is not None else size2
+        return {
+            "ok":     False,
+            "reason": (
+                f"[Volume Asymmetry] حجم موجود ({has_size:.0f}ml) في أحد المنتجَين "
+                f"ومفقود في الآخر — مطابقة 0%"
+            ),
+            "size1": size1, "size2": size2,
+            "conc1": conc1, "conc2": conc2,
+        }
+
+    # ── قاعدة 2: اختلاف الحجم ────────────────────────────────────────────
     if size1 is not None and size2 is not None:
         diff = abs(size1 - size2)
         if diff > _VM_SIZE_TOLERANCE_ML:
             return {
                 "ok":     False,
                 "reason": (
-                    f"اختلاف الحجم: {size1:.0f}ml ≠ {size2:.0f}ml "
+                    f"[Volume Mismatch] {size1:.0f}ml ≠ {size2:.0f}ml "
                     f"(فارق {diff:.0f}ml > {_VM_SIZE_TOLERANCE_ML:.0f}ml)"
                 ),
                 "size1": size1, "size2": size2,
                 "conc1": conc1, "conc2": conc2,
             }
 
-    # ── قاعدة 2: التركيز ──────────────────────────────────────────────────
+    # ── قاعدة 3: التركيز ──────────────────────────────────────────────────
     if conc1 and conc2 and conc1 != conc2:
         pair = frozenset([conc1, conc2])
         if pair in _VM_INCOMPATIBLE:
             return {
                 "ok":     False,
                 "reason": (
-                    f"اختلاف التركيز: {conc1} ≠ {conc2} — مطابقة مستحيلة"
+                    f"[Concentration Mismatch] {conc1} ≠ {conc2} — مطابقة مستحيلة"
                 ),
                 "size1": size1, "size2": size2,
                 "conc1": conc1, "conc2": conc2,
@@ -1051,10 +1113,18 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
         return {"success":True, **data}
-    # كلمة حرفية مستقلة فقط — تجنب "this is not true" أو "untrue"
+    # النص الخام بدون JSON: أي مطابقة بنسبة < 85% تُعدّ مفقودة
     _tl = txt.lower()
     match = bool(re.search(r'\btrue\b', _tl)) or "نعم" in txt
-    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
+    # رفض أي مطابقة غير مؤكدة من مسار النص الخام (< 85% ثقة)
+    return {
+        "success": True,
+        "match": False,
+        "confidence": 0,
+        "reason": f"[Threshold Reject] استجابة AI غير JSON — مطابقة غير مؤكدة: {txt[:200]}",
+        "correct_section": "مفقود",
+        "suggested_price": 0,
+    }
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
 _RC_BATCH = 10   # حجم الدفعة الواحدة — يمنع timeout ويحسن دقة JSON
@@ -1073,51 +1143,96 @@ def _reclassify_batch(batch: list, offset: int) -> list:
     """
     تصنيف دفعة واحدة (≤ _RC_BATCH منتجات).
     offset: الرقم الأساسي للـ idx الأصلي (لتصحيح الترقيم عند دمج الدفعات).
+
+    الجديد: يُطبّق verify_perfume_match على كل زوج قبل الإرسال للـ AI.
+    المنتجات المرفوضة hard-reject تُحوَّل مباشرة لـ "مفقود" بدون استهلاك AI.
     """
     lines = []
+    hard_rejected: dict[int, dict] = {}  # local_idx → نتيجة الرفض المسبق
+
     for i, it in enumerate(batch):
+        our_name  = str(it.get("our", "") or "")
+        comp_name = str(it.get("comp", "") or "")
+
+        # ── فحص صارم مسبق (Hard Firewall) ───────────────────────────────
+        _vmr = verify_perfume_match(our_name, comp_name)
+        if not _vmr["ok"]:
+            _logger.info(
+                "_reclassify_batch HARD-REJECT [%d]: «%s» vs «%s» — %s",
+                offset + i + 1, our_name[:50], comp_name[:50], _vmr["reason"],
+            )
+            hard_rejected[i + 1] = {
+                "idx":        i + 1 + offset,
+                "section":    "🔍 مفقود",
+                "confidence": 0,
+                "match":      False,
+                "reason":     _vmr["reason"],
+                "hard_reject": True,
+            }
+            continue  # لا يُرسل للـ AI
+
         diff = it.get("our_price", 0) - it.get("comp_price", 0)
         lines.append(
-            f"[{i + 1}] منتجنا: {it['our']} ({it.get('our_price', 0):.0f}ر.س)"
-            f" vs منافس: {it['comp']} ({it.get('comp_price', 0):.0f}ر.س)"
+            f"[{i + 1}] منتجنا: {our_name} ({it.get('our_price', 0):.0f}ر.س)"
+            f" vs منافس: {comp_name} ({it.get('comp_price', 0):.0f}ر.س)"
             f" | فرق: {diff:+.0f}ر.س"
         )
+
+    # إذا كل الدفعة مرفوضة hard → لا حاجة للـ AI
+    if not lines:
+        return [hard_rejected[k] for k in sorted(hard_rejected)]
+
     prompt = (
         "حلل المنتجات التالية وأعد JSON فقط بالصيغة المطلوبة:\n"
         + "\n".join(lines)
         + "\n\nأعد JSON فقط — لا أي نص قبله أو بعده:\n"
         + '{"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":"سبب"},...]} '
-        + f"(يجب أن يحتوي على {len(batch)} عنصر بالضبط)"
+        + f"(يجب أن يحتوي على {len(lines)} عنصر بالضبط)"
     )
-    sys = PAGE_PROMPTS["reclassify"]
-    txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
+    sys_prompt = PAGE_PROMPTS["reclassify"]
+    txt = _call_gemini(prompt, sys_prompt, temperature=0.1) or _call_openrouter(prompt, sys_prompt)
     if not txt:
-        _logger.warning("_reclassify_batch: AI لم يُرجع نصاً — %d منتج يبقى تحت المراجعة", len(batch))
-        return _fallback_review_items(batch, offset)
-    data = _parse_json(txt)
-    if not (data and "results" in data):
-        _logger.warning("_reclassify_batch: JSON غير صالح — %d منتج يبقى تحت المراجعة | نص[:200]=%s",
-                        len(batch), (txt or "")[:200])
-        return _fallback_review_items(batch, offset)
-    out = []
-    for r in data["results"]:
-        try:
-            local_idx = int(r.get("idx", 0) or 0)
-        except Exception:
-            local_idx = 0
-        r["idx"] = local_idx + offset      # ترقيم عالمي مرجعي للـ batch الأصلية
-        sec = r.get("section", "")
-        if "اعلى" in sec or "أعلى" in sec:
-            r["section"] = "🔴 سعر أعلى"
-        elif "اقل" in sec or "أقل" in sec:
-            r["section"] = "🟢 سعر أقل"
-        elif "موافق" in sec:
-            r["section"] = "✅ موافق"
-        elif "مفقود" in sec:
-            r["section"] = "🔍 مفقود"
+        _logger.warning("_reclassify_batch: AI لم يُرجع نصاً — %d منتج يبقى تحت المراجعة", len(lines))
+        ai_results = _fallback_review_items(batch, offset)
+    else:
+        data = _parse_json(txt)
+        if not (data and "results" in data):
+            _logger.warning("_reclassify_batch: JSON غير صالح — %d منتج يبقى تحت المراجعة | نص[:200]=%s",
+                            len(lines), (txt or "")[:200])
+            ai_results = _fallback_review_items(batch, offset)
         else:
-            r["section"] = "⚠️ تحت المراجعة"
-        out.append(r)
+            ai_results = []
+            for r in data["results"]:
+                try:
+                    local_idx = int(r.get("idx", 0) or 0)
+                except Exception:
+                    local_idx = 0
+                r["idx"] = local_idx + offset
+
+                # ── فحص بعد AI: رفض أي مطابقة confidence < 85 ──────────
+                if r.get("match") and int(r.get("confidence", 0) or 0) < 85:
+                    r["match"]     = False
+                    r["section"]   = "مفقود"
+                    r["reason"]    = (
+                        f"[Threshold Reject] confidence={r.get('confidence')}% < 85% — {r.get('reason','')}"
+                    )
+
+                sec = r.get("section", "")
+                if "اعلى" in sec or "أعلى" in sec:
+                    r["section"] = "🔴 سعر أعلى"
+                elif "اقل" in sec or "أقل" in sec:
+                    r["section"] = "🟢 سعر أقل"
+                elif "موافق" in sec:
+                    r["section"] = "✅ موافق"
+                elif "مفقود" in sec:
+                    r["section"] = "🔍 مفقود"
+                else:
+                    r["section"] = "⚠️ تحت المراجعة"
+                ai_results.append(r)
+
+    # ── دمج نتائج AI مع المرفوضات المسبقة وترتيبها ───────────────────────
+    out = list(hard_rejected.values()) + ai_results
+    out.sort(key=lambda x: x.get("idx", 0))
     return out
 
 
