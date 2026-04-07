@@ -780,7 +780,217 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
     return body if body else txt
 
 # ══ تحقق منتج + تحديد القسم الصحيح ════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  verify_perfume_match — طبقة تحقق Python صارمة (لا تعتمد على AI)
+#  تُطبَّق قبل كل استدعاء AI وبعده — تمنع المطابقات الكارثية (EDT vs Parfum)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── استخراج الحجم ────────────────────────────────────────────────────────────
+_VM_SIZE_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ML|Ml|cl|fl\.?\s*oz)',
+    re.I | re.UNICODE,
+)
+
+# ── استخراج التركيز (مُرتَّب من الأقوى إلى الأضعف) ──────────────────────────
+# ⚠️  الترتيب مهم: EDP قبل PARFUM حتى لا تخطف "بارفيوم" وحدها من "أو دو بارفيوم"
+_VM_CONC_PATTERNS = [
+    # EXTRAIT — الأقوى
+    (re.compile(
+        r'\b(?:extrait\s+de\s+parfum|extrait|اكستريه|اكسترايت|اكسترا\s+دو\s+بارفيوم)\b',
+        re.I | re.UNICODE), "EXTRAIT"),
+
+    # EDP — Eau de Parfum (يجب أن يأتي قبل PARFUM)
+    (re.compile(
+        r'\beau\s+de\s+parfum\b'
+        r'|\be\.?d\.?p\b'
+        r'|أو\s+دو\s+بارفيوم|او\s+دو\s+بارفيوم'
+        r'|\bأو\s+بارفيوم\b|\bاو\s+بارفيوم\b',
+        re.I | re.UNICODE), "EDP"),
+
+    # EDT — Eau de Toilette
+    (re.compile(
+        r'\beau\s+de\s+toilette\b'
+        r'|\be\.?d\.?t\b'
+        r'|أو\s+دو\s+تواليت|او\s+دو\s+تواليت'
+        r'|\bتواليت\b',
+        re.I | re.UNICODE), "EDT"),
+
+    # EDC — Eau de Cologne
+    (re.compile(
+        r'\beau\s+de\s+cologne\b'
+        r'|\be\.?d\.?c\b'
+        r'|أو\s+دو\s+كولون|او\s+دو\s+كولون'
+        r'|\bكولون\b(?!\s+إنتنس)|\bcologne\b',
+        re.I | re.UNICODE), "EDC"),
+
+    # PARFUM وحده — يأتي بعد EDP حتى لا يستأثر بـ "أو دو بارفيوم"
+    (re.compile(
+        r'(?<!\bde\s)(?<!\bدو\s)(?<!\bدو\s)\bparfum\b'
+        r'|\bبارفيوم\b(?!\s+كولون)(?!\s+او)(?!\s+أو)'
+        r'|\bبارفيوم\s+(?!كولون|او|أو)'
+        r'|\bبارفان\b',
+        re.I | re.UNICODE), "PARFUM"),
+
+    # ELIXIR — خط منتج (ليس مجرد تركيز)
+    (re.compile(
+        r'\belixir\b|اليكسير|الكسير',
+        re.I | re.UNICODE), "ELIXIR"),
+
+    # BODY MIST / SPRAY — تختلف اختلافاً جوهرياً عن العطر
+    (re.compile(
+        r'\bbody\s*mist\b|\bbody\s*spray\b|\bbody\s*lotion\b'
+        r'|بادي\s*ميست|بادي\s*سبراي|بودي\s*ميست',
+        re.I | re.UNICODE), "BODY_MIST"),
+
+    # HAIR MIST / SPRAY
+    (re.compile(
+        r'\bhair\s*mist\b|\bhair\s*spray\b|\bhair\s*perfume\b'
+        r'|هير\s*ميست|هير\s*سبراي',
+        re.I | re.UNICODE), "HAIR_MIST"),
+]
+
+# أزواج التركيز غير المتوافقة — أي منها → رفض صارم (0% match)
+_VM_INCOMPATIBLE: frozenset = frozenset([
+    frozenset(["EDP",     "EDT"]),
+    frozenset(["EDP",     "EDC"]),
+    frozenset(["EDP",     "PARFUM"]),
+    frozenset(["EDT",     "PARFUM"]),
+    frozenset(["EDT",     "EDC"]),
+    frozenset(["EXTRAIT", "EDP"]),
+    frozenset(["EXTRAIT", "EDT"]),
+    frozenset(["EXTRAIT", "EDC"]),
+    frozenset(["EXTRAIT", "PARFUM"]),
+    frozenset(["ELIXIR",  "EDP"]),
+    frozenset(["ELIXIR",  "EDT"]),
+    frozenset(["ELIXIR",  "PARFUM"]),
+    frozenset(["BODY_MIST", "EDP"]),
+    frozenset(["BODY_MIST", "EDT"]),
+    frozenset(["BODY_MIST", "PARFUM"]),
+    frozenset(["BODY_MIST", "EXTRAIT"]),
+    frozenset(["HAIR_MIST", "EDP"]),
+    frozenset(["HAIR_MIST", "EDT"]),
+    frozenset(["HAIR_MIST", "PARFUM"]),
+    frozenset(["HAIR_MIST", "EXTRAIT"]),
+])
+
+# فارق الحجم المسموح به (ml) قبل الرفض
+_VM_SIZE_TOLERANCE_ML: float = 10.0
+
+
+def _vm_extract_size(name: str) -> float | None:
+    """يستخرج أول حجم (ml) من الاسم. يُرجع None إذا لم يجد."""
+    m = _VM_SIZE_RE.search(str(name or ""))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _vm_extract_conc(name: str) -> str | None:
+    """
+    يستخرج التركيز العطري من الاسم.
+    يُرجع أول تطابق من _VM_CONC_PATTERNS (مُرتَّبة: EXTRAIT → EDP → EDT → …).
+    """
+    s = str(name or "")
+    for pattern, conc in _VM_CONC_PATTERNS:
+        if pattern.search(s):
+            return conc
+    return None
+
+
+def verify_perfume_match(name1: str, name2: str) -> dict:
+    """
+    طبقة تحقق Python صارمة (Hard Rules) — تعمل قبل AI وبعده.
+
+    قواعد الرفض الصارمة:
+    ──────────────────────────────────────────────────────────
+    1. الحجم: إذا استُخرج من كلا الاسمَين والفارق > 10ml → REJECT.
+       مثال: 200ml vs 100ml → فارق 100ml → مرفوض.
+
+    2. التركيز: إذا تعرّف النظام على تركيز مختلف في الاسمَين → REJECT.
+       مثال: EDT vs Parfum | EDP vs EDT | Elixir vs EDP → مرفوضة.
+
+    إذا لم يُستخرج أحد الجانبَين → لا قرار (ok=True) والـ AI يحكم.
+    ──────────────────────────────────────────────────────────
+    Returns:
+        {
+          "ok":     bool,    # True=اجتاز / False=رفض صارم
+          "reason": str,     # سبب الرفض (فارغ إذا ok=True)
+          "size1":  float|None,
+          "size2":  float|None,
+          "conc1":  str|None,
+          "conc2":  str|None,
+        }
+    """
+    n1 = str(name1 or "").strip()
+    n2 = str(name2 or "").strip()
+
+    size1 = _vm_extract_size(n1)
+    size2 = _vm_extract_size(n2)
+    conc1 = _vm_extract_conc(n1)
+    conc2 = _vm_extract_conc(n2)
+
+    # ── قاعدة 1: الحجم ────────────────────────────────────────────────────
+    if size1 is not None and size2 is not None:
+        diff = abs(size1 - size2)
+        if diff > _VM_SIZE_TOLERANCE_ML:
+            return {
+                "ok":     False,
+                "reason": (
+                    f"اختلاف الحجم: {size1:.0f}ml ≠ {size2:.0f}ml "
+                    f"(فارق {diff:.0f}ml > {_VM_SIZE_TOLERANCE_ML:.0f}ml)"
+                ),
+                "size1": size1, "size2": size2,
+                "conc1": conc1, "conc2": conc2,
+            }
+
+    # ── قاعدة 2: التركيز ──────────────────────────────────────────────────
+    if conc1 and conc2 and conc1 != conc2:
+        pair = frozenset([conc1, conc2])
+        if pair in _VM_INCOMPATIBLE:
+            return {
+                "ok":     False,
+                "reason": (
+                    f"اختلاف التركيز: {conc1} ≠ {conc2} — مطابقة مستحيلة"
+                ),
+                "size1": size1, "size2": size2,
+                "conc1": conc1, "conc2": conc2,
+            }
+
+    return {
+        "ok":     True,
+        "reason": "",
+        "size1":  size1, "size2":  size2,
+        "conc1":  conc1, "conc2":  conc2,
+    }
+
+
 def verify_match(p1, p2, pr1=0, pr2=0):
+    # ── مرحلة 0: الفحص الصارم بالـ Python قبل أي استدعاء AI ─────────────────
+    _vmr = verify_perfume_match(p1, p2)
+    if not _vmr["ok"]:
+        # رفض صارم — لا حاجة للـ AI، التركيز أو الحجم مختلف
+        _logger.info(
+            "verify_match HARD-REJECT: «%s» vs «%s» — %s",
+            p1[:60], p2[:60], _vmr["reason"],
+        )
+        return {
+            "success":        True,
+            "match":          False,
+            "confidence":     0,
+            "reason":         _vmr["reason"],
+            "correct_section": "مفقود",
+            "suggested_price": 0,
+            "hard_reject":    True,
+            "conc1":          _vmr.get("conc1"),
+            "conc2":          _vmr.get("conc2"),
+            "size1":          _vmr.get("size1"),
+            "size2":          _vmr.get("size2"),
+        }
+
+    # ── مرحلة 1: AI ───────────────────────────────────────────────────────────
     diff = pr1 - pr2 if pr1 > 0 and pr2 > 0 else 0
     if pr1 > 0 and pr2 > 0:
         if diff > 10:     expected = "سعر اعلى"
@@ -789,22 +999,33 @@ def verify_match(p1, p2, pr1=0, pr2=0):
     else:
         expected = "تحت المراجعة"
 
+    # أضف معلومات الحجم والتركيز المستخرجة في الـ prompt للمساعدة
+    _ctx = ""
+    if _vmr.get("conc1") or _vmr.get("size1"):
+        _ctx = (
+            f"\n[تحليل Python مسبق] منتج 1: حجم={_vmr.get('size1') or '?'}ml "
+            f"/ تركيز={_vmr.get('conc1') or '؟'} | "
+            f"منتج 2: حجم={_vmr.get('size2') or '?'}ml "
+            f"/ تركيز={_vmr.get('conc2') or '؟'}"
+        )
+
     prompt = f"""تحقق من تطابق هذين المنتجين بدقة متناهية (99.9%):
 منتج 1 (مهووس): {p1} | السعر: {pr1:.0f} ريال
-منتج 2 (المنافس): {p2} | السعر: {pr2:.0f} ريال
+منتج 2 (المنافس): {p2} | السعر: {pr2:.0f} ريال{_ctx}
 
-قواعد المطابقة المنطقية (صارمة):
+قواعد الرفض الصارمة (لا استثناء):
 1. الماركة متطابقة تماماً.
-2. خط العطر متطابق (Sauvage ≠ Sauvage Elixir).
-3. الحجم بالمل متطابق — **50 مل مقابل 100 مل = مطابقة 0%** حتى لو تطابق الاسم.
-4. التركيز متطابق (EDP ≠ Parfum ≠ EDT) — مثال: **Sauvage EDP ≠ Sauvage Parfum**.
+2. خط العطر متطابق (Sauvage ≠ Sauvage Elixir ≠ Sauvage Elixir Parfum).
+3. الحجم بالمل متطابق — **50ml مقابل 100ml = مطابقة 0%** حتى لو تطابق الاسم.
+4. التركيز متطابق — EDT ≠ EDP ≠ Parfum ≠ Extrait ≠ Elixir ≠ Body Mist.
+   مثال صارم: «إيروس أو دو تواليت 200ml» ≠ «إيروس بارفيوم» (EDT vs Parfum).
 5. الجنس متطابق (Men ≠ Women).
 
-إذا تعذر تحقق أي شرط أعلاه، فالمطابقة **false** وconfidence منخفضة.
+إذا تعذّر تحقق أي شرط أعلاه، فالمطابقة **false** وconfidence = 0.
 
-إذا كانت كل الشروط أعلاه متوفرة، أجب بـ:
+إذا كانت كل الشروط متوفرة، أجب بـ:
 - القسم الصحيح = {expected}
-خلاف ذلك، أجب بـ:
+خلاف ذلك:
 - القسم الصحيح = مفقود"""
 
     sys = PAGE_PROMPTS["verify"]
@@ -813,6 +1034,16 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0}
     data = _parse_json(txt)
     if data:
+        # ── مرحلة 2: فحص Python بعد AI — لا تقبل "match=true" إذا اختلف التركيز/الحجم
+        if data.get("match") is True:
+            _post = verify_perfume_match(p1, p2)
+            if not _post["ok"]:
+                data["match"]          = False
+                data["confidence"]     = 0
+                data["reason"]         = f"[Python Override] {_post['reason']}"
+                data["correct_section"] = "مفقود"
+                data["hard_reject"]    = True
+                return {"success": True, **data}
         sec = data.get("correct_section","")
         if "اعلى" in sec or "أعلى" in sec: data["correct_section"] = "سعر اعلى"
         elif "اقل" in sec or "أقل" in sec:  data["correct_section"] = "سعر اقل"

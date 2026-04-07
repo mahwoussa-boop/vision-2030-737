@@ -1881,11 +1881,19 @@ def _ai_batch(batch):
 
     prompt = (
         "أنت خبير عطور فاخرة. مهمتك مطابقة منتجنا مع أفضل مرشح من المنافسين.\n"
-        "الشروط الصارمة للتطابق: نفس الماركة، نفس الحجم (±5ml)، نفس التركيز (EDP/EDT)، ونفس الجنس.\n\n"
+        "\n"
+        "⛔ قواعد الرفض الصارمة — لا استثناء:\n"
+        "1. الحجم: إذا اختلف الحجم (مثل 100ml مقابل 200ml) → index=0 مباشرةً.\n"
+        "2. التركيز: EDT ≠ EDP ≠ Parfum ≠ Extrait ≠ Elixir ≠ Body Mist.\n"
+        "   مثال فاشل: «فيرزاتشي إيروس أو دو تواليت 200ml» ≠ «فيرزاتشي إيروس بارفيوم» (EDT vs Parfum).\n"
+        "3. خط العطر: Sauvage ≠ Sauvage Elixir | Eros ≠ Eros Flame.\n"
+        "4. الجنس: رجالي ≠ نسائي.\n"
+        "إذا شككت في أي شرط → index=0 (لا تطابق).\n"
+        "\n"
         + "\n\n".join(lines)
-        + '\n\nأعد كائن JSON فقط بالصيغة التالية (بدون أي نصوص إضافية):\n'
-        + '{"results": [{"index": رقم_المرشح_الصحيح, "reason": "تبرير قصير جداً في سطر واحد"}, ...]}\n'
-        + 'ملاحظة: index هو رقم المرشح (1، 2، الخ). إذا لم يوجد تطابق تام اجعل index = 0.'
+        + '\n\nأعد كائن JSON فقط (بدون أي نصوص قبله أو بعده):\n'
+        + '{"results": [{"index": رقم_المرشح_الصحيح_أو_0_إذا_لا_يوجد, "reason": "سبب قصير"}, ...]}\n'
+        + f'يجب أن يحتوي على {len(batch)} عنصر بالضبط. index=0 يعني لا تطابق.'
     )
 
     def _parse(txt):
@@ -2401,19 +2409,71 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             continue
 
         if best0["score"] >= 97 or not use_ai:
-            row_result = _row(product, our_price, our_id, brand, size, ptype, gender,
-                              best0, src="auto", all_cands=all_cands,
-                              our_img=our_img, our_url=our_url)
-            if row_result is not None:   # ← فلتر None
-                results.append(_inject_price_alert(row_result))
+            # ── فحص صارم قبل قبول المطابقة التلقائية ────────────────────────
+            try:
+                from engines.ai_engine import verify_perfume_match as _vpm
+                _vmr = _vpm(product, best0.get("name", ""))
+            except Exception:
+                _vmr = {"ok": True}
+            if not _vmr.get("ok", True):
+                # رفض صارم (حجم/تركيز مختلف) — تُعامَل كمنتج غير مطابق
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "AUTO-MATCH HARD-REJECT: «%.60s» vs «%.60s» — %s",
+                    product, best0.get("name", ""), _vmr.get("reason", ""),
+                )
+                audit_stats["no_competitor_found"] += 1
+                audit_stats["processed"] -= 1    # تراجع عن العدّاد السابق
+                results.append(
+                    _excluded_match_row(
+                        product, our_price, our_id, display_brand, size, ptype, gender,
+                        our_img=our_img, our_url=our_url,
+                        score=float(best0.get("score") or 0),
+                        مصدر_المطابقة=f"hard_reject_conc_size:{_vmr.get('reason','')[:60]}",
+                    )
+                )
+            else:
+                row_result = _row(product, our_price, our_id, brand, size, ptype, gender,
+                                  best0, src="auto", all_cands=all_cands,
+                                  our_img=our_img, our_url=our_url)
+                if row_result is not None:
+                    results.append(_inject_price_alert(row_result))
         else:
-            pending.append(dict(
-                product=product, our_price=our_price, our_id=our_id,
-                brand=brand, size=size, ptype=ptype, gender=gender,
-                candidates=top5, all_cands=all_cands,
-                our=product, price=our_price,
-                our_img=our_img, our_url=our_url,
-            ))
+            # ── فلترة المرشحين: احذف من يفشل فحص التركيز/الحجم مسبقاً ─────
+            try:
+                from engines.ai_engine import verify_perfume_match as _vpm
+                _filtered_top5 = [
+                    c for c in top5
+                    if _vpm(product, c.get("name", "")).get("ok", True)
+                ]
+                _filtered_all  = [
+                    c for c in all_cands
+                    if _vpm(product, c.get("name", "")).get("ok", True)
+                ]
+            except Exception:
+                _filtered_top5 = top5
+                _filtered_all  = all_cands
+
+            if not _filtered_top5:
+                # كل المرشحين رُفضوا بالفحص الصارم → مفقود مباشرةً
+                audit_stats["no_competitor_found"] += 1
+                audit_stats["processed"] -= 1
+                results.append(
+                    _excluded_match_row(
+                        product, our_price, our_id, display_brand, size, ptype, gender,
+                        our_img=our_img, our_url=our_url,
+                        score=float(top5[0].get("score") or 0) if top5 else 0,
+                        مصدر_المطابقة="hard_reject_all_candidates",
+                    )
+                )
+            else:
+                pending.append(dict(
+                    product=product, our_price=our_price, our_id=our_id,
+                    brand=brand, size=size, ptype=ptype, gender=gender,
+                    candidates=_filtered_top5, all_cands=_filtered_all,
+                    our=product, price=our_price,
+                    our_img=our_img, our_url=our_url,
+                ))
             if len(pending) >= BATCH:
                 _flush()
 
