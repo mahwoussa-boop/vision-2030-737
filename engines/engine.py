@@ -2737,12 +2737,13 @@ def find_missing_products(our_df, comp_dfs):
                 _conf_level = "green"    # مفقود مؤكد — جاهز للإرسال
             elif score < 55 and not _has_similar:
                 _conf_level = "green"    # مفقود مؤكد
-            elif _has_similar or (score >= 55 and score < 68):
-                _conf_level = "yellow"   # مفقود محتمل — يحتاج تحقق
             elif _has_var and variant.get("type") == "similar":
                 _conf_level = "red"      # مشكوك فيه — محظور الإرسال
+            elif _has_similar or (score >= 55 and score < 68):
+                _conf_level = "yellow"   # مفقود محتمل — يحتاج تحقق
             else:
-                _conf_level = "green"
+                # score >= 68 → تشابه عالٍ مع منتجاتنا = مشكوك فيه
+                _conf_level = "yellow"
 
             _img_url = _extract_image_url_from_cell(row.get(img_col)) if img_col else ""
             if not _img_url:

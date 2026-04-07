@@ -806,6 +806,24 @@ def _sanitize_desc_links(text: str, brand: str = "", gender: str = "", ptype: st
     if not text:
         return text
 
+    # ── استبدال روابط Google داخل HTML <a href="..."> ──────────────────────
+    def _replace_html_href(m: re.Match) -> str:
+        prefix = m.group(1)   # النص قبل الرابط: href="
+        url    = m.group(2)   # الرابط نفسه
+        suffix = m.group(3)   # النص بعد الرابط: "
+        if not _FAKE_LINK_RE.search(url):
+            return m.group(0)
+        _fq = re.sub(r"\s+", "+", (product_name or brand or "عطر").strip()[:40])
+        new_url = f"https://mahwous.com/search?q={_fq}"
+        return f"{prefix}{new_url}{suffix}"
+
+    text = re.sub(
+        r'(href=["\'])(https?://[^"\']+)(["\'])',
+        _replace_html_href,
+        text,
+        flags=re.I,
+    )
+
     # ── استبدال روابط Google داخل Markdown [نص](url) ──────────────────────
     def _replace_link(m: re.Match) -> str:
         anchor = m.group(1) or ""
