@@ -380,6 +380,49 @@ def _placeholder_description(name: str, brand: str) -> str:
     )
 
 
+# ── أحرف خاصة يرفضها حقل «وصف صورة المنتج» في سلة ─────────────────────────
+_ALT_SPECIAL_RE = re.compile(r"[^\w\s\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", re.UNICODE)
+
+
+def _safe_alt_text(name: str, max_len: int = 125) -> str:
+    """
+    يُنتج نص alt مقبول من سلة:
+    - يحذف الأحرف الخاصة (| ( ) ! @ # & — – … إلخ).
+    - يحتفظ بالحروف العربية والإنجليزية والأرقام والمسافات فقط.
+    - يحذف المسافات المتعددة.
+    - يقطع عند max_len.
+    """
+    s = _strip_html_visible(str(name or ""))
+    s = _ALT_SPECIAL_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len].strip()
+
+
+def _safe_promo(name: str, brand: str, max_len: int = 25) -> str:
+    """
+    يُنتج العنوان الترويجي بحد أقصى 25 حرفاً (قيد سلة).
+    يُفضّل اسم المنتج المختصر على دمجه مع الماركة إذا كان الدمج يتجاوز الحد.
+    """
+    # محاولة دمج الاسم + الماركة
+    brand_clean = str(brand or "").strip()
+    if brand_clean and "|" in brand_clean:
+        # استخدم الجزء الإنجليزي من الاسم الثنائي كاختصار
+        parts = [p.strip() for p in brand_clean.split("|")]
+        brand_short = next((p for p in parts if re.search(r"[a-zA-Z]", p)), parts[0])
+    else:
+        brand_short = brand_clean
+
+    full = f"{name} {brand_short}".strip() if brand_short else name
+    if len(full) <= max_len:
+        return full
+
+    # اقطع اسم المنتج فقط عند max_len (كلمة كاملة)
+    short = name[:max_len]
+    if " " in short:
+        short = short.rsplit(" ", 1)[0]
+    return short.rstrip(".,،؛—–").strip()[:max_len]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  الدالة الرئيسية — التصدير
 # ══════════════════════════════════════════════════════════════════════════════
@@ -473,8 +516,11 @@ def export_to_salla_shamel(
         else:
             desc_text = _placeholder_description(pname, brand_out)
 
-        alt_txt = f"زجاجة عطر {pname} الأصلية"
-        promo   = f"{pname} — {brand_out}".strip(" —")
+        # وصف الصورة — نص خالٍ من الأحرف الخاصة (قيد سلة)
+        alt_txt = _safe_alt_text(f"زجاجة عطر {pname} الأصلية")
+
+        # العنوان الترويجي — حد أقصى 25 حرفاً (قيد سلة الصارم)
+        promo = _safe_promo(pname, brand_out)
 
         # ── بناء الصف بالترتيب الحرفي للأعمدة ────────────────────────────
         row_map = {
@@ -498,7 +544,7 @@ def export_to_salla_shamel(
             "الوزن":                         w_val,
             "وحدة الوزن":                    w_unit,
             "الماركة":                       brand_out,
-            "العنوان الترويجي":              promo[:250],
+            "العنوان الترويجي":              promo,
             "تثبيت المنتج":                  "",
             "الباركود":                      str(r.get("الباركود") or r.get("Barcode") or "").strip(),
             "السعرات الحرارية":              "",
