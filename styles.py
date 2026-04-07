@@ -394,7 +394,8 @@ def comp_strip(all_comps):
 def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
               confidence_level="green", confidence_score=0, product_id="", image_url="",
-              comp_url="", title_override="", gray_zone_html="", dup_compare_html=""):
+              comp_url="", title_override="", gray_zone_html="", dup_compare_html="",
+              all_competitors=None):
     """بطاقة المنتج المفقود — image_url / comp_url اختياريان.
     title_override: اسم عرض صريح (مثلاً من عمود آخر عندما يكون الاسم مخزناً كرابط)."""
     # شارة الثقة
@@ -445,6 +446,42 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
     # الرابط يبقى في عنوان المنتج القابل للنقر — بدون شريط إضافي أسفل البطاقة
     _foot = ""
 
+    # ── قسم المنافسين (إن كان هناك أكثر من منافس) ─────────────────────────
+    _comp_rows_html = ""
+    if all_competitors and len(all_competitors) > 0:
+        _rows = []
+        for _c in all_competitors:
+            _cn  = html.escape(str(_c.get("comp", "—"))[:25], quote=False)
+            _cp2 = _c.get("price", 0)
+            _cu  = str(_c.get("url", "") or "")
+            _badge = (
+                f'<span style="font-size:.6rem;background:#1a3a5c;border-radius:4px;'
+                f'padding:1px 5px;color:#90caf9;margin-left:4px">🏷️ {_cn}</span>'
+            )
+            _price_span = (
+                f'<span style="color:#ffcc80;font-size:.68rem;font-weight:700">'
+                f'{_cp2:,.0f} ر.س</span>'
+                if _cp2 > 0 else ""
+            )
+            if _cu.startswith("http"):
+                _link_open  = f'<a href="{html.escape(_cu, quote=True)}" target="_blank" style="text-decoration:none">'
+                _link_close = "</a>"
+            else:
+                _link_open = _link_close = ""
+            _rows.append(
+                f'<div style="display:inline-flex;align-items:center;gap:4px;margin:2px 0">'
+                f'{_link_open}{_badge}{_link_close}{_price_span}</div>'
+            )
+        _comp_rows_html = (
+            f'<div style="margin-top:6px;padding:5px 8px;border-radius:6px;'
+            f'background:rgba(79,195,247,.05);border:1px solid #4fc3f720;'
+            f'font-size:.65rem;color:#888">'
+            f'<span style="color:#4fc3f7;font-size:.63rem;font-weight:700">🏪 متوفر أيضاً عند:</span>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:3px">'
+            + "".join(_rows)
+            + f"</div></div>"
+        )
+
     # بدون مسافات بادئة في بداية الأسطر — وإلا Markdown يعرضها كـ <pre><code>
     return (
         f'<div class="miss-card" style="border:1px solid {border_color}">'
@@ -457,6 +494,7 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
         f"{variant_html}"
         f"{note_html}"
         f"{gray_zone_html}"
+        f"{_comp_rows_html}"
         f"{dup_compare_html}"
         f"</div>"
         f'<div class="miss-prices">'

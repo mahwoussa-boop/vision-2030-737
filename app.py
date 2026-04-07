@@ -2451,6 +2451,21 @@ elif page == "🔍 منتجات مفقودة":
             st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
 
             # ══════════════════════════════════════════════════════════════
+            #  بناء قاموس المنافسين لكل منتج (اسم → قائمة منافسين)
+            # ══════════════════════════════════════════════════════════════
+            _comp_map: dict = {}
+            for _fi, _fr in filtered.iterrows():
+                _fn = str(_fr.get("منتج_المنافس", "") or "").strip()
+                _fc = str(_fr.get("المنافس", "") or "").strip()
+                _fp = safe_float(_fr.get("سعر_المنافس", 0))
+                _fu = str(_fr.get("رابط_المنافس", "") or "").strip()
+                if not _fn:
+                    continue
+                if _fn not in _comp_map:
+                    _comp_map[_fn] = []
+                _comp_map[_fn].append({"comp": _fc, "price": _fp, "url": _fu})
+
+            # ══════════════════════════════════════════════════════════════
             #  شبكة بطاقات (2 عمود × 6 صف = 12 بطاقة/صفحة)
             # ══════════════════════════════════════════════════════════════
             _page_rows = filtered.iloc[_pg_start:_pg_end]
@@ -2465,7 +2480,9 @@ elif page == "🔍 منتجات مفقودة":
                     idx = _abs_i
 
                     name  = str(row.get("منتج_المنافس", ""))
-                    _miss_key = f"missing_{name}_{idx}"
+                    # مفتاح ثابت: name + comp (لا idx — idx يتغير بين الجلسات)
+                    _mk_comp = str(row.get("المنافس", ""))
+                    _miss_key = f"missing_{name}_{_mk_comp}"
                     if _miss_key in st.session_state.hidden_products:
                         continue
 
@@ -2615,6 +2632,11 @@ elif page == "🔍 منتجات مفقودة":
                         )
 
                         # ── بطاقة المنتج ────────────────────────────────────
+                        # جميع المنافسين الآخرين لنفس المنتج (بدون المنافس الحالي)
+                        _all_comps = [
+                            c for c in _comp_map.get(name, [])
+                            if c["comp"] != _mk_comp
+                        ]
                         st.markdown(miss_card(
                             name=name, price=price, brand=brand, size=size,
                             ptype=ptype, comp=_comp_show, suggested_price=suggested_price,
@@ -2628,6 +2650,7 @@ elif page == "🔍 منتجات مفقودة":
                             title_override=_title_display,
                             gray_zone_html=_gray_zone_html,
                             dup_compare_html=_dup_compare_html,
+                            all_competitors=_all_comps if _all_comps else None,
                         ), unsafe_allow_html=True)
 
                         # ── أزرار الإجراءات ─────────────────────────────────
@@ -2647,20 +2670,46 @@ elif page == "🔍 منتجات مفقودة":
                             _has_desc = f"desc_{idx}" in st.session_state
                             _lbl = "📤 Make + وصف" if _has_desc else "📤 إرسال Make"
                             if st.button(_lbl, key=f"mk_m_{idx}", use_container_width=True):
+                                st.session_state[f"show_price_editor_{idx}"] = True
+                                st.rerun()
+
+                        # ── محرر السعر قبل الإرسال ──────────────────────────
+                        if st.session_state.get(f"show_price_editor_{idx}"):
+                            with st.form(key=f"price_form_{idx}"):
+                                _edit_price = st.number_input(
+                                    "💰 سعر الإرسال (ر.س)",
+                                    value=float(suggested_price),
+                                    min_value=0.0,
+                                    step=1.0,
+                                    key=f"price_inp_{idx}",
+                                )
+                                _pf_cols = st.columns(2)
+                                _submit_price = _pf_cols[0].form_submit_button(
+                                    "✅ تأكيد الإرسال", use_container_width=True
+                                )
+                                _cancel_price = _pf_cols[1].form_submit_button(
+                                    "❌ إلغاء", use_container_width=True
+                                )
+                            if _submit_price:
                                 with st.spinner("📤 يُرسل لـ Make..."):
                                     _res_mk = send_new_products([{
                                         "product_id": _miss_pid, "name": nm_ai,
-                                        "price": float(suggested_price), "sku": _miss_pid,
+                                        "price": float(_edit_price), "sku": _miss_pid,
                                         "weight": 1, "cost_price": 0, "sale_price": 0,
                                         "description": st.session_state.get(f"desc_{idx}", f"عطر {nm_ai} الأصلي"),
                                         "image_url": _miss_img,
                                     }])
+                                st.session_state.pop(f"show_price_editor_{idx}", None)
                                 if _res_mk["success"]:
                                     st.success(_res_mk["message"])
                                     st.session_state.hidden_products.add(_miss_key)
+                                    save_hidden_product(_miss_key, nm_ai, "sent_to_make")
                                     st.rerun()
                                 else:
                                     st.error(_res_mk["message"])
+                            elif _cancel_price:
+                                st.session_state.pop(f"show_price_editor_{idx}", None)
+                                st.rerun()
                         with _ba3:
                             if _miss_comp_url:
                                 st.link_button("🔗", _miss_comp_url, use_container_width=True)
@@ -2782,6 +2831,13 @@ elif page == "🔍 منتجات مفقودة":
                             _pb.progress(1.0)
                             if _res["success"]:
                                 st.success(_res["message"])
+                                # حفظ كل منتج مُرسَل في DB لمنع إعادة عرضه بعد إعادة تشغيل التطبيق
+                                for _sr in _sel_df.itertuples():
+                                    _sn = str(getattr(_sr, "منتج_المنافس", "") or "")
+                                    _sc = str(getattr(_sr, "المنافس", "") or "")
+                                    _sk = f"missing_{_sn}_{_sc}"
+                                    st.session_state.hidden_products.add(_sk)
+                                    save_hidden_product(_sk, _sn, "sent_to_make_bulk")
                                 st.session_state.miss_sel.clear()
                             else:
                                 st.error(_res["message"])
