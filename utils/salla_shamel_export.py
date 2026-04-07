@@ -235,17 +235,18 @@ def _best_category_from_rules(product_name: str, gender: str, ptype: str) -> str
                 return v
         return valid[0]
 
-    return _CAT_FALLBACK
+    return _CAT_FALLBACK  # Hard Rule: لا تُرجع فارغاً أبداً
 
 
 def _best_brand_from_csv(raw_brand: str) -> str:
     """
     يُرجع الاسم الحرفي للماركة من brands.csv (نسخ حرفي).
     إذا لم تُوجد مطابقة ≥ 75% → يُعيد raw_brand كما هو.
+    Hard Rule: لا تُرجع فارغاً أبداً — القيمة الافتراضية "غير محدد".
     """
     raw = str(raw_brand or "").strip()
     if not raw or raw.lower() in ("nan", "none", ""):
-        return ""
+        return "غير محدد"          # ← Hard Rule
     valid = _load_valid_brands()
     if not valid:
         return raw
@@ -339,6 +340,12 @@ def _extract_price(r: dict) -> float:
 
 
 def _extract_sku(r: dict) -> str:
+    """
+    يستخرج SKU من الصف ويُنظّفه عبر sanitize_sku.
+    يُمنع وضع روابط URL مباشرةً — يُحوَّل الرابط لرمز فريد.
+    """
+    from utils.data_helpers import sanitize_sku as _sanitize_sku
+
     for k in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku",
               "SKU", "sku", "رمز المنتج", "رقم المنتج", "Barcode", "barcode"):
         v = r.get(k)
@@ -347,13 +354,15 @@ def _extract_sku(r: dict) -> str:
         s = str(v).strip()
         if not s or s.lower() in ("nan", "none", "<na>"):
             continue
-        if _is_url(s):
-            continue
-        try:
-            fv = float(s.replace(",", ""))
-            return str(int(fv)) if fv == int(fv) else s
-        except (ValueError, TypeError):
-            return s
+        # sanitize_sku يتعامل مع الرابط والرقم والنص
+        return _sanitize_sku(s)
+
+    # إذا لم يُوجد حقل SKU → حاول الاشتقاق من رابط المنتج
+    for url_k in ("رابط_المنافس", "رابط المنتج", "product_url", "url"):
+        u = str(r.get(url_k) or "").strip()
+        if u.startswith("http"):
+            return _sanitize_sku(u)
+
     return ""
 
 
@@ -438,34 +447,20 @@ def export_to_salla_shamel(
         else:
             brand_out = _best_brand_from_csv(brand) if brand else ""
 
-        # ── الوصف ────────────────────────────────────────────────────────
-        seo: dict = {}
+        # ── الوصف — HTML نقي (لا Markdown) ──────────────────────────────
         if generate_descriptions:
             try:
-                from engines.ai_engine import generate_mahwous_description
-                extra = f"الحجم: {r.get('الحجم', '')} | النوع: {ptype} | الجنس: {gender}"
-                res = generate_mahwous_description(
-                    pname, list_price,
-                    fragrantica_data=None,
-                    extra_info=extra,
-                    return_seo=True,
-                )
-                if isinstance(res, dict):
-                    desc_text = res.get("body") or ""
-                    seo = res.get("seo") or {}
-                else:
-                    desc_text = str(res)
+                from engines.ai_engine import generate_salla_html_description
+                raw_scraped = str(r.get("raw_description", "") or "").strip()
+                desc_text = generate_salla_html_description(pname, raw_scraped)
             except Exception as _e:
-                _logger.warning("generate_descriptions فشل للمنتج '%s': %s", pname, _e)
+                _logger.warning("generate_salla_html_description فشل للمنتج '%s': %s", pname, _e)
                 desc_text = _placeholder_description(pname, brand_out)
         else:
             desc_text = _placeholder_description(pname, brand_out)
 
-        alt_txt = (seo.get("alt_text") or "").strip() or f"زجاجة عطر {pname} الأصلية"
-        promo   = (seo.get("page_title") or "").strip() or f"{pname} — {brand_out}".strip(" —")
-        meta    = (seo.get("meta_description") or "").strip()
-        if meta and meta not in desc_text:
-            desc_text = f"{desc_text}\n\n---\n{meta}"
+        alt_txt = f"زجاجة عطر {pname} الأصلية"
+        promo   = f"{pname} — {brand_out}".strip(" —")
 
         # ── بناء الصف بالترتيب الحرفي للأعمدة ────────────────────────────
         row_map = {
@@ -489,7 +484,7 @@ def export_to_salla_shamel(
             "الوزن":                         w_val,
             "وحدة الوزن":                    w_unit,
             "الماركة":                       brand_out,
-            "العنوان الترويجي":              promo[:500],
+            "العنوان الترويجي":              promo[:250],
             "تثبيت المنتج":                  "",
             "الباركود":                      str(r.get("الباركود") or r.get("Barcode") or "").strip(),
             "السعرات الحرارية":              "",

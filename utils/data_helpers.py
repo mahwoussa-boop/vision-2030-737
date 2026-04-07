@@ -354,6 +354,269 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  جدار الحماية للمطابقة الصارمة — Strict Match Firewall
+#  يُطبَّق قبل قبول أي مطابقة من الذكاء الاصطناعي أو خوارزمية الـ fuzzy
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── الحجم (ml) ────────────────────────────────────────────────────────────────
+_SMV_SIZE_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ML|Ml|cl|fl\.?\s*oz)',
+    re.I | re.UNICODE,
+)
+_SMV_SIZE_TOLERANCE_ML: float = 10.0
+
+# ── التركيز (مُرتَّب من الأقوى إلى الأضعف — الترتيب مهم) ──────────────────
+_SMV_CONC_PATTERNS = [
+    (re.compile(
+        r'\b(?:extrait\s+de\s+parfum|extrait|اكستريه|اكسترايت|اكسترا\s+دو\s+بارفيوم)\b',
+        re.I | re.UNICODE), "EXTRAIT"),
+    (re.compile(
+        r'\beau\s+de\s+parfum\b|\be\.?d\.?p\b'
+        r'|أو\s+دو\s+بارفيوم|او\s+دو\s+بارفيوم|\bأو\s+بارفيوم\b|\bاو\s+بارفيوم\b',
+        re.I | re.UNICODE), "EDP"),
+    (re.compile(
+        r'\beau\s+de\s+toilette\b|\be\.?d\.?t\b'
+        r'|أو\s+دو\s+تواليت|او\s+دو\s+تواليت|\bتواليت\b',
+        re.I | re.UNICODE), "EDT"),
+    (re.compile(
+        r'\beau\s+de\s+cologne\b|\be\.?d\.?c\b'
+        r'|أو\s+دو\s+كولون|او\s+دو\s+كولون|\bكولون\b(?!\s+إنتنس)|\bcologne\b',
+        re.I | re.UNICODE), "EDC"),
+    (re.compile(
+        r'(?<!\bde\s)(?<!\bدو\s)\bparfum\b'
+        r'|\bبارفيوم\b(?!\s+كولون)(?!\s+او)(?!\s+أو)'
+        r'|\bبارفان\b',
+        re.I | re.UNICODE), "PARFUM"),
+    (re.compile(r'\belixir\b|اليكسير|الكسير', re.I | re.UNICODE), "ELIXIR"),
+    (re.compile(
+        r'\bbody\s*mist\b|\bbody\s*spray\b|\bbody\s*lotion\b'
+        r'|بادي\s*ميست|بادي\s*سبراي|بودي\s*ميست',
+        re.I | re.UNICODE), "BODY_MIST"),
+    (re.compile(
+        r'\bhair\s*mist\b|\bhair\s*spray\b|\bhair\s*perfume\b'
+        r'|هير\s*ميست|هير\s*سبراي',
+        re.I | re.UNICODE), "HAIR_MIST"),
+]
+
+# أزواج التركيز غير المتوافقة — أي منها = رفض فوري
+_SMV_INCOMPATIBLE: frozenset = frozenset([
+    frozenset(["EDP",      "EDT"]),
+    frozenset(["EDP",      "EDC"]),
+    frozenset(["EDP",      "PARFUM"]),
+    frozenset(["EDT",      "PARFUM"]),
+    frozenset(["EDT",      "EDC"]),
+    frozenset(["EXTRAIT",  "EDP"]),
+    frozenset(["EXTRAIT",  "EDT"]),
+    frozenset(["EXTRAIT",  "EDC"]),
+    frozenset(["EXTRAIT",  "PARFUM"]),
+    frozenset(["ELIXIR",   "EDP"]),
+    frozenset(["ELIXIR",   "EDT"]),
+    frozenset(["ELIXIR",   "PARFUM"]),
+    frozenset(["BODY_MIST","EDP"]),
+    frozenset(["BODY_MIST","EDT"]),
+    frozenset(["BODY_MIST","PARFUM"]),
+    frozenset(["BODY_MIST","EXTRAIT"]),
+    frozenset(["HAIR_MIST","EDP"]),
+    frozenset(["HAIR_MIST","EDT"]),
+    frozenset(["HAIR_MIST","PARFUM"]),
+    frozenset(["HAIR_MIST","EXTRAIT"]),
+])
+
+# ── قاعدة الكلمات المحظورة (Blacklist) ──────────────────────────────────────
+# أي كلمة من هذه في أحد الطرفين دون الآخر = رفض فوري
+# مثال: "بديل ديور سوفاج" ≠ "Dior Sauvage 100ml" → False
+# مثال: "Sauvage Tester" ≠ "Sauvage EDP 100ml"   → False
+_SMV_BLACKLIST_RE = re.compile(
+    r'\b(?:بديل|بدائل|مستوحى|مستوحاة|inspired\s+by|alternative|'
+    r'tester|تستر|تسترز|testers)\b',
+    re.I | re.UNICODE,
+)
+
+
+def sanitize_sku(url_or_string: str, prefix: str = "MSNG") -> str:
+    """
+    تنظيف وتوليد رمز SKU آمن لسلة.
+
+    القواعد:
+    ─────────────────────────────────────────────────────────────────────────
+    • إذا كانت القيمة رابط URL → استخرج الرقم الرقمي من المسار (مثل /products/10023)
+      أو أنشئ رمزاً فريداً من هاش الرابط (مثال: MSNG-A3F8).
+    • إذا كانت القيمة رقماً → أعد الرقم مباشرةً.
+    • إذا كانت القيمة نصاً صالحاً (حروف/أرقام فقط) → أبقِه كما هو.
+    • إذا كانت القيمة فارغة → أعد رمزاً فريداً (prefix + hash قصير).
+
+    أمثلة:
+        sanitize_sku("https://example.com/products/10023") → "10023"
+        sanitize_sku("https://example.com/p/abc-perfume") → "MSNG-A3B9"
+        sanitize_sku("12345")                              → "12345"
+        sanitize_sku("")                                   → "MSNG-0000"
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    import hashlib as _hashlib
+    s = str(url_or_string or "").strip()
+
+    if not s or s.lower() in ("nan", "none", "<na>", "0"):
+        # SKU فارغ → رمز عشوائي منضبط
+        return f"{prefix}-0000"
+
+    # رابط URL → استخراج الرقم أو هاش
+    if s.startswith("http://") or s.startswith("https://"):
+        # محاولة استخراج رقم صريح من المسار: /products/12345 أو ?id=12345
+        _num_m = re.search(r'(?:/|id=|product_id=|pid=)(\d{3,})', s, re.I)
+        if _num_m:
+            return _num_m.group(1)
+        # لا يوجد رقم → هاش مختصر (4 أحرف hexadecimal)
+        _h = _hashlib.md5(s.encode("utf-8")).hexdigest()[:4].upper()
+        return f"{prefix}-{_h}"
+
+    # رقم صريح
+    try:
+        fv = float(s.replace(",", ""))
+        if fv == int(fv) and fv > 0:
+            return str(int(fv))
+    except (ValueError, TypeError):
+        pass
+
+    # نص → تنظيف: احتفظ بالأحرف والأرقام والشرطات فقط
+    _clean = re.sub(r"[^\w\-]", "", s, flags=re.UNICODE).strip("-_")
+    if _clean and len(_clean) >= 2:
+        return _clean[:40]
+
+    # fallback
+    _h = _hashlib.md5(s.encode("utf-8")).hexdigest()[:4].upper()
+    return f"{prefix}-{_h}"
+
+
+def strict_match_validator(our_product_name: str, competitor_product_name: str) -> bool:
+    """
+    جدار الحماية للمطابقة الصارمة.
+    يُرجع True  إذا اجتازت المطابقة جميع القواعد.
+    يُرجع False فوراً عند أي انتهاك (قبل أي استدعاء AI).
+
+    القواعد الثلاث الصارمة:
+    ──────────────────────────────────────────────────────────────────────────
+    1. قاعدة الحجم (Volume Rule):
+       • يستخرج الحجم (مل) من كلا الاسمَين.
+       • إذا كان الحجم موجوداً في أحدهما ومفقوداً في الآخر → False (عدم تماثل).
+       • إذا كلاهما له حجم لكنهما مختلفان > 10ml → False.
+       أمثلة:
+         "ديور سوفاج 100مل" vs "Dior Sauvage 50ml"  → False  (100 ≠ 50)
+         "شانيل N°5 50مل"   vs "Chanel No5 EDP"     → False  (50 vs بلا حجم)
+         "Sauvage 100ml"    vs "Sauvage EDP 100ml"   → True   (تطابق)
+
+    2. قاعدة التركيز (Concentration Rule):
+       • يتعرف على: EDP / EDT / EDC / PARFUM / EXTRAIT / ELIXIR / BODY_MIST / HAIR_MIST
+       • إذا التركيز مختلف بين المنتجَين ضمن الأزواج غير المتوافقة → False.
+       أمثلة:
+         "سوفاج أو دو تواليت"   vs "Sauvage Parfum"     → False (EDT ≠ PARFUM)
+         "لانكوم EDP"           vs "Lancome بارفيوم"    → False (EDP ≠ PARFUM)
+         "Bleu de Chanel EDP"   vs "بلو دو شانيل EDP"  → True  (متطابق)
+         "Sauvage" (بلا تركيز) vs "Sauvage Parfum"    → True  (AI يحكم)
+
+    3. قاعدة الكلمات المحظورة (Blacklist Rule):
+       • إذا أحدهما يحتوي: بديل | مستوحى | tester | تستر | inspired by
+         والآخر لا يحتوي عليها → False.
+       • منتج أصلي لا يطابق بديلاً أو تستراً أبداً.
+       أمثلة:
+         "ديور سوفاج 100مل"   vs "بديل ديور سوفاج"  → False (blacklist)
+         "Dior Sauvage 100ml"  vs "Sauvage Tester"    → False (blacklist)
+         "Tester Sauvage EDT"  vs "Tester Sauvage EDP"→ False (EDT≠EDP → قاعدة 2)
+         "Tester A"            vs "Tester B"           → True  (كلاهما تستر — AI يحكم)
+    ──────────────────────────────────────────────────────────────────────────
+    """
+    n1 = str(our_product_name or "").strip()
+    n2 = str(competitor_product_name or "").strip()
+    if not n1 or not n2:
+        return False
+
+    # ── قاعدة 3: الكلمات المحظورة (فحص مبكر — الأسرع) ─────────────────────
+    bl1 = bool(_SMV_BLACKLIST_RE.search(n1))
+    bl2 = bool(_SMV_BLACKLIST_RE.search(n2))
+    if bl1 != bl2:
+        return False  # أحدهما بديل/تستر والآخر أصلي → رفض قاطع
+
+    # ── قاعدة 1: الحجم ──────────────────────────────────────────────────────
+    m1 = _SMV_SIZE_RE.search(n1)
+    m2 = _SMV_SIZE_RE.search(n2)
+    size1 = float(m1.group(1)) if m1 else None
+    size2 = float(m2.group(1)) if m2 else None
+
+    # عدم تماثل: أحدهما له حجم والآخر لا → رفض
+    if (size1 is None) != (size2 is None):
+        return False
+
+    # كلاهما به حجم → تحقق من الفارق
+    if size1 is not None and size2 is not None:
+        if abs(size1 - size2) > _SMV_SIZE_TOLERANCE_ML:
+            return False
+
+    # ── قاعدة 2: التركيز ────────────────────────────────────────────────────
+    conc1 = conc2 = None
+    for pattern, label in _SMV_CONC_PATTERNS:
+        if conc1 is None and pattern.search(n1):
+            conc1 = label
+        if conc2 is None and pattern.search(n2):
+            conc2 = label
+        if conc1 and conc2:
+            break
+
+    if conc1 and conc2 and conc1 != conc2:
+        if frozenset([conc1, conc2]) in _SMV_INCOMPATIBLE:
+            return False
+
+    return True
+
+
+def strict_match_rejection_reason(our_product_name: str, competitor_product_name: str) -> str:
+    """
+    يُعيد سبب رفض المطابقة كنص قابل للعرض.
+    يُعيد "" إذا اجتازت المطابقة جميع القواعد.
+    """
+    n1 = str(our_product_name or "").strip()
+    n2 = str(competitor_product_name or "").strip()
+    if not n1 or not n2:
+        return "اسم منتج فارغ"
+
+    bl1 = bool(_SMV_BLACKLIST_RE.search(n1))
+    bl2 = bool(_SMV_BLACKLIST_RE.search(n2))
+    if bl1 != bl2:
+        tag = "بديل/مستوحى" if (bl1 or bl2) else "تستر"
+        return f"[Blacklist] أحد المنتجين يحتوي على كلمة محظورة ({tag}) والآخر لا — لا يجوز المطابقة"
+
+    m1 = _SMV_SIZE_RE.search(n1)
+    m2 = _SMV_SIZE_RE.search(n2)
+    size1 = float(m1.group(1)) if m1 else None
+    size2 = float(m2.group(1)) if m2 else None
+
+    if (size1 is None) != (size2 is None):
+        has = f"{size1 or size2:.0f}ml"
+        return f"[Volume Asymmetry] حجم موجود ({has}) في أحدهما ومفقود في الآخر — مطابقة 0%"
+
+    if size1 is not None and size2 is not None:
+        diff = abs(size1 - size2)
+        if diff > _SMV_SIZE_TOLERANCE_ML:
+            return (
+                f"[Volume Mismatch] {size1:.0f}ml ≠ {size2:.0f}ml "
+                f"(فارق {diff:.0f}ml > {_SMV_SIZE_TOLERANCE_ML:.0f}ml) — مطابقة 0%"
+            )
+
+    conc1 = conc2 = None
+    for pattern, label in _SMV_CONC_PATTERNS:
+        if conc1 is None and pattern.search(n1):
+            conc1 = label
+        if conc2 is None and pattern.search(n2):
+            conc2 = label
+        if conc1 and conc2:
+            break
+
+    if conc1 and conc2 and conc1 != conc2:
+        if frozenset([conc1, conc2]) in _SMV_INCOMPATIBLE:
+            return f"[Concentration Mismatch] {conc1} ≠ {conc2} — مطابقة مستحيلة"
+
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  طبقة مطابقة سلة — Salla Validation Layer
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -502,7 +765,7 @@ def validate_salla_brands(
     def _get_valid_brand(brand_name) -> str:
         bname = str(brand_name or "").strip()
         if not bname or bname.lower() in ("nan", "none", ""):
-            return ""
+            return "غير محدد"          # ← Hard Rule: لا قيمة فارغة أبداً
         if not valid_brands:
             return bname
         # مطابقة مباشرة (حساسة للحالة)

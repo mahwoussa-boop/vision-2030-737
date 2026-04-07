@@ -210,10 +210,11 @@ def send_single_product(product: Dict) -> Dict:
         }
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
+    # Salla UpdateProduct يتوقع price كـ uinteger
     _prod = {
         "product_id":  product_id,
         "name":        name,
-        "price":       float(price),
+        "price":       int(round(price)),
         "section":     product.get("section", "update"),
         "comp_name":   product.get("comp_name", ""),
         "competitor":  product.get("competitor", ""),
@@ -294,7 +295,7 @@ def send_price_updates(products: List[Dict]) -> Dict:
         valid_products.append({
             "product_id":  product_id,
             "name":        name,
-            "price":       float(price),
+            "price":       int(round(price)),
             "section":     p.get("section", "update"),
             "comp_name":   p.get("comp_name", ""),
             "competitor":  p.get("competitor", ""),
@@ -349,14 +350,15 @@ def send_new_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
+        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      float(price),
+            "سعر المنتج":      int(round(float(price))) if price else 0,
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
-            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
-            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
+            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
+            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
+            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         # حقل صورة اختياري
@@ -407,14 +409,15 @@ def send_missing_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
+        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      float(price),
+            "سعر المنتج":      int(round(float(price))) if price else 0,
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
-            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
-            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
+            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
+            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
+            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         if p.get("image_url"):
@@ -538,7 +541,7 @@ def verify_webhook_connection() -> Dict:
         "products": [{
             "product_id": "test-001",
             "name":       "اختبار الاتصال",
-            "price":      1.0,
+            "price":      1,
             "section":    "test",
         }]
     }
@@ -549,12 +552,12 @@ def verify_webhook_connection() -> Dict:
         "data": [{
             "product_id":     "",
             "أسم المنتج":     "اختبار الاتصال",
-            "سعر المنتج":     1.0,
-            "رمز المنتج sku": "",
+            "سعر المنتج":     1,
+            "رمز المنتج sku": "TEST-SKU-001",
             "الوزن":          1,
             "سعر التكلفة":    0,
             "السعر المخفض":   0,
-            "الوصف":          "test",
+            "الوصف":          "اختبار تلقائي من نظام مهووس للتحقق من الاتصال",
         }]
     }
     r2 = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, test_new_payload)
