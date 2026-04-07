@@ -137,14 +137,14 @@ if "health_check_done" not in st.session_state:
             "ok": True, "warnings": [], "errors": [], "details": {}
         }
 
-# ── تشغيل خيط المجدول التلقائي (مرة واحدة عند أول تشغيل للبيئة) ─────────
-if "scheduler_started" not in st.session_state:
-    try:
-        from scrapers.scheduler import start_scheduler_thread
-        start_scheduler_thread()
-        st.session_state["scheduler_started"] = True
-    except Exception:
-        st.session_state["scheduler_started"] = False
+# ── تشغيل خيط المجدول التلقائي (مرة واحدة على مستوى العملية — لا كل جلسة) ──
+# start_scheduler_thread آمن للاستدعاء المتعدد: يفحص is_alive() داخلياً
+# ويُشغّل الخيط مرة واحدة فقط بغض النظر عن عدد جلسات المستخدمين
+try:
+    from scrapers.scheduler import start_scheduler_thread
+    start_scheduler_thread()
+except Exception:
+    pass
 
 # أخطاء حرجة فقط تُعرض عالمياً (مثل DB تالفة) — التحذيرات تُعرض في الشريط الجانبي
 _hs = st.session_state.get("health_status", {})
