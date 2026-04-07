@@ -160,21 +160,28 @@ def _check_gemini_api(rep: DiagnosticReport) -> None:
     if providers:
         rep.pass_("ai_providers", f"مزودو AI: {' · '.join(providers)}")
     else:
-        # تحذير خفيف فقط — التطبيق يعمل للمطابقة بدون AI
-        rep.pass_("ai_providers",
-                  "لم يُعثر على مفاتيح AI — المطابقة تعمل بدون AI، أضف المفاتيح للتحليل الذكي")
+        rep.warn(
+            "لم يُعثر على مفاتيح AI — ميزات التحليل الذكي معطّلة. "
+            "أضف GEMINI_API_KEY أو OPENROUTER_API_KEY في إعدادات البيئة.",
+            "ai_providers",
+        )
 
 
 def _check_database(rep: DiagnosticReport) -> None:
-    """قاعدة البيانات SQLite قابلة للاتصال."""
+    """قاعدة البيانات SQLite قابلة للاتصال والكتابة."""
     try:
-        from utils.db_manager import get_db
+        from utils.db_manager import get_db, DB_PATH
         conn = get_db()
         conn.execute("SELECT 1").fetchone()
+        # فحص الكتابة الفعلية (لا القراءة فقط)
+        conn.execute("CREATE TABLE IF NOT EXISTS _health_ping (ts TEXT)")
+        conn.execute("INSERT INTO _health_ping VALUES (?)", (str(time.time()),))
+        conn.execute("DELETE FROM _health_ping WHERE 1=1")
+        conn.commit()
         conn.close()
-        rep.pass_("database", "قاعدة البيانات SQLite سليمة")
+        rep.pass_("database", f"قاعدة البيانات SQLite سليمة — {DB_PATH}")
     except Exception as exc:
-        rep.warn(f"تحذير قاعدة البيانات: {exc}", "database")
+        rep.fail(f"قاعدة البيانات غير متاحة أو للقراءة فقط: {exc}", "database")
 
 
 def run_system_diagnostics() -> DiagnosticReport:

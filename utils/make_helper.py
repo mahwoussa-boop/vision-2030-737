@@ -22,17 +22,10 @@ from typing import List, Dict, Any, Optional
 
 
 # ── Webhook URLs ───────────────────────────────────────────────────────────
-def _get_webhook_url(key: str, default: str) -> str:
-    return os.environ.get(key, "") or default
-
-WEBHOOK_UPDATE_PRICES = _get_webhook_url(
-    "WEBHOOK_UPDATE_PRICES",
-    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
-)
-WEBHOOK_NEW_PRODUCTS = _get_webhook_url(
-    "WEBHOOK_NEW_PRODUCTS",
-    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
-)
+# يجب ضبط هذه المتغيرات في بيئة التشغيل (Railway / .env).
+# لا يوجد fallback إنتاجي هنا — أي إرسال بدون URL سيُعيد خطأ صريحاً.
+WEBHOOK_UPDATE_PRICES = os.environ.get("WEBHOOK_UPDATE_PRICES", "").strip()
+WEBHOOK_NEW_PRODUCTS  = os.environ.get("WEBHOOK_NEW_PRODUCTS",  "").strip()
 
 TIMEOUT = 15  # ثانية
 
@@ -139,11 +132,15 @@ def export_to_make_format(df, section_type: str = "update") -> List[Dict]:
         )
 
         if section_type == "raise":
-            # سعرنا أعلى → نُخفّض لسعر المنافس مطروحاً ريال
-            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            # قسم "سعر أعلى": سعرنا أعلى من المنافس → نُخفّض إلى comp_price - 1
+            # الشرط: يجب أن يكون لدينا سعر أصلي وأن الهدف فعلاً أقل منه
+            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            price = _target if (our_price > 0 and _target < our_price) else our_price
         elif section_type == "lower":
-            # سعرنا أقل → نرفع لسعر المنافس مطروحاً ريال (نبقى أقل بريال)
-            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            # قسم "سعر أقل": سعرنا أقل من المنافس → نرفع إلى comp_price - 1 (نزيد الهامش)
+            # الشرط: يجب أن يكون الهدف فعلاً أعلى من سعرنا الحالي
+            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            price = _target if (our_price > 0 and _target > our_price) else our_price
         elif section_type in ("approved", "update"):
             price = our_price
         else:

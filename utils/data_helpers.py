@@ -298,7 +298,7 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
         return pd.Series([""] * n, index=salla_input.index)
 
     # 1) بيانات أساسية إجبارية (بعناوين سلة الحرفية)
-    salla_df["النوع "] = ["منتج"] * n
+    salla_df["النوع"] = ["منتج"] * n
     salla_df["أسم المنتج"] = _series_or_blank("منتج_المنافس")
     # تصنيف: يُفضَّل العمود المُطابَق "تصنيف_سلة_الدقيق" ثم فارغ (لا افتراضي أعمى)
     if "تصنيف_سلة_الدقيق" in salla_input.columns:
@@ -312,7 +312,9 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
     salla_df["صورة المنتج"] = _series_or_blank("صورة_المنافس")
     salla_df["وصف صورة المنتج"] = ""
     salla_df["نوع المنتج"] = ["منتج جاهز"] * n
-    salla_df["سعر المنتج"] = _series_or_blank("سعر_المنافس")
+    # سعر المنتج: رقم صريح — سلة ترفض النص ذا الفواصل أو رموز العملة
+    from utils.helpers import safe_float as _sf
+    salla_df["سعر المنتج"] = _series_or_blank("سعر_المنافس").map(_sf)
     salla_df["الكمية المتوفرة"] = [0] * n
     # الوصف: يُفضَّل الوصف الآلي (HTML من AI)؛ يُعاد لفارغ إذا لم يُولَّد بعد
     salla_df["الوصف"] = _series_or_blank("الوصف_الآلي")
@@ -475,7 +477,7 @@ def validate_salla_brands(
 #  ذاكرة المنافسين التراكمية — Competitor Master Catalog (Upsert Logic)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def upsert_competitors(new_comp_dfs: dict) -> pd.DataFrame:
+def upsert_competitors(new_comp_dfs: dict) -> tuple:  # (dict, int, int)
     """
     يدمج الملفات الجديدة المرفوعة مع الكتالوج المركزي المحفوظ على القرص.
 
@@ -548,8 +550,11 @@ def upsert_competitors(new_comp_dfs: dict) -> pd.DataFrame:
     # ── حفظ الكتالوج المتراكم ─────────────────────────────────────────────
     try:
         combined.to_csv(master_path, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "upsert_competitors: فشل حفظ الكتالوج المتراكم في '%s' — %s", master_path, _e
+        )
 
     # ── إرجاع dict مقسَّم حسب المتجر (لـ run_full_analysis) ──────────────
     result: dict = {}

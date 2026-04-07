@@ -14,6 +14,30 @@ from utils.data_paths import get_data_db_path
 
 _logger = logging.getLogger(__name__)
 
+# ── حد أقصى لحجم JSON المُخزَّن في DB (4 ميغابايت) ──────────────────────
+_MAX_JSON_BYTES = 4 * 1024 * 1024
+
+
+def _safe_json_dump(data, max_bytes: int = _MAX_JSON_BYTES) -> str:
+    """
+    تسلسل JSON مع حد أقصى للحجم.
+    إذا تجاوز الحد: يُزيل أولاً الحقول الثقيلة ("جميع_المنافسين")،
+    ثم يقتطع عند آخر 1000 صف.
+    """
+    full = json.dumps(data, ensure_ascii=False, default=str)
+    if len(full.encode('utf-8')) <= max_bytes:
+        return full
+    if isinstance(data, list):
+        light = [{k: v for k, v in r.items() if k != 'جميع_المنافسين'} for r in data]
+        s = json.dumps(light, ensure_ascii=False, default=str)
+        if len(s.encode('utf-8')) <= max_bytes:
+            _logger.warning("save_job_progress: results_json مقطوع الحقل الثقيل (%d صف)", len(data))
+            return s
+        trimmed = json.dumps(light[-1000:], ensure_ascii=False, default=str)
+        _logger.warning("save_job_progress: results_json مقتطع إلى آخر 1000 صف من %d", len(data))
+        return trimmed
+    return full
+
 # قاعدة SQLite الرئيسية — مسار الملف عبر get_data_db_path() (DATA_DIR على Railway)
 _DB_NAME = "pricing_v18.db"
 DB_PATH = get_data_db_path(_DB_NAME)
@@ -82,14 +106,14 @@ def init_db():
         audit_json TEXT DEFAULT '{}',
         our_file TEXT, comp_files TEXT
     )""")
-    # إضافة عمود missing_json إذا لم يكن موجوداً (للتوافق مع قواعد البيانات القديمة)
+    # إضافة أعمدة غائبة — يُتجاهل الخطأ فقط عند وجود العمود مسبقاً
     try:
         c.execute("ALTER TABLE job_progress ADD COLUMN missing_json TEXT DEFAULT '[]'")
-    except:
-        pass  # العمود موجود بالفعل
+    except sqlite3.OperationalError:
+        pass
     try:
         c.execute("ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'")
-    except:
+    except sqlite3.OperationalError:
         pass
 
     # تاريخ التحليلات
@@ -127,7 +151,8 @@ def log_event(page, event_type, details="", product_name="", action=""):
             (_ts(), page, event_type, details, product_name, action)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_event: فشل حفظ الحدث — %s", _e)
 
 
 # ─── قرارات ────────────────────────────────
@@ -144,7 +169,8 @@ def log_decision(product_name, old_status, new_status, reason="",
              competitor, old_status, new_status, reason)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_decision: فشل حفظ القرار '%s' — %s", product_name, _e)
 
 
 def get_decisions(product_name=None, status=None, limit=100):
@@ -166,7 +192,9 @@ def get_decisions(product_name=None, status=None, limit=100):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_decisions: فشل القراءة — %s", _e)
+        return []
 
 
 # ─── تاريخ الأسعار (الميزة الذكية) ──────────
@@ -180,32 +208,42 @@ def upsert_price_history(product_name, competitor, price,
     """
     conn = get_db()
     today = _date()
-
-    # آخر سعر مسجل لهذا المنتج/المنافس
-    last = conn.execute(
-        """SELECT price, date FROM price_history
-           WHERE product_name=? AND competitor=?
-           ORDER BY id DESC LIMIT 1""",
-        (product_name, competitor)
-    ).fetchone()
-
     price_changed = False
-    if last:
-        last_price = last["price"]
-        last_date  = last["date"]
-        price_changed = abs(float(price) - float(last_price)) > 0.01
+    try:
+        # BEGIN EXCLUSIVE يمنع race condition في Read-Modify-Write
+        # عند استدعاء متزامن من callbacks متعددة في Streamlit
+        conn.execute("BEGIN EXCLUSIVE")
 
-        if last_date == today:
-            # نفس اليوم → حدّث فقط
-            conn.execute(
-                """UPDATE price_history SET price=?,our_price=?,diff=?,
-                   match_score=?,decision=?,product_id=?
-                   WHERE product_name=? AND competitor=? AND date=?""",
-                (price, our_price, diff, match_score, decision,
-                 product_id, product_name, competitor, today)
-            )
+        last = conn.execute(
+            """SELECT price, date FROM price_history
+               WHERE product_name=? AND competitor=?
+               ORDER BY id DESC LIMIT 1""",
+            (product_name, competitor)
+        ).fetchone()
+
+        if last:
+            last_price = last["price"]
+            last_date  = last["date"]
+            price_changed = abs(float(price) - float(last_price)) > 0.01
+
+            if last_date == today:
+                conn.execute(
+                    """UPDATE price_history SET price=?,our_price=?,diff=?,
+                       match_score=?,decision=?,product_id=?
+                       WHERE product_name=? AND competitor=? AND date=?""",
+                    (price, our_price, diff, match_score, decision,
+                     product_id, product_name, competitor, today)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO price_history
+                       (date,product_name,competitor,price,our_price,diff,
+                        match_score,decision,product_id)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (today, product_name, competitor, price, our_price,
+                     diff, match_score, decision, product_id)
+                )
         else:
-            # يوم جديد → أضف سجل
             conn.execute(
                 """INSERT INTO price_history
                    (date,product_name,competitor,price,our_price,diff,
@@ -214,18 +252,13 @@ def upsert_price_history(product_name, competitor, price,
                 (today, product_name, competitor, price, our_price,
                  diff, match_score, decision, product_id)
             )
-    else:
-        # أول مرة
-        conn.execute(
-            """INSERT INTO price_history
-               (date,product_name,competitor,price,our_price,diff,
-                match_score,decision,product_id)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (today, product_name, competitor, price, our_price,
-             diff, match_score, decision, product_id)
-        )
-
-    conn.commit(); conn.close()
+        conn.commit()
+    except Exception as _e:
+        conn.rollback()
+        _logger.error("upsert_price_history: فشل — %s", _e)
+        raise
+    finally:
+        conn.close()
     return price_changed
 
 
@@ -247,7 +280,9 @@ def get_price_history(product_name, competitor="", limit=30):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_price_history: فشل — %s", _e)
+        return []
 
 
 def get_price_changes(days=7):
@@ -272,16 +307,18 @@ def get_price_changes(days=7):
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_price_changes: فشل — %s", _e)
+        return []
 
 
 # ─── المعالجة الخلفية ──────────────────────
 def save_job_progress(job_id, total, processed, results, status="running",
                       our_file="", comp_files="", missing=None, audit_stats=None):
     missing_data = json.dumps(missing if missing else [], ensure_ascii=False, default=str)
-    results_data = json.dumps(results, ensure_ascii=False, default=str)
-    audit_data = json.dumps(audit_stats if audit_stats is not None else {},
-                            ensure_ascii=False, default=str)
+    results_data = _safe_json_dump(results)
+    audit_data   = json.dumps(audit_stats if audit_stats is not None else {},
+                              ensure_ascii=False, default=str)
     with sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
@@ -308,13 +345,20 @@ def get_job_progress(job_id):
         if row:
             d = dict(row)
             try: d["results"] = json.loads(d.get("results_json", "[]"))
-            except: d["results"] = []
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل results_json — %s", _e)
+                d["results"] = []
             try: d["missing"] = json.loads(d.get("missing_json", "[]"))
-            except: d["missing"] = []
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل missing_json — %s", _e)
+                d["missing"] = []
             try: d["audit"] = json.loads(d.get("audit_json") or "{}")
-            except: d["audit"] = {}
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل audit_json — %s", _e)
+                d["audit"] = {}
             return d
-    except: pass
+    except Exception as _e:
+        _logger.warning("get_job_progress: فشل قراءة DB — %s", _e)
     return None
 
 
@@ -328,13 +372,20 @@ def get_last_job():
         if row:
             d = dict(row)
             try: d["results"] = json.loads(d.get("results_json", "[]"))
-            except: d["results"] = []
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل results_json — %s", _e)
+                d["results"] = []
             try: d["missing"] = json.loads(d.get("missing_json", "[]"))
-            except: d["missing"] = []
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل missing_json — %s", _e)
+                d["missing"] = []
             try: d["audit"] = json.loads(d.get("audit_json") or "{}")
-            except: d["audit"] = {}
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل audit_json — %s", _e)
+                d["audit"] = {}
             return d
-    except: pass
+    except Exception as _e:
+        _logger.warning("get_last_job: فشل قراءة DB — %s", _e)
     return None
 
 
@@ -349,7 +400,8 @@ def log_analysis(our_file, comp_file, total, matched, missing, summary=""):
             (_ts(), our_file, comp_file, total, matched, missing, summary)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_analysis: فشل حفظ سجل التحليل — %s", _e)
 
 
 def get_analysis_history(limit=20):
@@ -360,7 +412,9 @@ def get_analysis_history(limit=20):
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_analysis_history: فشل — %s", _e)
+        return []
 
 
 def get_events(page=None, limit=50):
@@ -377,7 +431,9 @@ def get_events(page=None, limit=50):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_events: فشل — %s", _e)
+        return []
 
 
 # ── دوال المنتجات المخفية الدائمة ──────────────────────
@@ -393,8 +449,9 @@ def save_hidden_product(product_key: str, product_name: str = "", action: str = 
         )
         conn.commit()
         conn.close()
-    except:
-        pass
+    except Exception as _e:
+        _logger.warning("save_hidden_product: فشل حفظ المنتج المخفي '%s' — %s", product_key, _e)
+
 
 def get_hidden_product_keys() -> set:
     """يُرجع مجموعة كل مفاتيح المنتجات المخفية من قاعدة البيانات"""
@@ -403,11 +460,9 @@ def get_hidden_product_keys() -> set:
         rows = conn.execute("SELECT product_key FROM hidden_products").fetchall()
         conn.close()
         return {r["product_key"] for r in rows}
-    except:
+    except Exception as _e:
+        _logger.warning("get_hidden_product_keys: فشل قراءة DB — %s", _e)
         return set()
-
-
-init_db()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -415,7 +470,7 @@ init_db()
 # ═══════════════════════════════════════════════════════════════
 
 def _init_competitor_price_history():
-    """يُنشئ جدول competitor_price_history إن لم يكن موجوداً — يُستدعى تلقائياً."""
+    """يُنشئ جدول competitor_price_history إن لم يكن موجوداً."""
     try:
         conn = get_db()
         conn.execute("""CREATE TABLE IF NOT EXISTS competitor_price_history (
@@ -428,10 +483,8 @@ def _init_competitor_price_history():
         )""")
         conn.commit()
         conn.close()
-    except Exception:
-        pass
-
-_init_competitor_price_history()
+    except Exception as _e:
+        _logger.error("_init_competitor_price_history: فشل إنشاء الجدول — %s", _e)
 
 
 def update_competitor_price(comp_name: str, product_id: str, current_price: float):
@@ -472,7 +525,9 @@ def update_competitor_price(comp_name: str, product_id: str, current_price: floa
         conn.close()
 
         return round(old_price, 2) if price_changed else None
-    except Exception:
+    except Exception as _e:
+        _logger.warning("update_competitor_price: فشل تحديث سعر '%s/%s' — %s",
+                        comp_name, product_id, _e)
         return None
 
 
@@ -750,8 +805,8 @@ def save_processed(product_key: str, product_name: str, competitor: str,
                  old_price, new_price, product_id, notes)
             )
             conn.commit()
-    except Exception:
-        pass  # لا يوقف الثريد الخلفي
+    except Exception as _e:
+        _logger.warning("save_processed: فشل حفظ المنتج المعالج '%s' — %s", product_key, _e)
 
 
 def get_processed(limit=200) -> list:
@@ -836,40 +891,53 @@ def migrate_db_v26():
                        VALUES ('v26.0', 'إضافة جداول الأتمتة الذكية وسجل القرارات')""")
 
         # ── 5. إضافة أعمدة جديدة للجداول الموجودة (بأمان) ──
-        # إضافة عمود cost_price لجدول our_catalog إذا لم يكن موجوداً
-        try:
-            cur.execute("ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0")
-        except Exception:
-            pass  # العمود موجود مسبقاً
+        # إضافة أعمدة جديدة — يُتجاهل الخطأ فقط عند وجود العمود مسبقاً
+        for _stmt in [
+            "ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0",
+            "ALTER TABLE processed_products ADD COLUMN auto_processed INTEGER DEFAULT 0",
+            "ALTER TABLE comp_catalog ADD COLUMN comp_product_key TEXT",
+            "ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'",
+        ]:
+            try:
+                cur.execute(_stmt)
+            except sqlite3.OperationalError:
+                pass
 
-        # إضافة عمود auto_processed لجدول processed_products
-        try:
-            cur.execute("ALTER TABLE processed_products ADD COLUMN auto_processed INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        # عمود comp_product_key قد يُضاف يدوياً بقيد NOT NULL — نضيفه فارغاً ثم نملأه إن أمكن
-        try:
-            cur.execute("ALTER TABLE comp_catalog ADD COLUMN comp_product_key TEXT")
-        except Exception:
-            pass
         try:
             cur.execute(
                 """UPDATE comp_catalog SET comp_product_key = competitor || '::' || IFNULL(norm_name, '')
                    WHERE comp_product_key IS NULL OR TRIM(comp_product_key) = ''"""
             )
-        except Exception:
-            pass
-
-        try:
-            cur.execute("ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'")
-        except Exception:
-            pass
+        except Exception as _e:
+            _logger.warning("migrate_db_v26: فشل تعبئة comp_product_key — %s", _e)
 
         conn.commit()
         conn.close()
     except Exception as e:
         _logger.error("Migration v26 error: %s", e)
         try: conn.close()
-        except: pass
+        except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  نقطة تهيئة واحدة — تُستدعى صراحةً من app.py عند الإقلاع
+# ═══════════════════════════════════════════════════════════════
+_DB_INITIALIZED = False
+
+
+def initialize_database() -> None:
+    """
+    تهيّئ قاعدة البيانات كاملةً مرة واحدة فقط لكل عملية.
+    تشمل: init_db + _init_competitor_price_history + init_db_v26 + migrate_db_v26.
+    آمنة للاستدعاء المتعدد (idempotent بواسطة العلم _DB_INITIALIZED).
+    """
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    init_db()
+    _init_competitor_price_history()
+    init_db_v26()
+    migrate_db_v26()
+    _DB_INITIALIZED = True
+    _logger.info("initialize_database: قاعدة البيانات جاهزة — %s", DB_PATH)
 
