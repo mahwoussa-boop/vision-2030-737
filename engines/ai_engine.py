@@ -12,8 +12,11 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 """
 import base64
 import hashlib
+import logging
 import requests, json, re, time, traceback
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
+
+_logger = logging.getLogger(__name__)
 
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
@@ -425,7 +428,10 @@ def _parse_json(txt):
         s = clean.find('{'); e = clean.rfind('}')+1
         if s >= 0 and e > s:
             return json.loads(clean[s:e])
-    except: pass
+    except json.JSONDecodeError as _e:
+        _logger.debug("_parse_json: JSONDecodeError — %s | نص[:200]=%s", _e, txt[:200])
+    except Exception as _e:
+        _logger.debug("_parse_json: خطأ غير متوقع — %s", _e)
     return None
 
 def _search_ddg(query, num_results=5):
@@ -798,42 +804,90 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
         return {"success":True, **data}
-    match = "true" in txt.lower() or "نعم" in txt
+    # كلمة حرفية مستقلة فقط — تجنب "this is not true" أو "untrue"
+    _tl = txt.lower()
+    match = bool(re.search(r'\btrue\b', _tl)) or "نعم" in txt
     return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
-def reclassify_review_items(items):
-    if not items: return []
+_RC_BATCH = 10   # حجم الدفعة الواحدة — يمنع timeout ويحسن دقة JSON
+
+
+def _fallback_review_items(batch: list, offset: int) -> list:
+    """يُبقي المنتجات بحالة 'تحت المراجعة' عند فشل AI — بدلاً من إسقاطها صامتاً."""
+    return [
+        {"idx": offset + i, "section": "⚠️ تحت المراجعة",
+         "confidence": 0, "match": False, "reason": "فشل AI"}
+        for i in range(len(batch))
+    ]
+
+
+def _reclassify_batch(batch: list, offset: int) -> list:
+    """
+    تصنيف دفعة واحدة (≤ _RC_BATCH منتجات).
+    offset: الرقم الأساسي للـ idx الأصلي (لتصحيح الترقيم عند دمج الدفعات).
+    """
     lines = []
-    for i, it in enumerate(items):
-        diff = it.get("our_price",0) - it.get("comp_price",0)
-        lines.append(f"[{i+1}] منتجنا: {it['our']} ({it.get('our_price',0):.0f}ر.س)"
-                     f" vs منافس: {it['comp']} ({it.get('comp_price',0):.0f}ر.س) | فرق: {diff:+.0f}ر.س")
-    prompt = f"""حلل هذه المنتجات وحدد القسم الصحيح لكل منها:
-{chr(10).join(lines)}
-«نفس المنتج» = نفس SKU (ماركة + خط + حجم مل + تركيز). اختلاف حجم أو تركيز → ليس نفس المنتج → مفقود/مراجعة.
-- سعر اعلى: نفس المنتج (SKU) + سعرنا أعلى بـ10+ ريال
-- سعر اقل: نفس المنتج (SKU) + سعرنا أقل بـ10+ ريال
-- موافق: نفس المنتج + فرق 10 ريال أو أقل
-- مفقود: ليسا نفس المنتج (مثلاً حجم/تركيز مختلف)"""
+    for i, it in enumerate(batch):
+        diff = it.get("our_price", 0) - it.get("comp_price", 0)
+        lines.append(
+            f"[{i + 1}] منتجنا: {it['our']} ({it.get('our_price', 0):.0f}ر.س)"
+            f" vs منافس: {it['comp']} ({it.get('comp_price', 0):.0f}ر.س)"
+            f" | فرق: {diff:+.0f}ر.س"
+        )
+    prompt = (
+        "حلل المنتجات التالية وأعد JSON فقط بالصيغة المطلوبة:\n"
+        + "\n".join(lines)
+        + "\n\nأعد JSON فقط — لا أي نص قبله أو بعده:\n"
+        + '{"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":"سبب"},...]} '
+        + f"(يجب أن يحتوي على {len(batch)} عنصر بالضبط)"
+    )
     sys = PAGE_PROMPTS["reclassify"]
     txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
-    if not txt: return []
+    if not txt:
+        _logger.warning("_reclassify_batch: AI لم يُرجع نصاً — %d منتج يبقى تحت المراجعة", len(batch))
+        return _fallback_review_items(batch, offset)
     data = _parse_json(txt)
-    if data and "results" in data:
-        for r in data["results"]:
-            try:
-                r["idx"] = int(r.get("idx", 0) or 0)
-            except Exception:
-                r["idx"] = 0
-            sec = r.get("section","")
-            if "اعلى" in sec or "أعلى" in sec: r["section"] = "🔴 سعر أعلى"
-            elif "اقل" in sec or "أقل" in sec:  r["section"] = "🟢 سعر أقل"
-            elif "موافق" in sec:                 r["section"] = "✅ موافق"
-            elif "مفقود" in sec:                 r["section"] = "🔵 مفقود"
-            else:                                 r["section"] = "⚠️ تحت المراجعة"
-        return data["results"]
-    return []
+    if not (data and "results" in data):
+        _logger.warning("_reclassify_batch: JSON غير صالح — %d منتج يبقى تحت المراجعة | نص[:200]=%s",
+                        len(batch), (txt or "")[:200])
+        return _fallback_review_items(batch, offset)
+    out = []
+    for r in data["results"]:
+        try:
+            local_idx = int(r.get("idx", 0) or 0)
+        except Exception:
+            local_idx = 0
+        r["idx"] = local_idx + offset      # ترقيم عالمي مرجعي للـ batch الأصلية
+        sec = r.get("section", "")
+        if "اعلى" in sec or "أعلى" in sec:
+            r["section"] = "🔴 سعر أعلى"
+        elif "اقل" in sec or "أقل" in sec:
+            r["section"] = "🟢 سعر أقل"
+        elif "موافق" in sec:
+            r["section"] = "✅ موافق"
+        elif "مفقود" in sec:
+            r["section"] = "🔍 مفقود"
+        else:
+            r["section"] = "⚠️ تحت المراجعة"
+        out.append(r)
+    return out
+
+
+def reclassify_review_items(items: list) -> list:
+    """
+    يُعيد تصنيف قائمة المنتجات (تحت المراجعة) عبر Gemini Flash.
+    يُعالج في دفعات صغيرة (_RC_BATCH) لتجنب timeout وضمان JSON سليم.
+    يُعيد قائمة نتائج مدمجة من كل الدفعات.
+    """
+    if not items:
+        return []
+    all_results: list = []
+    for start in range(0, len(items), _RC_BATCH):
+        batch = items[start: start + _RC_BATCH]
+        batch_res = _reclassify_batch(batch, offset=start)
+        all_results.extend(batch_res)
+    return all_results
 
 # ══ بحث أسعار السوق ══════════════════════════════════════════════════════
 def search_market_price(product_name, our_price=0):

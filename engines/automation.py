@@ -59,7 +59,13 @@ class PricingRule:
             if diff > min_diff:
                 new_price = comp_price - undercut
                 if cost_price > 0:
+                    # حماية مستندة إلى سعر التكلفة الفعلي
                     min_allowed = cost_price * (1 - max_loss_pct / 100)
+                    new_price = max(new_price, round(min_allowed, 2))
+                elif our_price > 0:
+                    # حماية افتراضية عند غياب سعر التكلفة:
+                    # لا تخفض أكثر من max_loss_pct% من سعرنا الحالي
+                    min_allowed = our_price * (1 - max_loss_pct / 100)
                     new_price = max(new_price, round(min_allowed, 2))
                 if new_price < 1:
                     return None

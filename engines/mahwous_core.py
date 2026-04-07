@@ -7,6 +7,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
 
+# جدول ترجمة الأرقام العربية-الهندية → ASCII
+_AR_DIGIT_TABLE = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+
 import pandas as pd
 
 try:
@@ -19,10 +22,25 @@ except ImportError:
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
+    """
+    تحويل آمن إلى float — يدعم الأرقام العربية-الهندية ورموز العملة.
+    مثال: "350 ر.س" → 350.0 | "1,500 SAR" → 1500.0 | "١٥٠٠" → 1500.0
+    """
     try:
-        if val is None or str(val).strip() in ("", "nan", "None", "NaN"):
+        if val is None or (isinstance(val, float) and val != val):
             return default
-        return float(str(val).replace(",", ""))
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        if s in ("", "nan", "None", "NaN"):
+            return default
+        # ترجمة الأرقام العربية-الهندية
+        s = s.translate(_AR_DIGIT_TABLE)
+        # إزالة رموز العملة والنصوص، الإبقاء على الأرقام والفاصلتين والناقص فقط
+        s = re.sub(r'[^\d.,-]', '', s)
+        # إزالة الفاصلة كفاصل آلاف
+        s = s.replace(',', '')
+        return float(s) if s else default
     except (ValueError, TypeError):
         return default
 

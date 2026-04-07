@@ -908,9 +908,12 @@ def _smart_rename_columns(df):
         numeric_count = 0
         for v in vs:
             try:
+                # ترجمة الأرقام العربية-الهندية + إزالة رموز العملة بكل صيغها
+                _v = v.translate(_AR_DIGIT_TABLE_ENG)
                 x = float(
-                    v.replace(",", "")
-                    .replace("ر.س", "")
+                    _v.replace(",", "")
+                    .replace("ر.س", "")   # نقطة ASCII
+                    .replace("ر٫س", "")   # فاصلة عشرية عربية U+066B
                     .replace("﷼", "")
                     .replace("SAR", "")
                     .strip()
@@ -1236,11 +1239,19 @@ def classify_product(name):
         return 'other'
     return 'retail'
 
+_AR_DIGIT_TABLE_ENG = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+# أعمدة المعرّفات — يُتجنَّب أخذها كسعر في fallback
+_PRICE_SKIP_COLS = frozenset({
+    'sku', 'معرف', 'barcode', 'باركود', 'id', 'معرف_المنتج',
+    'رقم_المنتج', 'كود', 'رمز المنتج sku', 'product_id',
+})
+
 def _price(row):
     def _clean_price(s: str) -> float:
-        """يستخرج رقم السعر من نص قد يحتوي على رموز عملة (SAR, $, ر.س, ﷼)."""
-        # البحث عن أول رقم + فواصل عشرية/آلاف داخل النص
-        m = re.search(r'\d[\d,]*(?:\.\d+)?', str(s))
+        """يستخرج رقم السعر — يدعم الأرقام العربية-الهندية ورموز العملة."""
+        # ترجمة الأرقام العربية-الهندية إلى ASCII قبل regex/float
+        s = str(s).translate(_AR_DIGIT_TABLE_ENG)
+        m = re.search(r'\d[\d,]*(?:\.\d+)?', s)
         if not m:
             return 0.0
         try:
@@ -1253,8 +1264,10 @@ def _price(row):
             v = _clean_price(str(row[c]))
             if v > 0:
                 return v
-    # احتياطي: ابحث عن أي عمود رقمي يشبه السعر
+    # احتياطي: تجاهل أعمدة المعرّفات (SKU/Barcode) التي قد تكون أرقاماً كبيرة
     for c in row.index:
+        if any(skip in str(c).lower() for skip in _PRICE_SKIP_COLS):
+            continue
         v = _clean_price(str(row[c]))
         if 1 <= v <= 99999:
             return v
@@ -1900,10 +1913,14 @@ def _ai_batch(batch):
                 if isinstance(entry, dict):
                     n = entry.get("index", 1)
                     reason = str(entry.get("reason", "")).strip()
-                else:
+                elif entry is not None:
                     # صيغة قديمة: رقم مباشر
-                    n = entry if entry is not None else 1
+                    n = entry
                     reason = ""
+                else:
+                    # دفعة مبتورة — لا نفترض تطابقاً وهمياً
+                    n = 0
+                    reason = "دفعة مبتورة"
                 try:
                     n = int(float(str(n)))
                 except Exception:
@@ -2324,7 +2341,11 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         our_price = 0.0
         if our_price_col:
             try:
-                our_price = float(str(row[our_price_col]).replace(",", ""))
+                # يدعم "1,500 ر.س" و"١٥٠٠" والأرقام العربية وجميع رموز العملة
+                _s = str(row[our_price_col]).translate(_AR_DIGIT_TABLE_ENG)
+                _m = re.search(r'\d[\d,]*(?:\.\d+)?', _s)
+                if _m:
+                    our_price = float(_m.group(0).replace(',', ''))
             except Exception:
                 pass
 
@@ -2769,8 +2790,9 @@ def _clean_comp_slug(name: str) -> str:
     return _SLUG_RE.sub(' ', name).strip()
 
 
-# ── كاش مترجم الأسماء الصامت ────────────────────────────────────────────────
+# ── كاش مترجم الأسماء الصامت — محدود الحجم لمنع تسريب الذاكرة ──────────────
 _bilingual_kw_cache: dict = {}
+_BILINGUAL_CACHE_MAX = 2_000  # 2000 إدخال ≈ ~1-2 MB — كافٍ لكل كتالوج معقول
 
 
 def _translate_to_bilingual_keywords(name: str) -> str:
@@ -2787,7 +2809,7 @@ def _translate_to_bilingual_keywords(name: str) -> str:
     if name in _bilingual_kw_cache:
         return _bilingual_kw_cache[name]
     if not (GEMINI_API_KEYS or []):
-        _bilingual_kw_cache[name] = name
+        # لا نخزّن في الكاش عند غياب API — لتجنب ملء الكاش بنتائج fallback
         return name
     prompt = (
         f"استخرج فقط اسم الماركة واسم موديل العطر من النص التالي، "
@@ -2813,11 +2835,18 @@ def _translate_to_bilingual_keywords(name: str) -> str:
                           .get("text", "")
                           .strip())
                 if result:
+                    # تحقق من الحد الأقصى قبل الإضافة (FIFO: حذف أقدم النصف)
+                    if len(_bilingual_kw_cache) >= _BILINGUAL_CACHE_MAX:
+                        _evict = list(_bilingual_kw_cache)[:_BILINGUAL_CACHE_MAX // 2]
+                        for _k in _evict:
+                            del _bilingual_kw_cache[_k]
                     _bilingual_kw_cache[name] = result
                     return result
         except Exception:
             continue
-    _bilingual_kw_cache[name] = name
+    # Fallback: خزّن النتيجة فارغة لتجنب طلبات API متكررة لنفس الاسم
+    if len(_bilingual_kw_cache) < _BILINGUAL_CACHE_MAX:
+        _bilingual_kw_cache[name] = name
     return name
 
 
@@ -2869,8 +2898,17 @@ def _last_chance_ai_batch(pending: list) -> list:
             out = []
             for i, item in enumerate(pending):
                 entry = raw[i] if i < len(raw) else {}
-                m_idx = int(entry.get("match", 0)) if isinstance(entry, dict) else 0
-                conf  = int(entry.get("confidence", 0)) if isinstance(entry, dict) else 0
+                # int(float(str(...))) يعالج: int | float | "0" | "0.0" | None
+                _raw_m = entry.get("match", 0) if isinstance(entry, dict) else 0
+                _raw_c = entry.get("confidence", 0) if isinstance(entry, dict) else 0
+                try:
+                    m_idx = int(float(str(_raw_m or 0)))
+                except (ValueError, TypeError):
+                    m_idx = 0
+                try:
+                    conf = int(float(str(_raw_c or 0)))
+                except (ValueError, TypeError):
+                    conf = 0
                 if 1 <= m_idx <= len(item["candidates"]) and conf >= 75:
                     out.append(item["candidates"][m_idx - 1])
                 else:
