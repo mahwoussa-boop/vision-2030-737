@@ -343,7 +343,9 @@ def _extract_sku(r: dict) -> str:
     """
     يستخرج SKU من الصف ويُنظّفه عبر sanitize_sku.
     يُمنع وضع روابط URL مباشرةً — يُحوَّل الرابط لرمز فريد.
+    عند غياب أي مصدر SKU يُولَّد هاش فريد من اسم المنتج + المنافس لتفادي التصادم.
     """
+    import hashlib as _hashlib
     from utils.data_helpers import sanitize_sku as _sanitize_sku
 
     for k in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku",
@@ -354,7 +356,6 @@ def _extract_sku(r: dict) -> str:
         s = str(v).strip()
         if not s or s.lower() in ("nan", "none", "<na>"):
             continue
-        # sanitize_sku يتعامل مع الرابط والرقم والنص
         return _sanitize_sku(s)
 
     # إذا لم يُوجد حقل SKU → حاول الاشتقاق من رابط المنتج
@@ -362,6 +363,18 @@ def _extract_sku(r: dict) -> str:
         u = str(r.get(url_k) or "").strip()
         if u.startswith("http"):
             return _sanitize_sku(u)
+
+    # آخر fallback: هاش فريد من اسم المنتج + اسم المنافس
+    # هذا يضمن أن كل منتج بدون SKU يحصل على رمز مختلف ولا تتصادم المنتجات
+    _name_seed = " ".join(filter(None, [
+        str(r.get("منتج_المنافس") or r.get("المنتج") or r.get("name") or ""),
+        str(r.get("المنافس") or r.get("comp") or ""),
+        str(r.get("الماركة") or ""),
+        str(r.get("الحجم") or ""),
+    ])).strip()
+    if _name_seed:
+        _h = _hashlib.md5(_name_seed.encode("utf-8")).hexdigest()[:6].upper()
+        return f"MSNG-{_h}"
 
     return ""
 
@@ -459,6 +472,21 @@ def export_to_salla_shamel(
         pname = _plain_name(r)
         if not pname:
             pname = _strip_html_visible(str(r.get("منتج_المنافس", "") or "")) or "منتج"
+
+        # ── فلتر Tester — تُصدَّر لقسم "عطور التستر" فقط عبر الزر المخصص
+        # منع تسرب التسترات للتصدير العام تلقائياً
+        _is_tester_row = bool(r.get("هو_تستر", False))
+        if not _is_tester_row:
+            _pname_l = pname.lower()
+            _is_tester_row = any(
+                kw in _pname_l for kw in ("tester", "تستر", "تسترز", "testers")
+            )
+        if _is_tester_row:
+            # إذا كان التصنيف المقرر بالفعل "عطور التستر" → نسمح بالمرور
+            _preset = str(r.get("تصنيف_سلة_الدقيق", "") or "").strip()
+            if "تستر" not in _preset.lower():
+                # تصحيح التصنيف تلقائياً لـ "عطور التستر" بدل تخطي الصف
+                r["تصنيف_سلة_الدقيق"] = "عطور التستر"
 
         # ── السعر ─────────────────────────────────────────────────────────
         comp_price = _extract_price(r)

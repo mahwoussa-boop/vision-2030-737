@@ -456,8 +456,9 @@ def sanitize_sku(url_or_string: str, prefix: str = "MSNG") -> str:
     s = str(url_or_string or "").strip()
 
     if not s or s.lower() in ("nan", "none", "<na>", "0"):
-        # SKU فارغ → رمز عشوائي منضبط
-        return f"{prefix}-0000"
+        # SKU فارغ تماماً — المستدعي يجب أن يمرر seed ذا معنى (اسم المنتج + المنافس)
+        # هذا المسار هو آخر fallback فقط عندما لا يوجد أي بيانات على الإطلاق
+        return f"{prefix}-EMPTY"
 
     # رابط URL → استخراج الرقم أو هاش
     if s.startswith("http://") or s.startswith("https://"):

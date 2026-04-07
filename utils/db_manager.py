@@ -635,8 +635,21 @@ def _comp_catalog_product_key(competitor: str, norm_name: str) -> str:
     return f"{c}::__{h}"
 
 
+_ALLOWED_TABLES = frozenset({
+    "comp_catalog", "our_catalog", "processed_products", "hidden_products",
+    "job_progress", "price_history", "decisions", "events", "analysis_history",
+    "ai_cache", "competitor_price_history", "automation_log", "automation_settings",
+    "db_version", "match_cache_v2", "media_assets", "outbox_events",
+    "pricing_decisions", "raw_scrape_staging", "scrape_hashes", "_health_ping",
+})
+
+
 def _pragma_column_names(conn, table: str):
-    """أسماء أعمدة جدول — متوافق مع sqlite3.Row (لا تعتمد على row[1] فقط)."""
+    """أسماء أعمدة جدول — متوافق مع sqlite3.Row (لا تعتمد على row[1] فقط).
+    allowlist صارمة لمنع SQL injection عبر اسم الجدول."""
+    if table not in _ALLOWED_TABLES:
+        _logger.warning("_pragma_column_names: جدول غير مسموح به '%s'", table)
+        return []
     try:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     except Exception:
