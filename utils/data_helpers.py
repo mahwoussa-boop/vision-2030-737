@@ -357,61 +357,112 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
 #  طبقة مطابقة سلة — Salla Validation Layer
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _load_categories_list(path: str) -> list:
+    """
+    يقرأ ملف التصنيفات بالترميزات المدعومة.
+    يُنظّف BOM والإقتباسات ويُرجع قائمة نصوص نظيفة.
+    """
+    for enc in ("cp1256", "utf-8-sig", "utf-8"):
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            col = df.columns[0]
+            vals = [
+                str(v).strip().strip('"').lstrip('\ufeff').strip()
+                for v in df[col].dropna().tolist()
+            ]
+            vals = [v for v in vals if v and v.lower() not in ("nan", "none", "")]
+            if vals:
+                return vals
+        except Exception:
+            continue
+    return []
+
+
+def _load_brands_list(path: str) -> list:
+    """يقرأ ملف الماركات بالترميزات المدعومة."""
+    for enc in ("cp1256", "utf-8-sig", "utf-8"):
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            col = df.columns[0]
+            vals = [
+                str(v).strip().strip('"').lstrip('\ufeff').strip()
+                for v in df[col].dropna().tolist()
+            ]
+            vals = [v for v in vals if v and v.lower() not in ("nan", "none", "")]
+            if vals:
+                return vals
+        except Exception:
+            continue
+    return []
+
+
 def map_salla_categories(
     missing_df: pd.DataFrame,
     categories_csv_path: str = "",
 ) -> pd.DataFrame:
     """
-    يقرأ ملف التصنيفات المعتمد ويعيّن مسار التصنيف الدقيق في سلة
-    بناءً على عمودَي (النوع) و (الجنس) في كل صف.
-
-    يُضيف عمود "تصنيف_سلة_الدقيق" إلى DataFrame.
+    يُعيّن مسار التصنيف الدقيق في سلة بناءً على (النوع) و(الجنس) لكل صف.
+    يُضيف عمود "تصنيف_سلة_الدقيق".
+    القيمة لا تكون أبداً None — يُستخدم "العطور" كقيمة احتياطية.
     """
     if missing_df is None or missing_df.empty:
         return missing_df
 
-    # ── تحديد مسار ملف التصنيفات ─────────────────────────────────────────────
+    from utils.data_paths import get_catalog_data_path
     if not categories_csv_path:
-        from utils.data_paths import get_catalog_data_path
-        categories_csv_path = get_catalog_data_path("تصنيفات مهووس.csv")
-        if not __import__("os").path.exists(categories_csv_path):
-            categories_csv_path = get_catalog_data_path("categories.csv")
+        for fname in ("تصنيفات مهووس.csv", "categories.csv"):
+            p = get_catalog_data_path(fname)
+            if os.path.exists(p):
+                categories_csv_path = p
+                break
 
-    valid_categories: list = []
-    try:
-        cat_df  = pd.read_csv(categories_csv_path, encoding="utf-8-sig")
-        cat_col = "التصنيفات" if "التصنيفات" in cat_df.columns else cat_df.columns[0]
-        valid_categories = cat_df[cat_col].dropna().astype(str).tolist()
-    except Exception:
-        pass
+    valid_categories: list = (
+        _load_categories_list(categories_csv_path) if categories_csv_path else []
+    )
 
-    # خريطة بحث ثابتة: (gender, type) → كلمة بحث بالعربية
+    # خريطة حتمية: (gender_kw, type_kw) → كلمة بحث في قائمة التصنيفات
     _SEARCH_MAP = {
-        ("رجالي",   "hair_mist"):  "عطور شعر",
-        ("نسائي",   "hair_mist"):  "عطور شعر",
-        ("للجنسين", "hair_mist"):  "عطور شعر",
-        ("",        "hair_mist"):  "عطور شعر",
-        ("رجالي",   "body_mist"):  "معطرات جسم",
-        ("نسائي",   "body_mist"):  "معطرات جسم",
-        ("",        "body_mist"):  "معطرات جسم",
+        ("رجالي",   "hair_mist"):  "عطور الشعر",
+        ("نسائي",   "hair_mist"):  "عطور الشعر",
+        ("للجنسين", "hair_mist"):  "عطور الشعر",
+        ("",        "hair_mist"):  "عطور الشعر",
+        ("رجالي",   "body_mist"):  "عطور الجسم",
+        ("نسائي",   "body_mist"):  "عطور الجسم",
+        ("",        "body_mist"):  "عطور الجسم",
+        ("رجالي",   "tester"):     "عطور التستر",
+        ("نسائي",   "tester"):     "عطور التستر",
+        ("",        "tester"):     "عطور التستر",
         ("رجالي",   ""):           "عطور رجالية",
         ("نسائي",   ""):           "عطور نسائية",
-        ("للجنسين", ""):           "عطور للجنسين",
+        ("للجنسين", ""):           "العطور",
+        ("",        ""):           "العطور",
     }
+    _FALLBACK_CAT = "العطور"
 
     def _get_best_category(row) -> str:
-        if not valid_categories:
-            return ""
         gender = str(row.get("الجنس", "") or "").strip()
         type_  = str(row.get("النوع", "") or "").strip().lower()
-        search_term = _SEARCH_MAP.get((gender, type_)) \
-            or _SEARCH_MAP.get(("", type_)) \
-            or _SEARCH_MAP.get((gender, "")) \
-            or "عطور"
+        search_term = (
+            _SEARCH_MAP.get((gender, type_))
+            or _SEARCH_MAP.get(("", type_))
+            or _SEARCH_MAP.get((gender, ""))
+            or _FALLBACK_CAT
+        )
+        if not valid_categories:
+            return search_term
+        # مطابقة مباشرة أولاً
+        for v in valid_categories:
+            if v == search_term or v.startswith(search_term):
+                return v
+        # fuzzy
         hit = rf_proc.extractOne(search_term, valid_categories, scorer=rf_fuzz.token_set_ratio)
-        if hit and hit[1] >= 60:
+        if hit and hit[1] >= 55:
             return hit[0]
-        return valid_categories[0] if valid_categories else ""
+        # fallback: أول تصنيف عام
+        for v in valid_categories:
+            if v == _FALLBACK_CAT:
+                return v
+        return valid_categories[0]
 
     out = missing_df.copy()
     out["تصنيف_سلة_الدقيق"] = out.apply(_get_best_category, axis=1)
@@ -423,31 +474,28 @@ def validate_salla_brands(
     brands_csv_path: str = "",
 ) -> tuple:
     """
-    يطابق ماركة كل منتج مع قائمة الماركات المعتمدة في سلة.
+    يُطابق ماركة كل منتج مع قائمة الماركات المعتمدة في سلة (نسخ حرفي).
 
     يُضيف عمود "الماركة_المعتمدة":
-      - إذا وُجد تطابق ≥ 85%: الاسم الحرفي من ملف سلة (نسخ حرفي).
-      - إذا لم يوجد تطابق: الاسم الأصلي يُبقى كما هو.
+      - تطابق ≥ 75%: الاسم الحرفي من ملف سلة.
+      - لا تطابق: الاسم الأصلي (لا قيمة فارغة أبداً إذا كان هناك ماركة).
 
-    يُرجع: (DataFrame_المُحدَّث, قائمة_الماركات_المفقودة)
+    يُرجع: (DataFrame_المُحدَّث, قائمة_الماركات_غير_المسجلة)
     """
     if missing_df is None or missing_df.empty:
         return missing_df, []
 
-    # ── تحديد مسار ملف الماركات ──────────────────────────────────────────────
+    from utils.data_paths import get_catalog_data_path
     if not brands_csv_path:
-        from utils.data_paths import get_catalog_data_path
-        brands_csv_path = get_catalog_data_path("ماركات مهووس.csv")
-        if not __import__("os").path.exists(brands_csv_path):
-            brands_csv_path = get_catalog_data_path("brands.csv")
+        for fname in ("ماركات مهووس.csv", "brands.csv"):
+            p = get_catalog_data_path(fname)
+            if os.path.exists(p):
+                brands_csv_path = p
+                break
 
-    valid_brands: list = []
-    try:
-        brands_df   = pd.read_csv(brands_csv_path, encoding="utf-8-sig")
-        brand_col   = "اسم الماركة" if "اسم الماركة" in brands_df.columns else brands_df.columns[0]
-        valid_brands = brands_df[brand_col].dropna().astype(str).tolist()
-    except Exception:
-        pass
+    valid_brands: list = (
+        _load_brands_list(brands_csv_path) if brands_csv_path else []
+    )
 
     missing_brands: set = set()
 
@@ -457,18 +505,26 @@ def validate_salla_brands(
             return ""
         if not valid_brands:
             return bname
+        # مطابقة مباشرة (حساسة للحالة)
+        for v in valid_brands:
+            if bname.lower() == v.lower():
+                return v
+            # مقارنة الجزء الإنجليزي بعد |
+            parts = [p.strip() for p in v.split("|")]
+            if any(bname.lower() == p.lower() for p in parts):
+                return v
+        # fuzzy
         hit = rf_proc.extractOne(bname, valid_brands, scorer=rf_fuzz.token_set_ratio)
-        if hit and hit[1] >= 85:
-            return hit[0]  # الاسم الحرفي من ملف سلة — نسخ حرفي
-        # ماركة غير مسجلة → سجّلها لتنبيه المستخدم
+        if hit and hit[1] >= 75:
+            return hit[0]
+        # ماركة غير مسجلة — أبقِ الاسم الأصلي ولا تُرجع فارغاً
         missing_brands.add(bname)
         return bname
 
     out = missing_df.copy()
     brand_src = "الماركة" if "الماركة" in out.columns else None
     out["الماركة_المعتمدة"] = (
-        out[brand_src].apply(_get_valid_brand) if brand_src
-        else ""
+        out[brand_src].apply(_get_valid_brand) if brand_src else ""
     )
     return out, sorted(missing_brands)
 
@@ -566,3 +622,82 @@ def upsert_competitors(new_comp_dfs: dict) -> tuple:  # (dict, int, int)
         result["master_competitors.csv"] = combined
 
     return result, len(combined), deduped
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  filter_unique_competitors — مُحرّك تصفية تكرار المنافسين (Presentation Layer)
+#  يُطبَّق على مستوى العرض فقط — لا يمسّ قاعدة البيانات
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DOMAIN_FROM_URL_RE = re.compile(
+    r"https?://(?:www\.)?([a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,})",
+    re.I,
+)
+
+
+def _comp_dedup_key(comp: dict) -> str:
+    """
+    يُنتج مفتاح تجميع فريداً لكل إدخال منافس.
+    الأولوية: دومين من product_url → دومين من competitor → competitor نصاً.
+    """
+    for url_field in ("product_url", "url", "comp_url"):
+        raw_url = str(comp.get(url_field) or "").strip()
+        if raw_url.startswith("http"):
+            m = _DOMAIN_FROM_URL_RE.search(raw_url)
+            if m:
+                return m.group(1).lower().lstrip("www.")
+    # اسم المتجر/المنافس مباشرةً (مع تطبيع)
+    c = str(comp.get("competitor") or "").strip().lower()
+    c = c.replace("www.", "")
+    # إزالة امتداد .csv إن كان ملف منافس
+    c = re.sub(r"\.csv$", "", c).strip()
+    return c or "unknown"
+
+
+def filter_unique_competitors(all_comps) -> list:
+    """
+    يُزيل تكرار نفس المنافس (domain/store) في قائمة المطابقات — Presentation Layer.
+
+    القاعدة: نفس المنافس → تُحفظ المطابقة ذات أعلى score فقط.
+    في حال تساوي الـ score → تُفضَّل الأقل سعراً.
+
+    يدعم أيضاً:
+    - قوائم فارغة / None
+    - JSON string (عند تحميل DataFrame من CSV)
+
+    لا يُعدِّل قاعدة البيانات — للعرض فقط.
+    """
+    if not all_comps:
+        return []
+
+    # ── دعم السلسلة النصية (تحميل من CSV) ─────────────────────────────────
+    if isinstance(all_comps, str):
+        import json as _json
+        try:
+            all_comps = _json.loads(all_comps)
+        except (ValueError, TypeError):
+            return []
+
+    if not isinstance(all_comps, list):
+        return []
+
+    # ── بناء خريطة: dedup_key → أفضل مرشح ──────────────────────────────────
+    best: dict[str, dict] = {}
+    for comp in all_comps:
+        if not isinstance(comp, dict):
+            continue
+        key  = _comp_dedup_key(comp)
+        score = float(comp.get("score") or 0)
+        price = float(comp.get("price") or 0)
+
+        if key not in best:
+            best[key] = comp
+        else:
+            prev       = best[key]
+            prev_score = float(prev.get("score") or 0)
+            prev_price = float(prev.get("price") or 0)
+            # أعلى score ينتصر؛ عند التساوي → الأقل سعراً
+            if score > prev_score or (score == prev_score and price < prev_price):
+                best[key] = comp
+
+    return list(best.values())
