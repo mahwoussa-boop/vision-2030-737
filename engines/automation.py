@@ -18,15 +18,15 @@ import pandas as pd
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
-                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES, DB_PATH)
+                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES)
 except ImportError:
-    from utils.data_paths import get_data_db_path
-
     AUTOMATION_RULES_DEFAULT = []
     AUTO_DECISION_CONFIDENCE = 92
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
-    DB_PATH = get_data_db_path("perfume_pricing.db")
+
+# مسار DB الموحّد — دائماً من db_manager
+from utils.db_manager import DB_PATH
 
 
 # ═══════════════════════════════════════════════════════

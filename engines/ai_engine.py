@@ -18,8 +18,15 @@ from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
 _logger = logging.getLogger(__name__)
 
-_GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
-_GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
+# قائمة النماذج بالأولوية — يتدرج تلقائياً إذا كان النموذج غير متاح (404)
+_GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+_GM  = _GEMINI_MODELS[0]  # النموذج الافتراضي (للعرض في التشخيص)
+_GU_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_GU  = _GU_TEMPLATE.format(model=_GM)  # للتوافق مع الكود القديم
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
 _CO  = "https://api.cohere.ai/v1/generate"
 
@@ -281,37 +288,46 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     for i, key in enumerate(GEMINI_API_KEYS):
         if not key:
             continue
-        try:
-            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("candidates"):
-                    parts = data["candidates"][0]["content"]["parts"]
-                    return "".join(p.get("text","") for p in parts)
+        # يحاول كل نموذج بالتسلسل — يتخطى النموذج إذا كان غير متاح (404)
+        for model in _GEMINI_MODELS:
+            url = f"{_GU_TEMPLATE.format(model=model)}?key={key}"
+            try:
+                r = requests.post(url, json=payload, timeout=45)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("candidates"):
+                        parts = data["candidates"][0]["content"]["parts"]
+                        return "".join(p.get("text","") for p in parts)
+                    else:
+                        reason = data.get("promptFeedback",{}).get("blockReason","")
+                        _log_err("Gemini", f"مفتاح {i+1}/{model}: لا نتائج — {reason}")
+                    break  # نموذج يعمل لكن لا نتائج → لا فائدة من نماذج أخرى بنفس المفتاح
+                elif r.status_code == 429:
+                    _log_err("Gemini", f"مفتاح {i+1}/{model}: Rate Limit (429) — انتظار 2 ثانية")
+                    time.sleep(2)
+                    break  # نفس المفتاح محدود — انتقل للمفتاح التالي
+                elif r.status_code == 403:
+                    _log_err("Gemini", f"مفتاح {i+1}/{model}: IP محظور أو مفتاح غير مصرح (403)")
+                    break  # المفتاح معطوب — انتقل للتالي
+                elif r.status_code == 404:
+                    _log_err("Gemini", f"مفتاح {i+1}/{model}: نموذج غير متاح (404) — جرب {model}")
+                    continue  # جرب النموذج التالي في القائمة
                 else:
-                    # blocked / safety filter
-                    reason = data.get("promptFeedback",{}).get("blockReason","")
-                    _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
-            elif r.status_code == 429:
-                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
-                continue
-            elif r.status_code == 403:
-                _log_err("Gemini", f"مفتاح {i+1}: IP محظور أو مفتاح غير مصرح (403)")
-            elif r.status_code == 404:
-                _log_err("Gemini", f"مفتاح {i+1}: نموذج غير متاح {_GM} (404)")
-            else:
-                try:
-                    msg = r.json().get("error",{}).get("message","")
-                except Exception:
-                    msg = r.text[:100]
-                _log_err("Gemini", f"مفتاح {i+1}: {r.status_code} — {msg[:80]}")
-        except requests.exceptions.ConnectionError as e:
-            _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
-        except requests.exceptions.Timeout:
-            _log_err("Gemini", f"مفتاح {i+1}: Timeout (45s)")
-        except Exception as e:
-            _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
+                    try:
+                        msg = r.json().get("error",{}).get("message","")
+                    except Exception:
+                        msg = r.text[:100]
+                    _log_err("Gemini", f"مفتاح {i+1}/{model}: {r.status_code} — {msg[:80]}")
+                    break
+            except requests.exceptions.ConnectionError as e:
+                _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
+                break
+            except requests.exceptions.Timeout:
+                _log_err("Gemini", f"مفتاح {i+1}/{model}: Timeout (45s)")
+                break
+            except Exception as e:
+                _log_err("Gemini", f"مفتاح {i+1}/{model}: {str(e)[:80]}")
+                break
     return None
 
 def _call_openrouter(prompt, system=""):
