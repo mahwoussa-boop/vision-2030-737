@@ -14,7 +14,7 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
 import re, io, json, os, hashlib, sqlite3, time, gc
 from datetime import datetime
 import pandas as pd
-from utils.data_helpers import first_image_url_string, pid_from_row as _pid
+from utils.data_helpers import first_image_url_string, pid_from_row as _pid, generate_umid
 from utils.data_paths import get_data_db_path
 from utils.helpers import favicon_url_for_site, fetch_og_image_url
 from rapidfuzz import fuzz, process as rf_process
@@ -2357,7 +2357,6 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             except Exception:
                 pass
 
-        our_id  = _pid(row, our_id_col)
         our_img = _cell_clean(row, our_img_col)
         our_url = _cell_clean(row, our_url_col)
         brand   = extract_brand(product)
@@ -2368,6 +2367,11 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         gender  = extract_gender(product)
         our_n   = normalize(product)
         our_pl  = extract_product_line(product, brand)
+
+        # v26.1: استخدام UMID الذكي إذا لم يوجد معرف أصلي
+        our_id = _pid(row, our_id_col)
+        if str(our_id).startswith("AUTO-"):
+            our_id = generate_umid(display_brand, our_pl, size, ptype, gender)
 
         # ── جمع المرشحين من كل الفهارس ──
         all_cands = []
@@ -2737,13 +2741,12 @@ def find_missing_products(our_df, comp_dfs):
                 _conf_level = "green"    # مفقود مؤكد — جاهز للإرسال
             elif score < 55 and not _has_similar:
                 _conf_level = "green"    # مفقود مؤكد
-            elif _has_var and variant.get("type") == "similar":
-                _conf_level = "red"      # مشكوك فيه — محظور الإرسال
             elif _has_similar or (score >= 55 and score < 68):
                 _conf_level = "yellow"   # مفقود محتمل — يحتاج تحقق
+            elif _has_var and variant.get("type") == "similar":
+                _conf_level = "red"      # مشكوك فيه — محظور الإرسال
             else:
-                # score >= 68 → تشابه عالٍ مع منتجاتنا = مشكوك فيه
-                _conf_level = "yellow"
+                _conf_level = "green"
 
             _img_url = _extract_image_url_from_cell(row.get(img_col)) if img_col else ""
             if not _img_url:
