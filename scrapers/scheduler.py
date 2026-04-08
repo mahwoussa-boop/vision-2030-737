@@ -1,5 +1,5 @@
 """
-scrapers/scheduler.py — جدولة الكشط التلقائي v1.1
+scrapers/scheduler.py — جدولة الكشط التلقائي v1.0
 ═══════════════════════════════════════════════════
 يشغّل async_scraper.py كـ Orphan Process تلقائياً وفق الجدول المضبوط.
 
@@ -97,48 +97,30 @@ def disable_scheduler() -> None:
     logger.info("المجدول مُعطَّل")
 
 
-def trigger_now(max_products: int = 0, concurrency: int = 8, full: bool = False) -> bool:
+def trigger_now(max_products: int = 0, concurrency: int = 8) -> bool:
     """
     يُشغّل الكاشط فوراً كـ Orphan Process.
     يُحدِّث next_run في الحالة.
-    full=True → يتخطى lastmod cache ويكشط كل شيء.
     """
     if not _SCRAPER_SCRIPT.exists():
         logger.error("الكاشط غير موجود: %s", _SCRAPER_SCRIPT)
         return False
     try:
-        cmd = [
-            sys.executable, "-m", "scrapers.async_scraper",
-            "--max-products", str(max_products),
-            "--concurrency", str(concurrency),
-        ]
-        if full:
-            cmd.append("--full")
-
-        # توجيه stderr إلى ملف سجل بدلاً من DEVNULL — يُسهّل تشخيص الأخطاء
-        _log_dir = _DATA_DIR / "logs"
-        _log_dir.mkdir(parents=True, exist_ok=True)
-        _ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        _log_file = _log_dir / f"scraper_{_ts_str}.log"
-
-        with open(_log_file, "w", encoding="utf-8") as _lf:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=_lf,
-                stderr=_lf,
-                start_new_session=True,
-                cwd=str(_ROOT),
-            )
-
+        subprocess.Popen(
+            [sys.executable, str(_SCRAPER_SCRIPT),
+             "--max-products", str(max_products),
+             "--concurrency", str(concurrency)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         state = _load_state()
         state["last_run"]    = datetime.utcnow().isoformat()
         state["runs_count"]  = state.get("runs_count", 0) + 1
-        state["last_log"]    = str(_log_file)
         interval             = state.get("interval_hours", DEFAULT_INTERVAL_HOURS)
         state["next_run"]    = (datetime.utcnow() + timedelta(hours=interval)).isoformat()
         _save_state(state)
-        logger.info("الكاشط انطلق (PID=%d) — التشغيل رقم %d — السجل: %s",
-                    proc.pid, state["runs_count"], _log_file)
+        logger.info("الكاشط انطلق — التشغيل رقم %d", state["runs_count"])
         return True
     except Exception as exc:
         logger.error("فشل تشغيل الكاشط: %s", exc)

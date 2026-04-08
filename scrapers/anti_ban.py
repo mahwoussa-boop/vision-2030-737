@@ -1,53 +1,49 @@
 """
-scrapers/anti_ban.py — ترسانة ضد الحظر v2.0 (2026)
-═══════════════════════════════════════════════════════
-آليات متعددة الطبقات لتجاوز حماية المتاجر:
-  1. User-Agent ذكي — إصدارات 2026 من Chrome/Firefox/Safari/Edge
-  2. Headers تحاكي المتصفح الحقيقي (Sec-CH-UA + TLS fingerprint)
-  3. Adaptive Rate Limiting — يبطّئ تلقائياً عند 429/403
+scrapers/anti_ban.py — ترسانة ضد الحظر v1.0
+═══════════════════════════════════════════════
+آليات متعددة الطبقات لتجاوز الحماية:
+  1. User-Agent ذكي (real-browser database)
+  2. Headers تحاكي المتصفح الحقيقي
+  3. Adaptive Rate Limiting — يبطّئ تلقائياً عند 429
   4. Exponential Backoff مع Jitter
-  5. curl_cffi كـ fallback أساسي (TLS fingerprint حقيقي — أحدث من cloudscraper)
-  6. cloudscraper كـ fallback ثانوي
-  7. Per-domain throttling + cookie persistence
+  5. cloudscraper كـ fallback لـ Cloudflare
+  6. Per-domain throttling منفصل
 """
-from __future__ import annotations
-
 import asyncio
 import logging
 import random
 import time
 from collections import defaultdict
 from typing import Optional
-from urllib.parse import urlparse
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════
-#  1. User-Agents — قاعدة بيانات حقيقية من متصفحات 2026
+#  1. User-Agents — قاعدة بيانات حقيقية من متصفحات 2024-2025
 # ══════════════════════════════════════════════════════════════════════════
 _REAL_UA_POOL = [
-    # Chrome 134/133/132 — Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    # Chrome 134/133 — macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    # Firefox 135/134
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:134.0) Gecko/20100101 Firefox/134.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    # Safari 18
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
-    # Edge 134
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
-    # Mobile Chrome (Android 15)
-    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.99 Mobile Safari/537.36",
-    # Mobile Safari (iOS 18)
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
-    # Googlebot — يُقبل دائماً من المتاجر لأنه يُستخدم لأرشفة المنتجات
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    # Chrome Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.6; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    # Safari
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    # Mobile Chrome (Android)
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
+    # Mobile Safari (iOS)
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+    # Googlebot (يُقبَل دائماً)
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
 ]
@@ -60,64 +56,42 @@ _ACCEPT_LANGUAGES = [
 ]
 
 _ACCEPT_HEADERS = [
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 ]
 
 
 def get_browser_headers(referer: str = "") -> dict:
-    """يولّد headers تحاكي متصفحاً حقيقياً بالكامل — تتغير كل مرة."""
+    """
+    يولّد headers تحاكي متصفحاً حقيقياً بالكامل.
+    """
     ua = random.choice(_REAL_UA_POOL)
     headers = {
         "User-Agent":      ua,
         "Accept":          random.choice(_ACCEPT_HEADERS),
-        "Accept-Language":  random.choice(_ACCEPT_LANGUAGES),
-        "Accept-Encoding":  "gzip, deflate",
-        "Connection":       "keep-alive",
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest":   "document",
-        "Sec-Fetch-Mode":   "navigate",
-        "Sec-Fetch-Site":   "none" if not referer else "cross-site",
-        "Sec-Fetch-User":   "?1",
-        "Cache-Control":    "max-age=0",
-        "DNT":              "1",
+        "Sec-Fetch-Dest":  "document",
+        "Sec-Fetch-Mode":  "navigate",
+        "Sec-Fetch-Site":  "none",
+        "Sec-Fetch-User":  "?1",
+        "Cache-Control":   "max-age=0",
+        "DNT":             "1",
     }
     if referer:
         headers["Referer"] = referer
-        headers["Sec-Fetch-Site"] = "cross-site"
-    # Chrome-style sec-ch-ua
-    if "Chrome" in ua and "Edg" not in ua:
-        major = ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in ua else "134"
+    # Chrome-style sec-ch headers
+    if "Chrome" in ua:
+        major = ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in ua else "131"
         headers.update({
-            "sec-ch-ua":          f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile":   "?0" if "Mobile" not in ua else "?1",
-            "sec-ch-ua-platform": '"Windows"' if "Windows" in ua else ('"macOS"' if "Mac" in ua else '"Android"'),
-        })
-    elif "Edg" in ua:
-        major = ua.split("Edg/")[1].split(".")[0] if "Edg/" in ua else "134"
-        headers.update({
-            "sec-ch-ua":          f'"Chromium";v="{major}", "Microsoft Edge";v="{major}", "Not-A.Brand";v="99"',
+            "sec-ch-ua":          f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile":   "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform": '"Windows"' if "Windows" in ua else '"macOS"',
         })
     return headers
-
-
-def get_xml_headers() -> dict:
-    """رؤوس خاصة بطلبات Sitemap XML — تطلب XML صراحة وتحاكي Googlebot."""
-    ua = random.choice([
-        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-    ])
-    return {
-        "User-Agent": ua,
-        "Accept": "application/xml,text/xml,application/xhtml+xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -132,6 +106,7 @@ class AdaptiveRateLimiter:
     """
 
     def __init__(self):
+        # قاموس: domain → (last_delay, consecutive_ok, last_error_time)
         self._state: dict[str, dict] = defaultdict(lambda: {
             "delay":          random.uniform(0.5, 1.5),
             "consecutive_ok": 0,
@@ -140,6 +115,7 @@ class AdaptiveRateLimiter:
         })
 
     async def wait(self, domain: str) -> None:
+        """ينتظر الوقت المناسب قبل الطلب التالي لهذا الـ domain."""
         s = self._state[domain]
         now = time.monotonic()
         if s["backing_off"] and now < s["backoff_until"]:
@@ -154,13 +130,15 @@ class AdaptiveRateLimiter:
         s = self._state[domain]
         s["consecutive_ok"] += 1
         s["backing_off"] = False
-        if s["consecutive_ok"] >= 5 and s["delay"] > 0.25:
-            s["delay"] = max(0.25, s["delay"] * 0.85)
+        # تسريع تدريجي بعد 5 نجاحات متواصلة
+        if s["consecutive_ok"] >= 5 and s["delay"] > 0.3:
+            s["delay"] = max(0.3, s["delay"] * 0.85)
 
     def record_error(self, domain: str, status: int) -> None:
         s = self._state[domain]
         s["consecutive_ok"] = 0
         if status == 429:
+            # تضاعف وقت الانتظار
             backoff = min(s["delay"] * 3, 30.0) + random.uniform(2, 8)
             s["delay"] = min(s["delay"] * 2, 15.0)
             s["backing_off"] = True
@@ -175,6 +153,7 @@ class AdaptiveRateLimiter:
             s["delay"] = min(s["delay"] * 1.5, 10.0)
 
 
+# Singleton للمشاركة بين جميع coroutines
 _rate_limiter = AdaptiveRateLimiter()
 
 
@@ -193,8 +172,12 @@ async def fetch_with_retry(
     base_delay:  float = 2.0,
     referer:     str = "",
 ) -> Optional[aiohttp.ClientResponse]:
-    """يجلب URL مع إعادة محاولة + تغيير headers في كل محاولة."""
-    domain = urlparse(url).netloc
+    """
+    يجلب الـ URL مع إعادة المحاولة التلقائية + تغيير الـ headers في كل محاولة.
+    يُرجع الـ response عند النجاح أو None عند الفشل الكامل.
+    """
+    from urllib.parse import urlparse as _up
+    domain = _up(url).netloc
     rl = get_rate_limiter()
 
     for attempt in range(max_retries):
@@ -210,7 +193,7 @@ async def fetch_with_retry(
             rl.record_error(domain, resp.status)
 
             if resp.status in (404, 410):
-                return None
+                return None  # لا فائدة من إعادة المحاولة
             if resp.status in (429, 403, 500, 502, 503):
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 3)
                 logger.debug("attempt %d/%d → %d, سينتظر %.1fs",
@@ -232,35 +215,13 @@ async def fetch_with_retry(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  4. curl_cffi — TLS Fingerprint حقيقي (يتجاوز Cloudflare/Akamai)
-# ══════════════════════════════════════════════════════════════════════════
-def try_curl_cffi(url: str, timeout: int = 25) -> Optional[str]:
-    """
-    يحاول جلب الصفحة عبر curl_cffi الذي ينتحل بصمة TLS لـ Chrome الحقيقي.
-    هذا أحدث وأنجح من cloudscraper لأنه يستخدم libcurl مع impersonation.
-    """
-    try:
-        from curl_cffi import requests as cffi_requests
-        resp = cffi_requests.get(
-            url,
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        if resp.status_code == 200:
-            return resp.text
-    except ImportError:
-        logger.debug("curl_cffi غير مثبّت — تخطّى")
-    except Exception as exc:
-        logger.debug("curl_cffi %s: %s", url, exc)
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  5. cloudscraper — Fallback ثانوي لـ Cloudflare JS Challenge
+#  4. Cloudscraper fallback (مزامن — للمتاجر ذات Cloudflare)
 # ══════════════════════════════════════════════════════════════════════════
 def try_cloudscraper(url: str) -> Optional[str]:
-    """يحاول جلب الصفحة عبر cloudscraper (يتجاوز JS Challenge)."""
+    """
+    يحاول جلب الصفحة عبر cloudscraper (يتجاوز JS Challenge).
+    يُعيد HTML أو None.
+    """
     try:
         import cloudscraper
         scraper = cloudscraper.create_scraper(
@@ -270,32 +231,7 @@ def try_cloudscraper(url: str) -> Optional[str]:
         if resp.status_code == 200:
             return resp.text
     except ImportError:
-        pass
+        pass  # cloudscraper غير مثبّت — تخطّى
     except Exception as exc:
         logger.debug("cloudscraper %s: %s", url, exc)
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  6. سلسلة الـ Fallback الكاملة (مزامن — يُستدعى من executor)
-# ══════════════════════════════════════════════════════════════════════════
-def try_all_sync_fallbacks(url: str) -> Optional[str]:
-    """يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests بسيط."""
-    html = try_curl_cffi(url)
-    if html:
-        return html
-
-    html = try_cloudscraper(url)
-    if html:
-        return html
-
-    try:
-        import requests as _req
-        headers = get_browser_headers(referer=f"https://{urlparse(url).netloc}/")
-        resp = _req.get(url, headers=headers, timeout=20, allow_redirects=True, verify=False)
-        if resp.status_code == 200:
-            return resp.text
-    except Exception as exc:
-        logger.debug("requests fallback %s: %s", url, exc)
-
     return None
