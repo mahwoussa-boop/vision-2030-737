@@ -7,6 +7,9 @@ import re
 from datetime import datetime
 
 import pandas as pd
+
+import time as _time
+AUTO_ID_COUNTER = int(_time.time() * 1000) % 100_000  # seed بالوقت لتجنب التكرار عند reload
 from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
 
 # تسلسل شائع في سلة/إكسيل: ...jpg,https://...
@@ -253,20 +256,73 @@ def decision_badge(action):
     return f'<span style="font-size:.7rem;color:{c};font-weight:700">{label}</span>'
 
 
+def generate_umid(brand: str, product_line: str, size: float, ptype: str, gender: str) -> str:
+    """
+    توليد معرف منتج موحد (UMID) يعتمد على البصمة الرقمية (Hash-based ID).
+    يضمن بقاء المعرف ثابتاً حتى لو تغير اسم المنتج قليلاً، طالما بقيت الخصائص الأساسية كما هي.
+    """
+    import hashlib as _hashlib
+    
+    # 1. تنظيف وتوحيد المدخلات
+    def _clean(s): return str(s or "").strip().lower()
+    
+    b  = _clean(brand)
+    pl = _clean(product_line)
+    sz = str(float(size or 0))
+    pt = _clean(ptype)
+    gd = _clean(gender)
+    
+    # 2. بناء سلسلة المفتاح الفريد
+    # الترتيب: ماركة | خط_منتج | حجم | نوع | جنس
+    key_string = f"{b}|{pl}|{sz}|{pt}|{gd}"
+    
+    # 3. توليد الهاش (MD5 سريع وكافٍ هنا)
+    h = _hashlib.md5(key_string.encode("utf-8")).hexdigest().upper()
+    
+    # 4. تنسيق المعرف النهائي (UMID-8chars)
+    return f"UMID-{h[:8]}"
+
+
 def pid_from_row(row, col):
-    """استخراج معرف المنتج من صف pandas بشكل آمن."""
-    if not col or col not in row.index:
-        return ""
-    v = row.get(col, "")
-    if v is None or str(v) in ("nan", "None", "", "NaN"):
-        return ""
-    try:
-        fv = float(v)
-        if fv == int(fv):
-            return str(int(fv))
-    except (ValueError, TypeError):
-        pass
-    return str(v).strip()
+    """
+    استخراج معرف المنتج من صف pandas بشكل آمن.
+    v26.1: إذا لم يوجد معرف (SKU)، يتم توليد UMID ذكي بدلاً من AUTO-N العشوائي.
+    """
+    val = ""
+    if col and col in row.index:
+        v = row.get(col, "")
+        if v is not None and str(v).lower() not in ("nan", "none", "", "nan"):
+            try:
+                fv = float(v)
+                if fv == int(fv):
+                    val = str(int(fv))
+                else:
+                    val = str(v).strip()
+            except (ValueError, TypeError):
+                val = str(v).strip()
+    
+    if not val:
+        # محاولة توليد UMID ذكي من البيانات المتاحة في الصف
+        try:
+            # البحث عن الخصائص في الصف (أسماء أعمدة شائعة)
+            brand = row.get("الماركة", row.get("brand", ""))
+            pline = row.get("خط_المنتج", row.get("product_line", ""))
+            size  = row.get("الحجم", row.get("size", 0))
+            ptype = row.get("النوع", row.get("type", ""))
+            gender = row.get("الجنس", row.get("gender", ""))
+            
+            # إذا كانت البيانات الأساسية موجودة، نولد UMID
+            if brand or pline:
+                return generate_umid(brand, pline, size, ptype, gender)
+        except:
+            pass
+            
+        # Fallback الأخير (في حال فشل كل شيء)
+        global AUTO_ID_COUNTER
+        AUTO_ID_COUNTER += 1
+        return f"AUTO-{AUTO_ID_COUNTER}"
+        
+    return val
 
 
 def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
@@ -433,61 +489,42 @@ _SMV_BLACKLIST_RE = re.compile(
 )
 
 
-def sanitize_sku(url_or_string: str, prefix: str = "MSNG") -> str:
+def sanitize_sku(url_or_string: str, prefix: str = "MSNG", pname: str = "") -> str:
     """
     تنظيف وتوليد رمز SKU آمن لسلة.
-
-    القواعد:
-    ─────────────────────────────────────────────────────────────────────────
-    • إذا كانت القيمة رابط URL → استخرج الرقم الرقمي من المسار (مثل /products/10023)
-      أو أنشئ رمزاً فريداً من هاش الرابط (مثال: MSNG-A3F8).
-    • إذا كانت القيمة رقماً → أعد الرقم مباشرةً.
-    • إذا كانت القيمة نصاً صالحاً (حروف/أرقام فقط) → أبقِه كما هو.
-    • إذا كانت القيمة فارغة → أعد رمزاً فريداً (prefix + hash قصير).
-
-    أمثلة:
-        sanitize_sku("https://example.com/products/10023") → "10023"
-        sanitize_sku("https://example.com/p/abc-perfume") → "MSNG-A3B9"
-        sanitize_sku("12345")                              → "12345"
-        sanitize_sku("")                                   → "MSNG-0000"
-    ─────────────────────────────────────────────────────────────────────────
     """
     import hashlib as _hashlib
     s = str(url_or_string or "").strip()
 
     if not s or s.lower() in ("nan", "none", "<na>", "0"):
-        # SKU فارغ تماماً — المستدعي يجب أن يمرر seed ذا معنى (اسم المنتج + المنافس)
-        # هذا المسار هو آخر fallback فقط عندما لا يوجد أي بيانات على الإطلاق
-        return f"{prefix}-EMPTY"
+        hash_input = (pname or "empty").encode("utf-8")
+        _h = _hashlib.md5(hash_input).hexdigest()[:6].upper()
+        return f"{prefix}-{_h}"
 
-    # رابط URL → استخراج الرقم أو هاش
     if s.startswith("http://") or s.startswith("https://"):
-        # محاولة استخراج رقم صريح من المسار: /products/12345 أو ?id=12345
+        import re
         _num_m = re.search(r'(?:/|id=|product_id=|pid=)(\d{3,})', s, re.I)
         if _num_m:
             return _num_m.group(1)
-        # لا يوجد رقم → هاش مختصر (4 أحرف hexadecimal)
-        _h = _hashlib.md5(s.encode("utf-8")).hexdigest()[:4].upper()
+        hash_input = (pname or s).encode("utf-8")
+        _h = _hashlib.md5(hash_input).hexdigest()[:6].upper()
         return f"{prefix}-{_h}"
 
-    # رقم صريح
     try:
-        fv = float(s.replace(",", ""))
-        if fv == int(fv) and fv > 0:
-            return str(int(fv))
-    except (ValueError, TypeError):
+        sn = s.replace(",", "")
+        if sn.isdigit() and int(sn) > 0:
+            return str(int(sn))
+    except:
         pass
 
-    # نص → تنظيف: احتفظ بالأحرف والأرقام والشرطات فقط
+    import re
     _clean = re.sub(r"[^\w\-]", "", s, flags=re.UNICODE).strip("-_")
     if _clean and len(_clean) >= 2:
         return _clean[:40]
 
-    # fallback
-    _h = _hashlib.md5(s.encode("utf-8")).hexdigest()[:4].upper()
+    hash_input = (pname or s).encode("utf-8")
+    _h = _hashlib.md5(hash_input).hexdigest()[:6].upper()
     return f"{prefix}-{_h}"
-
-
 def strict_match_validator(our_product_name: str, competitor_product_name: str) -> bool:
     """
     جدار الحماية للمطابقة الصارمة.

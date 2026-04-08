@@ -339,13 +339,11 @@ def _extract_price(r: dict) -> float:
     return 0.0
 
 
-def _extract_sku(r: dict) -> str:
+def _extract_sku(r: dict, pname: str = "") -> str:
     """
     يستخرج SKU من الصف ويُنظّفه عبر sanitize_sku.
     يُمنع وضع روابط URL مباشرةً — يُحوَّل الرابط لرمز فريد.
-    عند غياب أي مصدر SKU يُولَّد هاش فريد من اسم المنتج + المنافس لتفادي التصادم.
     """
-    import hashlib as _hashlib
     from utils.data_helpers import sanitize_sku as _sanitize_sku
 
     for k in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku",
@@ -356,27 +354,18 @@ def _extract_sku(r: dict) -> str:
         s = str(v).strip()
         if not s or s.lower() in ("nan", "none", "<na>"):
             continue
-        return _sanitize_sku(s)
+        # sanitize_sku يتعامل مع الرابط والرقم والنص
+        return _sanitize_sku(s, pname=pname)
 
     # إذا لم يُوجد حقل SKU → حاول الاشتقاق من رابط المنتج
     for url_k in ("رابط_المنافس", "رابط المنتج", "product_url", "url"):
         u = str(r.get(url_k) or "").strip()
         if u.startswith("http"):
-            return _sanitize_sku(u)
+            return _sanitize_sku(u, pname=pname)
 
-    # آخر fallback: هاش فريد من اسم المنتج + اسم المنافس
-    # هذا يضمن أن كل منتج بدون SKU يحصل على رمز مختلف ولا تتصادم المنتجات
-    _name_seed = " ".join(filter(None, [
-        str(r.get("منتج_المنافس") or r.get("المنتج") or r.get("name") or ""),
-        str(r.get("المنافس") or r.get("comp") or ""),
-        str(r.get("الماركة") or ""),
-        str(r.get("الحجم") or ""),
-    ])).strip()
-    if _name_seed:
-        _h = _hashlib.md5(_name_seed.encode("utf-8")).hexdigest()[:6].upper()
-        return f"MSNG-{_h}"
-
-    return ""
+    # Last Resort: توليد MSNG hash من اسم المنتج — لا تُرجع فارغاً أبداً
+    # سلة ترفض أي صف بدون SKU → هذا السطر يضمن القبول 100%
+    return _sanitize_sku("", pname=pname)
 
 
 def _extract_weight(r: dict) -> tuple:
@@ -391,49 +380,6 @@ def _placeholder_description(name: str, brand: str) -> str:
         f"متوفر لدى متجر مهووس للعطور. "
         f"استخدم زر «خبير الوصف» في صفحة المفقودات لتوليد وصف تسويقي كامل."
     )
-
-
-# ── أحرف خاصة يرفضها حقل «وصف صورة المنتج» في سلة ─────────────────────────
-_ALT_SPECIAL_RE = re.compile(r"[^\w\s\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", re.UNICODE)
-
-
-def _safe_alt_text(name: str, max_len: int = 125) -> str:
-    """
-    يُنتج نص alt مقبول من سلة:
-    - يحذف الأحرف الخاصة (| ( ) ! @ # & — – … إلخ).
-    - يحتفظ بالحروف العربية والإنجليزية والأرقام والمسافات فقط.
-    - يحذف المسافات المتعددة.
-    - يقطع عند max_len.
-    """
-    s = _strip_html_visible(str(name or ""))
-    s = _ALT_SPECIAL_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:max_len].strip()
-
-
-def _safe_promo(name: str, brand: str, max_len: int = 25) -> str:
-    """
-    يُنتج العنوان الترويجي بحد أقصى 25 حرفاً (قيد سلة).
-    يُفضّل اسم المنتج المختصر على دمجه مع الماركة إذا كان الدمج يتجاوز الحد.
-    """
-    # محاولة دمج الاسم + الماركة
-    brand_clean = str(brand or "").strip()
-    if brand_clean and "|" in brand_clean:
-        # استخدم الجزء الإنجليزي من الاسم الثنائي كاختصار
-        parts = [p.strip() for p in brand_clean.split("|")]
-        brand_short = next((p for p in parts if re.search(r"[a-zA-Z]", p)), parts[0])
-    else:
-        brand_short = brand_clean
-
-    full = f"{name} {brand_short}".strip() if brand_short else name
-    if len(full) <= max_len:
-        return full
-
-    # اقطع اسم المنتج فقط عند max_len (كلمة كاملة)
-    short = name[:max_len]
-    if " " in short:
-        short = short.rsplit(" ", 1)[0]
-    return short.rstrip(".,،؛—–").strip()[:max_len]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -473,21 +419,6 @@ def export_to_salla_shamel(
         if not pname:
             pname = _strip_html_visible(str(r.get("منتج_المنافس", "") or "")) or "منتج"
 
-        # ── فلتر Tester — تُصدَّر لقسم "عطور التستر" فقط عبر الزر المخصص
-        # منع تسرب التسترات للتصدير العام تلقائياً
-        _is_tester_row = bool(r.get("هو_تستر", False))
-        if not _is_tester_row:
-            _pname_l = pname.lower()
-            _is_tester_row = any(
-                kw in _pname_l for kw in ("tester", "تستر", "تسترز", "testers")
-            )
-        if _is_tester_row:
-            # إذا كان التصنيف المقرر بالفعل "عطور التستر" → نسمح بالمرور
-            _preset = str(r.get("تصنيف_سلة_الدقيق", "") or "").strip()
-            if "تستر" not in _preset.lower():
-                # تصحيح التصنيف تلقائياً لـ "عطور التستر" بدل تخطي الصف
-                r["تصنيف_سلة_الدقيق"] = "عطور التستر"
-
         # ── السعر ─────────────────────────────────────────────────────────
         comp_price = _extract_price(r)
         list_price = comp_price if comp_price > 0 else 1.0
@@ -496,7 +427,7 @@ def export_to_salla_shamel(
         brand  = str(r.get("الماركة",  "") or "").strip()
         gender = str(r.get("الجنس",    "") or "").strip()
         ptype  = str(r.get("النوع",    "") or "").strip()
-        sku    = _extract_sku(r)
+        sku    = _extract_sku(r, pname=pname)
         w_val, w_unit = _extract_weight(r)
 
         # ── الصورة — رابط واحد نظيف ────────────────────────────────────────
@@ -511,26 +442,12 @@ def export_to_salla_shamel(
         else:
             category = _best_category_from_rules(pname, gender, ptype)
 
-        # ── الماركة — BrandManager (fuzzy + كشف الجديدة) ─────────────────
+        # ── الماركة — من ملف سلة الرسمي ──────────────────────────────────
         preset_brand = str(r.get("الماركة_المعتمدة", "") or "").strip()
         if preset_brand and preset_brand not in ("nan", "none"):
             brand_out = preset_brand
         else:
-            raw_brand_val = brand if brand else ""
-            if raw_brand_val:
-                try:
-                    from utils.brand_manager import resolve_brand
-                    brand_out, _is_new = resolve_brand(raw_brand_val, auto_generate=True)
-                    if _is_new:
-                        _logger.info(
-                            "salla_shamel_export: ماركة جديدة مكتشفة — «%s» → «%s»",
-                            raw_brand_val, brand_out,
-                        )
-                except Exception as _bm_err:
-                    _logger.warning("BrandManager fallback: %s", _bm_err)
-                    brand_out = _best_brand_from_csv(raw_brand_val)
-            else:
-                brand_out = ""
+            brand_out = _best_brand_from_csv(brand) if brand else ""
 
         # ── الوصف — HTML نقي (لا Markdown) ──────────────────────────────
         if generate_descriptions:
@@ -544,11 +461,8 @@ def export_to_salla_shamel(
         else:
             desc_text = _placeholder_description(pname, brand_out)
 
-        # وصف الصورة — نص خالٍ من الأحرف الخاصة (قيد سلة)
-        alt_txt = _safe_alt_text(f"زجاجة عطر {pname} الأصلية")
-
-        # العنوان الترويجي — حد أقصى 25 حرفاً (قيد سلة الصارم)
-        promo = _safe_promo(pname, brand_out)
+        alt_txt = f"زجاجة عطر {pname} الأصلية"
+        promo   = f"{pname} — {brand_out}".strip(" —")
 
         # ── بناء الصف بالترتيب الحرفي للأعمدة ────────────────────────────
         row_map = {
@@ -572,7 +486,7 @@ def export_to_salla_shamel(
             "الوزن":                         w_val,
             "وحدة الوزن":                    w_unit,
             "الماركة":                       brand_out,
-            "العنوان الترويجي":              promo,
+            "العنوان الترويجي":              promo[:250],
             "تثبيت المنتج":                  "",
             "الباركود":                      str(r.get("الباركود") or r.get("Barcode") or "").strip(),
             "السعرات الحرارية":              "",
@@ -598,55 +512,3 @@ def export_to_salla_shamel(
 
     # UTF-8 مع BOM
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  دوال مساعدة للواجهة — إدارة الماركات الجديدة
-# ══════════════════════════════════════════════════════════════════════════════
-
-def export_new_brands_salla_csv() -> bytes:
-    """
-    يُصدّر Brands_Salla.csv للماركات الجديدة المكتشفة في هذه الجلسة.
-    يجب رفعه على سلة *قبل* ملف المنتجات CSV.
-    """
-    from utils.brand_manager import export_new_brands_csv
-    return export_new_brands_csv()
-
-
-def get_new_brands_summary() -> dict:
-    """
-    يُعيد ملخص الماركات الجديدة للعرض في الواجهة.
-
-    Returns:
-        {"count": int, "brands": [{"name":..., "seo_url":..., "visual_prompt":...}]}
-    """
-    from utils.brand_manager import get_new_brands_list, get_visual_prompt
-    brands_data = get_new_brands_list()
-    return {
-        "count": len(brands_data),
-        "brands": [
-            {
-                "name":          bd.get("brand_name", ""),
-                "description":   bd.get("description", ""),
-                "seo_url":       bd.get("seo_url", ""),
-                "seo_title":     bd.get("seo_title", ""),
-                "visual_prompt": bd.get("logo_prompt") or get_visual_prompt(
-                    bd.get("brand_name", "")
-                ),
-            }
-            for bd in brands_data
-        ],
-    }
-
-
-def invalidate_brand_cache() -> None:
-    """
-    يُفرغ ذاكرة التخزين المؤقت للماركات — يُستدعى بعد رفع ملف brands.csv جديد.
-    يُصفّر كلاً من LRU cache الموجود ومفتاح BrandManager.
-    """
-    _load_valid_brands.cache_clear()
-    try:
-        from utils.brand_manager import reload_brands_file
-        reload_brands_file()
-    except Exception:
-        pass

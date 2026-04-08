@@ -361,10 +361,9 @@ def send_new_products(products: List[Dict]) -> Dict:
             "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
-        # صورة — فقط روابط صور مباشرة (بامتداد صورة) لا روابط بحث
-        _raw_img = str(p.get("image_url", "") or "").strip()
-        if _raw_img and any(ext in _raw_img.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
-            item["صورة المنتج"] = _raw_img
+        # حقل صورة اختياري
+        if p.get("image_url"):
+            item["صورة المنتج"] = str(p["image_url"])
 
         result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
@@ -405,7 +404,7 @@ def send_missing_products(products: List[Dict]) -> Dict:
         )
         pid   = _clean_pid(p.get("product_id", p.get("معرف_المنتج", "")))
 
-        if not name or price <= 0:
+        if not name:
             skipped += 1
             continue
 
@@ -414,17 +413,15 @@ def send_missing_products(products: List[Dict]) -> Dict:
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      int(round(float(price))),
+            "سعر المنتج":      int(round(float(price))) if price else 0,
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
             "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
             "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
             "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
-        # صورة — فقط روابط صور مباشرة (بامتداد صورة) لا روابط بحث
-        _raw_img = str(p.get("image_url", "") or "").strip()
-        if _raw_img and any(ext in _raw_img.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
-            item["صورة المنتج"] = _raw_img
+        if p.get("image_url"):
+            item["صورة المنتج"] = str(p["image_url"])
 
         result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
@@ -474,12 +471,9 @@ def send_batch_smart(products: list, batch_type: str = "update",
     fail_count = 0
     error_names = []
 
-    # تقسيم لدفعات — كل دفعة تُرسَل كوحدة واحدة
-    # عند الفشل: Retry يُعيد الدفعة كاملة (Make.com Webhook لا يدعم idempotency جزئي)
-    # لكن للتخفيف: نُقسّم الدفعة الفاشلة لمنتجات فردية عند المحاولة الثالثة
+    # تقسيم لدفعات
     for i in range(0, total, batch_size):
         batch = products[i:i + batch_size]
-        batch_sent = False
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -490,27 +484,13 @@ def send_batch_smart(products: list, batch_type: str = "update",
 
                 if result["success"]:
                     sent_count += len(batch)
-                    batch_sent = True
                     break
                 elif attempt < max_retries:
-                    time.sleep(2 * attempt)
+                    time.sleep(2 * attempt)  # backoff
                     continue
                 else:
-                    # آخر محاولة بالدفعة فشلت — حاول إرسال منتجات فردية
-                    for p in batch:
-                        for _fa in range(1, 3):
-                            try:
-                                _r = send_price_updates([p]) if batch_type == "update" else send_new_products([p])
-                                if _r["success"]:
-                                    sent_count += 1
-                                    break
-                                time.sleep(1)
-                            except Exception:
-                                time.sleep(1)
-                        else:
-                            fail_count += 1
-                            error_names.append(p.get("name", p.get("منتج_المنافس", "?"))[:30])
-                    batch_sent = True  # عولجت المنتجات فردياً
+                    fail_count += len(batch)
+                    error_names.extend([p.get("name", p.get("منتج_المنافس", "?"))[:30] for p in batch])
             except Exception:
                 if attempt >= max_retries:
                     fail_count += len(batch)
