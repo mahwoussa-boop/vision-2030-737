@@ -115,11 +115,16 @@ def any_ai_provider_configured() -> bool:
 ANY_AI_PROVIDER_CONFIGURED = any_ai_provider_configured()
 
 # ══════════════════════════════════════════════
-#  Make Webhooks — يجب ضبطهما في متغيرات البيئة (Railway / .env)
-#  لا يوجد fallback إنتاجي — أي إرسال بدون URL سيُعيد خطأ صريحاً
+#  Make Webhooks
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES")
-WEBHOOK_NEW_PRODUCTS  = _s("WEBHOOK_NEW_PRODUCTS")
+WEBHOOK_UPDATE_PRICES = (
+    _s("WEBHOOK_UPDATE_PRICES") or
+    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
+)
+WEBHOOK_NEW_PRODUCTS = (
+    _s("WEBHOOK_NEW_PRODUCTS") or
+    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+)
 
 # ══════════════════════════════════════════════
 #  ألوان
@@ -247,4 +252,4 @@ SECTIONS = [
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-# DB_PATH محذوف — استخدم db_manager.DB_PATH الموحّد (pricing_v18.db)
+DB_PATH          = get_data_db_path("perfume_pricing.db")
