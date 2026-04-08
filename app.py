@@ -323,12 +323,21 @@ def _resolve_comp_name_price_cols(comp_df: "pd.DataFrame"):
 
 def _build_cl_competitor_entries(comp_dfs: dict) -> list:
     """يبني قائمة competitor_entries للمحرك الجديد من comp_dfs."""
+    import json, time as _t
+    def _dblog(msg, data=None, hyp="H-B"):
+        try:
+            entry = {"sessionId":"bbc946","hypothesisId":hyp,"location":"app.py:_build_cl_competitor_entries","message":msg,"data":data or {},"timestamp":int(_t.time()*1000)}
+            open("debug-bbc946.log","a",encoding="utf-8").write(json.dumps(entry,ensure_ascii=False)+"\n")
+        except Exception: pass
     entries = []
     for comp_name, comp_df in comp_dfs.items():
         if comp_df is None or comp_df.empty:
+            _dblog("SKIP_EMPTY", {"name": str(comp_name)})
             continue
         name_col, price_col = _resolve_comp_name_price_cols(comp_df)
+        _dblog("COMP_COLS", {"name": str(comp_name), "cols": list(comp_df.columns)[:15], "name_col": name_col, "price_col": price_col})
         if not name_col or not price_col:
+            _dblog("SKIP_NO_COLS", {"name": str(comp_name)}, hyp="H-B")
             continue
         entries.append({
             "df":              comp_df,
@@ -337,12 +346,21 @@ def _build_cl_competitor_entries(comp_dfs: dict) -> list:
             "competitor_name": comp_name,
             "sku_col":         None,
         })
+    _dblog("TOTAL_ENTRIES", {"count": len(entries)})
     return entries
 
 
 def _prepare_our_catalog_for_cl(our_df: "pd.DataFrame") -> "pd.DataFrame":
     """يضمن أن كتالوج المتجر يحتوي على أعمدة المحرك الجديد: No. / أسم المنتج / سعر المنتج."""
+    import json, time as _t
+    def _dblog(msg, data=None, hyp="H-A"):
+        try:
+            entry = {"sessionId":"bbc946","hypothesisId":hyp,"location":"app.py:_prepare_our_catalog_for_cl","message":msg,"data":data or {},"timestamp":int(_t.time()*1000)}
+            open("debug-bbc946.log","a",encoding="utf-8").write(json.dumps(entry,ensure_ascii=False)+"\n")
+        except Exception: pass
+    _dblog("START", {"cols": list(our_df.columns)[:20], "rows": len(our_df)})
     col_map = resolve_catalog_columns(our_df)
+    _dblog("col_map", {"col_map": col_map})
     rename  = {}
     if col_map.get("id")    and col_map["id"]    not in ("No.",       ):
         rename[col_map["id"]]    = "No."
@@ -355,6 +373,12 @@ def _prepare_our_catalog_for_cl(our_df: "pd.DataFrame") -> "pd.DataFrame":
     # إذا لم يُوجد عمود "أسم المنتج" بعد — حاول أي عمود اسم
     if "أسم المنتج" not in our_df.columns and "اسم المنتج" in our_df.columns:
         our_df = our_df.rename(columns={"اسم المنتج": "أسم المنتج"})
+    # إذا لم يُوجد عمود "No." — أنشئه تسلسلياً (المحرك يتطلبه كـ PK)
+    if "No." not in our_df.columns:
+        our_df = our_df.copy()
+        our_df["No."] = [f"AUTO-{i+1}" for i in range(len(our_df))]
+        _dblog("AUTO_NO", {"msg": "No. column auto-generated"}, hyp="H-C")
+    _dblog("DONE", {"final_cols": list(our_df.columns)[:20], "has_name": "أسم المنتج" in our_df.columns, "has_price": "سعر المنتج" in our_df.columns, "has_no": "No." in our_df.columns})
     return our_df
 
 
@@ -712,6 +736,14 @@ def _render_audit_bar(audit_stats: dict):
 
 def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
     """تعمل في thread منفصل — تُشغّل المحرك الجديد وتحفظ النتائج."""
+    import json, time as _t
+    def _dblog(msg, data=None, hyp="H-E"):
+        try:
+            entry = {"sessionId":"bbc946","hypothesisId":hyp,"location":"app.py:_run_analysis_background","message":msg,"data":data or {},"timestamp":int(_t.time()*1000)}
+            open("debug-bbc946.log","a",encoding="utf-8").write(json.dumps(entry,ensure_ascii=False)+"\n")
+        except Exception: pass
+
+    _dblog("BG_THREAD_START", {"job_id": job_id, "our_rows": len(our_df), "comp_files": list(comp_dfs.keys())[:5]})
     # إجمالي منتجات المنافسين كمقياس للتقدم
     total     = sum(len(df) for df in comp_dfs.values()) or 1
     processed = 0
@@ -729,18 +761,23 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
         if not comp_entries:
             raise ValueError("❌ لم يُكتشف أي عمود صالح (اسم/سعر) في ملفات المنافسين")
 
+        _dblog("CALLING_ENGINE", {"entries": len(comp_entries), "catalog_rows": len(catalog_df)}, hyp="H-C")
         cl_result   = run_closed_loop_matching(
             catalog_df=catalog_df,
             competitor_entries=comp_entries,
         )
+        _dblog("ENGINE_DONE", {"keys": list(cl_result.keys()), "cheaper": len(cl_result.get("matched_cheaper", [])), "pricier": len(cl_result.get("matched_pricier", [])), "review": len(cl_result.get("review", [])), "missing": len(cl_result.get("missing", []))}, hyp="H-D")
         adapted     = _adapt_cl_result_to_legacy(cl_result)
         analysis_df = adapted["all"]
         missing_df  = adapted["missing"]
         audit_stats = cl_result.get("summary", {})
         processed   = total
+        _dblog("ADAPT_DONE", {"all_rows": len(analysis_df), "missing_rows": len(missing_df)})
 
     except Exception as e:
         import traceback
+        tb_str = traceback.format_exc()
+        _dblog("BG_ERROR", {"error": str(e)[:500], "traceback": tb_str[:800]}, hyp="H-E")
         traceback.print_exc()
         save_job_progress(
             job_id, total, processed,
@@ -2302,9 +2339,17 @@ if page == "📊 لوحة التحكم":
                     st.rerun()
                 else:
                     prog = st.progress(0, "⏳ جاري إعداد المحرك...")
+                    import json as _json_sync, time as _t_sync
+                    def _dblog_sync(msg, data=None, hyp="H-C"):
+                        try:
+                            entry = {"sessionId":"bbc946","hypothesisId":hyp,"location":"app.py:sync_path","message":msg,"data":data or {},"timestamp":int(_t_sync.time()*1000)}
+                            open("debug-bbc946.log","a",encoding="utf-8").write(_json_sync.dumps(entry,ensure_ascii=False)+"\n")
+                        except Exception: pass
+                    _dblog_sync("SYNC_START", {"our_rows": len(our_df) if our_df is not None else 0, "comp_count": len(comp_dfs)})
                     try:
                         catalog_df   = _prepare_our_catalog_for_cl(our_df)
                         comp_entries = _build_cl_competitor_entries(comp_dfs)
+                        _dblog_sync("AFTER_PREP", {"entries": len(comp_entries)})
                         if not comp_entries:
                             st.error("❌ لم يُكتشف أي عمود صالح (اسم/سعر) في ملفات المنافسين")
                             st.stop()
@@ -2314,12 +2359,16 @@ if page == "📊 لوحة التحكم":
                             catalog_df=catalog_df,
                             competitor_entries=comp_entries,
                         )
+                        _dblog_sync("ENGINE_OK", {"keys": list(cl_result.keys())}, hyp="H-D")
                         prog.progress(0.8, "🔀 تحويل النتائج...")
                         adapted     = _adapt_cl_result_to_legacy(cl_result)
                         df_all      = adapted["all"]
                         missing_df  = adapted["missing"]
                         audit_stats = cl_result.get("summary", {})
+                        _dblog_sync("ADAPT_OK", {"all_rows": len(df_all), "missing_rows": len(missing_df)})
                     except Exception as _sync_err:
+                        import traceback as _tb
+                        _dblog_sync("SYNC_ERROR", {"error": str(_sync_err)[:500], "tb": _tb.format_exc()[:800]}, hyp="H-C")
                         st.error(f"❌ خطأ في المحرك: {_sync_err}")
                         st.stop()
 
