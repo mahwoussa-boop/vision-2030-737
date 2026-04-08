@@ -1,5 +1,5 @@
 """
-scrapers/async_scraper.py — محرك الكشط غير المتزامن v3.0 (2026)
+scrapers/async_scraper.py — محرك الكشط غير المتزامن v2.0 (2026)
 ══════════════════════════════════════════════════════════════════
 • يقرأ قائمة المتاجر من data/competitors_list.json
 • يحدّد Sitemap لكل متجر عبر sitemap_resolve.py
@@ -7,19 +7,11 @@ scrapers/async_scraper.py — محرك الكشط غير المتزامن v3.0 (
 • يكتب النتائج في data/competitors_latest.csv
 • يحدّث data/scraper_progress.json لحظياً (للـ Dashboard)
 • يدعم lastmod للكشط التزايدي (يكشط فقط الصفحات المحدّثة)
-• ضد الحظر: Rotating Proxies + Smart Jitter + curl_cffi + cloudscraper
-
-[v3 جديد]:
-• كشط متجرين في نفس اللحظة بالتوازي (asyncio.gather)
-• Checkpoint: يستأنف من نقطة التوقف عند الانقطاع (--resume)
-• store_concurrency: عدد المتاجر المتوازية (افتراضي: 2)
-• Retry Logic: 3 محاولات + Exponential Backoff لكل URL
+• ضد الحظر: adaptive rate limiting + curl_cffi + cloudscraper
 
 التشغيل:
   python -m scrapers.async_scraper
   python -m scrapers.async_scraper --max-products 500 --concurrency 5
-  python -m scrapers.async_scraper --resume                  # استئناف من Checkpoint
-  python -m scrapers.async_scraper --store-concurrency 2    # متجرين بالتوازي
 """
 from __future__ import annotations
 
@@ -34,7 +26,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -45,7 +37,6 @@ from scrapers.anti_ban import (
     get_rate_limiter,
     fetch_with_retry,
     try_all_sync_fallbacks,
-    get_proxy_rotator,
 )
 
 # ── مسارات ────────────────────────────────────────────────────────────────
@@ -57,21 +48,22 @@ _DATA_DIR = (
 )
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-COMPETITORS_FILE  = _DATA_DIR / "competitors_list.json"
-OUTPUT_CSV        = _DATA_DIR / "competitors_latest.csv"
-PROGRESS_FILE     = _DATA_DIR / "scraper_progress.json"
-LASTMOD_FILE      = _DATA_DIR / "scraper_lastmod_cache.json"
-CHECKPOINT_FILE   = _DATA_DIR / "scraper_checkpoint.json"   # v3: استئناف من نقطة الانقطاع
-ERROR_LOG         = _DATA_DIR / "scraper_errors.log"
+COMPETITORS_FILE = _DATA_DIR / "competitors_list.json"
+OUTPUT_CSV       = _DATA_DIR / "competitors_latest.csv"
+PROGRESS_FILE    = _DATA_DIR / "scraper_progress.json"
+LASTMOD_FILE     = _DATA_DIR / "scraper_lastmod_cache.json"
+ERROR_LOG        = _DATA_DIR / "scraper_errors.log"
 
 CSV_COLS = ["store", "name", "price", "image", "url", "brand", "sku", "scraped_at"]
 
 # ── إعداد logging ─────────────────────────────────────────────────────────
 def _setup_logging() -> None:
-    """يهيئ logging مرة واحدة فقط — StreamHandler وحده."""
+    """يهيئ logging مرة واحدة فقط — StreamHandler وحده.
+    عند التشغيل كـ subprocess، يُعيد توجيه stdout إلى الملف من app.py؛
+    لا نحتاج FileHandler منفصل لتجنب التكرار."""
     root = logging.getLogger()
     if root.handlers:
-        return
+        return  # لا تضف handlers مرة ثانية
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
@@ -115,61 +107,9 @@ _PRICE_CLASS_RE = re.compile(
     re.I | re.S,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+# يمكن تجاوز سعر الصرف عبر متغير البيئة USD_TO_SAR (مثل: export USD_TO_SAR=3.80)
 import os as _os_scraper
 _USD_TO_SAR = float(_os_scraper.environ.get("USD_TO_SAR", "3.75"))
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Checkpoint — استئناف من نقطة الانقطاع (v3 جديد)
-# ══════════════════════════════════════════════════════════════════════════
-def _load_checkpoint() -> Set[str]:
-    """
-    يحمّل قائمة الـ URLs المكتملة من ملف الـ Checkpoint.
-    يتجاهل الـ checkpoint إذا كان عمره أكثر من 24 ساعة.
-    """
-    try:
-        data = json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
-        updated_at = data.get("updated_at", "2000-01-01T00:00:00")
-        age_hours = (
-            datetime.now() - datetime.fromisoformat(updated_at)
-        ).total_seconds() / 3600
-        if age_hours > 24:
-            logger.info("Checkpoint منتهي الصلاحية (%.1f ساعة) — بدء من الصفر", age_hours)
-            return set()
-        done: Set[str] = set(data.get("completed_urls", []))
-        logger.info(
-            "Checkpoint مُحمَّل: %d URL مكتمل (عمره %.1f دقيقة)",
-            len(done), age_hours * 60,
-        )
-        return done
-    except Exception:
-        return set()
-
-
-def _save_checkpoint(done_urls: Set[str]) -> None:
-    """يحفظ قائمة الـ URLs المكتملة — يُستدعى كل 100 URL."""
-    try:
-        CHECKPOINT_FILE.write_text(
-            json.dumps(
-                {
-                    "completed_urls": list(done_urls),
-                    "count": len(done_urls),
-                    "updated_at": datetime.now().isoformat(),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning("فشل حفظ Checkpoint: %s", exc)
-
-
-def _clear_checkpoint() -> None:
-    """يحذف ملف الـ Checkpoint عند الانتهاء بنجاح."""
-    try:
-        CHECKPOINT_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -212,7 +152,7 @@ def _write_merged_csv(
         writer.writeheader()
         for row in merged.values():
             writer.writerow(row)
-    tmp.replace(OUTPUT_CSV)  # atomic rename
+    tmp.replace(OUTPUT_CSV)  # atomic rename — لا يمحو الملف القديم إلا بعد نجاح الكتابة
     return len(merged)
 
 
@@ -253,14 +193,15 @@ class Progress:
             "fetch_exceptions":     0,
             "success_rate_pct":     0,
             "current_store":        "",
-            "current_stores":       [],     # v3: متاجر متوازية نشطة
             "last_error":           "",
             "output_file":          str(OUTPUT_CSV),
             "store_urls_total":     0,
             "store_urls_done":      0,
             "store_started_at":     "",
             "stores_results":       {},
+            # عدد المنتجات المحفوظة مسبقاً لكل متجر (من الكشط السابق)
             "stores_cached_counts": {},
+            # المتاجر التي فشل استخراج Sitemap لها
             "stores_sitemap_failed":[],
         }
         self._flush()
@@ -281,7 +222,6 @@ class Progress:
             "updated_at":     datetime.now().isoformat(),
             "finished_at":    datetime.now().isoformat(),
             "current_store":  "",
-            "current_stores": [],
         })
         self._flush()
 
@@ -308,24 +248,28 @@ def _parse_price(raw: Any) -> Optional[float]:
         return None
     if isinstance(raw, (int, float)):
         return float(raw) if float(raw) > 0 else None
+    # ترجمة الأرقام العربية-الهندية
     s0 = str(raw).strip().translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
     s0 = s0.replace("٬", ",").replace("،", ",")
     s = re.sub(r"[^\d.,]", "", s0)
     if not s:
         return None
+    # تحديد الفاصل العشري بناءً على موقع آخر فاصل:
+    #   "1.500,50" → comma أخيراً → decimal=',', thousands='.'
+    #   "1,500.50" → dot أخيراً  → decimal='.', thousands=','
     dot_idx   = s.rfind('.')
     comma_idx = s.rfind(',')
     if dot_idx >= 0 and comma_idx >= 0:
         if comma_idx > dot_idx:
-            s = s.replace('.', '').replace(',', '.')
+            s = s.replace('.', '').replace(',', '.')   # أوروبي
         else:
-            s = s.replace(',', '')
+            s = s.replace(',', '')                     # إنجليزي
     elif comma_idx >= 0:
         parts = s.split(',')
         if len(parts) == 2 and len(parts[-1]) == 3:
-            s = s.replace(',', '')
+            s = s.replace(',', '')    # فاصل آلاف
         else:
-            s = s.replace(',', '.')
+            s = s.replace(',', '.')   # فاصل عشري
     if not s:
         return None
     try:
@@ -362,6 +306,7 @@ def _price_to_sar(price: Optional[float], currency: str = "", raw_text: str = ""
 
 
 def _pick_price_candidate(candidates: List[tuple]) -> Optional[float]:
+    """اختر السعر مع تفضيل SAR، ثم حوّل USD→SAR عند الحاجة."""
     if not candidates:
         return None
     for p, cur, raw in candidates:
@@ -377,6 +322,7 @@ def _pick_price_candidate(candidates: List[tuple]) -> Optional[float]:
 
 
 def _extract_price_from_common_classes(html: str) -> Optional[tuple]:
+    """Fallback: ابحث في كلاسات الأسعار الشائعة (Salla/Zid وغيرها)."""
     for m in _PRICE_CLASS_RE.finditer(html or ""):
         raw = _strip_tags(m.group(1))
         p = _parse_price(raw)
@@ -386,20 +332,25 @@ def _extract_price_from_common_classes(html: str) -> Optional[tuple]:
 
 
 def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
+    """أفضل مصدر: JSON-LD schema.org/Product — يدعم @graph وقوائم وProductGroup."""
     for block in _JSON_LD_RE.findall(html):
         try:
             data = json.loads(block)
         except json.JSONDecodeError:
             continue
+
         node = _find_product_node(data)
         if node is None:
             continue
+
         name = node.get("name")
         if isinstance(name, dict):
             name = name.get("value") or name.get("text") or name.get("@value") or str(name)
         name = str(name or "").strip()
         if not name:
             continue
+
+        # سعر + عملة (تفضيل SAR ثم تحويل USD عند اللزوم)
         price_candidates: List[tuple] = []
         offers = node.get("offers") or node.get("Offers") or {}
         offers_list = offers if isinstance(offers, list) else [offers]
@@ -421,9 +372,12 @@ def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
             p = _parse_price(node.get("price"))
             if p and p > 0:
                 price_candidates.append((p, str(node.get("priceCurrency") or ""), str(node.get("price") or "")))
+
         price = _pick_price_candidate(price_candidates)
         if price is None or price <= 0:
             continue
+
+        # صورة
         img_field = node.get("image", "")
         if isinstance(img_field, list):
             image = str(img_field[0]).strip() if img_field else ""
@@ -431,6 +385,8 @@ def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
             image = str(img_field.get("url") or img_field.get("contentUrl") or "").strip()
         else:
             image = str(img_field or "").strip()
+
+        # ماركة
         brand_field = node.get("brand") or {}
         if isinstance(brand_field, dict):
             brand = str(brand_field.get("name") or brand_field.get("@value") or "").strip()
@@ -439,16 +395,20 @@ def _extract_from_jsonld(html: str, page_url: str) -> Optional[Dict[str, Any]]:
             brand = str(b0.get("name") if isinstance(b0, dict) else b0).strip()
         else:
             brand = str(brand_field or "").strip()
+
         url_out = str(node.get("url") or node.get("@id") or page_url).strip()
         sku = str(node.get("sku") or node.get("productID") or node.get("mpn") or "").strip()
+
         return {
             "name": name, "price": price, "image": image,
             "url": url_out or page_url, "brand": brand, "sku": sku,
         }
+
     return None
 
 
 def _find_product_node(obj: Any) -> Optional[dict]:
+    """أول كائن JSON-LD من نوع Product/ProductGroup (يشمل @graph وقوائم متداخلة)."""
     if isinstance(obj, list):
         for item in obj:
             found = _find_product_node(item)
@@ -477,6 +437,7 @@ def _find_product_node(obj: Any) -> Optional[dict]:
 
 
 def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
+    """Fallback: Open Graph meta tags."""
     name_m = _OG_TITLE_RE.search(html)
     price_m = _OG_PRICE_RE.search(html) or _PRICE_META_RE.search(html)
     image_m = _OG_IMAGE_RE.search(html)
@@ -498,7 +459,10 @@ def _extract_from_og(html: str, page_url: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, Any]]:
+    """Fallback أخير: JSON snippets/meta/classes للأسعار."""
     candidates: List[tuple] = []
+
+    # 1) JSON snippets: price + priceCurrency
     for pm in re.finditer(r'"price"\s*:\s*"?([\d.,]+)"?', html or "", re.I):
         raw = pm.group(1)
         around = (html or "")[max(0, pm.start() - 220): pm.end() + 220]
@@ -507,6 +471,8 @@ def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, 
         p = _parse_price(raw)
         if p and p > 0:
             candidates.append((p, cur, raw))
+
+    # 2) meta tags
     meta_price_m = _OG_PRICE_RE.search(html or "") or _PRICE_META_RE.search(html or "")
     if meta_price_m:
         cur_m = _OG_CURRENCY_RE.search(html or "") or _PRICE_META_CURRENCY_RE.search(html or "")
@@ -514,9 +480,12 @@ def _extract_from_html_patterns(html: str, page_url: str) -> Optional[Dict[str, 
         p = _parse_price(meta_price_m.group(1))
         if p and p > 0:
             candidates.append((p, cur, meta_price_m.group(1)))
+
+    # 3) common classes: .product-price / .price / .amount / .text-sm-2
     class_hit = _extract_price_from_common_classes(html or "")
     if class_hit:
         candidates.append(class_hit)
+
     price = _pick_price_candidate(candidates)
     if price is None or price <= 0:
         return None
@@ -546,6 +515,7 @@ _DESC_CONTENT_RE = re.compile(
     r'<meta\s+content=["\']([^"\']{10,})["\'][^>]*(?:name|property)=["\'](?:description|og:description)["\']',
     re.I,
 )
+# الأعمدة التي تحتوي على وصف المنتج في الصفحة
 _DESC_DIV_RE = re.compile(
     r'<(?:div|section|p)[^>]+class=["\'][^"\']*(?:description|details|product-info|product-body)[^"\']*["\'][^>]*>'
     r'([\s\S]{30,1200}?)</(?:div|section|p)>',
@@ -555,14 +525,17 @@ _HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 
 def _extract_raw_description(html: str) -> str:
+    """يستخرج النص الخام لوصف المنتج من meta description أو div الوصف."""
     if not html:
         return ""
+    # 1) meta description / og:description
     for pattern in (_DESC_META_RE, _DESC_CONTENT_RE):
         m = pattern.search(html)
         if m:
             txt = m.group(1).strip()
             if len(txt) >= 20:
                 return txt[:1500]
+    # 2) div/section ذو class وصفي
     m2 = _DESC_DIV_RE.search(html)
     if m2:
         raw = _HTML_TAG_RE.sub(" ", m2.group(1))
@@ -573,7 +546,8 @@ def _extract_raw_description(html: str) -> str:
 
 
 def extract_product(html: str, page_url: str) -> Optional[Dict[str, Any]]:
-    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex."""
+    """يستخرج بيانات المنتج بثلاث طبقات: JSON-LD → OG → regex.
+    يُضيف raw_description لاستخدامه لاحقاً في توليد الوصف عبر AI."""
     result = (
         _extract_from_jsonld(html, page_url)
         or _extract_from_og(html, page_url)
@@ -587,8 +561,8 @@ def extract_product(html: str, page_url: str) -> Optional[Dict[str, Any]]:
 # ══════════════════════════════════════════════════════════════════════════
 #  جلب صفحة منتج واحدة — retry + anti-ban + fallbacks
 # ══════════════════════════════════════════════════════════════════════════
-_DOMAIN_MAX_FAIL = 25
-
+# ── Circuit Breaker — يوقف محاولات دومين يرفض باستمرار ──────────────────
+_DOMAIN_MAX_FAIL = 25  # رفض الدومين بعد 25 فشل متتالٍ
 
 async def fetch_product(
     session: aiohttp.ClientSession,
@@ -596,14 +570,15 @@ async def fetch_product(
     store_domain: str,
     sem: asyncio.Semaphore,
     progress: Progress,
-    cb: Dict[str, int],
+    cb: Dict[str, int],          # {domain: consecutive_failures}
 ) -> Optional[Dict[str, Any]]:
+    # تحقق من Circuit Breaker قبل حجز السيمافور (لا ننتظر ولا نهدر طلباً)
     if cb.get(store_domain, 0) >= _DOMAIN_MAX_FAIL:
         return None
 
     async with sem:
         resp = await fetch_with_retry(
-            session, url, max_retries=3, referer=f"https://{store_domain}/"
+            session, url, max_retries=2, referer=f"https://{store_domain}/"
         )
 
         html: Optional[str] = None
@@ -623,11 +598,12 @@ async def fetch_product(
             cb[store_domain] = cb.get(store_domain, 0) + 1
             if cb[store_domain] == _DOMAIN_MAX_FAIL:
                 logger.warning(
-                    "Circuit Breaker: %s — %d فشل متتالٍ، تخطّي الروابط المتبقية.",
+                    "⛔ %s — %d فشل متتالٍ. تفعيل Circuit Breaker، تخطّي الروابط المتبقية.",
                     store_domain, _DOMAIN_MAX_FAIL,
                 )
             return None
 
+        # نجاح — أعد ضبط العداد
         cb[store_domain] = 0
         product = extract_product(html, url)
         if product:
@@ -637,185 +613,18 @@ async def fetch_product(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  كشط متجر واحد — coroutine مستقلة للتشغيل المتوازي (v3 جديد)
-# ══════════════════════════════════════════════════════════════════════════
-async def _scrape_single_store(
-    store_url: str,
-    session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
-    progress: Progress,
-    circuit_breaker: Dict[str, int],
-    existing_rows: Dict[str, Any],
-    all_new_rows: List[Dict[str, Any]],
-    lastmod_cache: Dict[str, str],
-    new_lastmod_cache: Dict[str, str],
-    checkpoint_urls: Set[str],
-    max_products_per_store: int,
-    incremental: bool,
-    existing_by_store: Any,
-) -> None:
-    """
-    يكشط متجراً واحداً كاملاً.
-    مصمَّم للتشغيل المتوازي مع متاجر أخرى عبر asyncio.gather.
-    يتحقق من Checkpoint لتخطّي الـ URLs المكتملة مسبقاً.
-    """
-    from scrapers.sitemap_resolve import resolve_product_entries
-
-    domain = urlparse(store_url).netloc
-
-    # تحديث قائمة المتاجر النشطة في Progress
-    _active = list(progress._data.get("current_stores") or [])
-    if domain not in _active:
-        _active.append(domain)
-    progress.update(
-        current_store=domain,
-        current_stores=_active,
-        store_urls_total=0,
-        store_urls_done=0,
-        store_started_at=datetime.now().isoformat(),
-    )
-    logger.info("→ بدء كشط: %s", domain)
-
-    # حل الـ Sitemap
-    try:
-        entries = await resolve_product_entries(
-            store_url, session, max_products=max_products_per_store
-        )
-    except Exception as exc:
-        progress.error(f"resolve {domain}: {exc}")
-        entries = []
-
-    if not entries:
-        logger.warning("لا روابط منتجات لـ %s (فشل Sitemap)", domain)
-        _res = dict(progress._data.get("stores_results") or {})
-        _res[domain] = 0
-        _failed = list(progress._data.get("stores_sitemap_failed") or [])
-        if domain not in _failed:
-            _failed.append(domain)
-        _active2 = [s for s in (progress._data.get("current_stores") or []) if s != domain]
-        progress.update(
-            stores_done=progress._data["stores_done"] + 1,
-            stores_results=_res,
-            stores_sitemap_failed=_failed,
-            current_stores=_active2,
-        )
-        return
-
-    # فلترة تزايدية: تخطي lastmod غير المتغير
-    urls_to_fetch: List[str] = []
-    for entry in entries:
-        if incremental and entry.lastmod:
-            cached = lastmod_cache.get(entry.url, "")
-            if cached == entry.lastmod:
-                continue
-            new_lastmod_cache[entry.url] = entry.lastmod
-        urls_to_fetch.append(entry.url)
-
-    if not urls_to_fetch and entries:
-        _cached_n = existing_by_store.get(domain, 0)
-        logger.info(
-            "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى، محفوظ مسبقاً: %d",
-            domain, len(entries), _cached_n,
-        )
-        _res = dict(progress._data.get("stores_results") or {})
-        _res[domain] = -_cached_n
-        _active2 = [s for s in (progress._data.get("current_stores") or []) if s != domain]
-        progress.update(
-            stores_done=progress._data["stores_done"] + 1,
-            stores_results=_res,
-            current_stores=_active2,
-        )
-        return
-
-    # تطبيق Checkpoint: تخطّي الـ URLs المكتملة في جلسة سابقة
-    checkpoint_skipped = 0
-    if checkpoint_urls:
-        before = len(urls_to_fetch)
-        urls_to_fetch = [u for u in urls_to_fetch if u not in checkpoint_urls]
-        checkpoint_skipped = before - len(urls_to_fetch)
-        if checkpoint_skipped:
-            logger.info(
-                "%s — تخطّى %d URL (Checkpoint من جلسة سابقة)، يبقى: %d",
-                domain, checkpoint_skipped, len(urls_to_fetch),
-            )
-
-    if not urls_to_fetch:
-        logger.info("%s — جميع الـ URLs مكتملة من Checkpoint", domain)
-        _active2 = [s for s in (progress._data.get("current_stores") or []) if s != domain]
-        progress.update(
-            stores_done=progress._data["stores_done"] + 1,
-            current_stores=_active2,
-        )
-        return
-
-    logger.info(
-        "%s — %d للكشط (من %d في Sitemap، تخطّى Checkpoint: %d)",
-        domain, len(urls_to_fetch), len(entries), checkpoint_skipped,
-    )
-    progress.update(store_urls_total=len(urls_to_fetch), store_urls_done=0)
-
-    tasks = [
-        fetch_product(session, url, domain, sem, progress, circuit_breaker)
-        for url in urls_to_fetch
-    ]
-
-    _store_rows = 0
-    _checkpoint_counter = 0
-
-    for _url_idx, coro in enumerate(asyncio.as_completed(tasks)):
-        url_fetched = urls_to_fetch[_url_idx] if _url_idx < len(urls_to_fetch) else ""
-        result = await coro
-        progress.update(store_urls_done=_url_idx + 1)
-
-        if result:
-            all_new_rows.append(result)
-            _store_rows += 1
-
-        # تحديث Checkpoint
-        if url_fetched:
-            checkpoint_urls.add(url_fetched)
-            _checkpoint_counter += 1
-            if _checkpoint_counter % 100 == 0:
-                _save_checkpoint(checkpoint_urls)
-
-        # كتابة تدريجية كل 50 منتج ناجح
-        if _store_rows > 0 and _store_rows % 50 == 0:
-            _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
-            progress.update(rows_in_csv=_total_so_far)
-
-    # تحديث نهائي لهذا المتجر
-    _res = dict(progress._data.get("stores_results") or {})
-    _res[domain] = _store_rows
-    _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
-    _active2 = [s for s in (progress._data.get("current_stores") or []) if s != domain]
-    progress.update(
-        stores_done=progress._data["stores_done"] + 1,
-        rows_in_csv=_total_so_far,
-        stores_results=_res,
-        store_urls_done=0,
-        store_urls_total=0,
-        current_stores=_active2,
-    )
-    logger.info("  ✓ %s — %d منتج جديد | إجمالي CSV: %d", domain, _store_rows, _total_so_far)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  المحرك الرئيسي — كشط متوازٍ لمجموعات من المتاجر (v3)
+#  المحرك الرئيسي
 # ══════════════════════════════════════════════════════════════════════════
 async def run_scraper(
     max_products_per_store: int = 0,
     concurrency: int = 3,
     incremental: bool = True,
-    store_concurrency: int = 2,
-    resume: bool = False,
 ) -> int:
     """
     يشغّل الكشط الكامل ويُرجع عدد الصفوف المكتوبة.
 
-    store_concurrency: عدد المتاجر التي تُكشط في نفس الوقت (الافتراضي: 2).
-    resume=True: يستأنف من Checkpoint إذا توقف الكاشط سابقاً.
-    max_products_per_store=0: كشط جميع المنتجات بدون سقف.
-    incremental=True: يتخطى الصفحات التي لم يتغير lastmod.
+    max_products_per_store=0 → كشط جميع المنتجات بدون سقف.
+    incremental=True → يتخطى الصفحات التي لم يتغير lastmod.
     """
     if not COMPETITORS_FILE.exists():
         logger.error("ملف المنافسين غير موجود: %s", COMPETITORS_FILE)
@@ -826,35 +635,39 @@ async def run_scraper(
         logger.error("قائمة المتاجر فارغة")
         return 0
 
-    pr = get_proxy_rotator()
-    proxy_status = f"{pr.active_count}/{len(pr._proxies)} proxy" if pr.has_proxies else "بدون proxy"
-
     logger.info(
-        "بدء الكشط v3 — %d متجر، %d متوازٍ، تزامن %d، تزايدي=%s، resume=%s، %s",
-        len(stores), store_concurrency, concurrency, incremental, resume, proxy_status,
+        "بدء الكشط — %d متجر، حد %d منتج/متجر، تزامن %d، تزايدي=%s",
+        len(stores), max_products_per_store, concurrency, incremental,
     )
 
-    # تحميل Checkpoint إذا طُلب الاستئناف
-    checkpoint_urls: Set[str] = _load_checkpoint() if resume else set()
-    if resume and checkpoint_urls:
-        logger.info("وضع الاستئناف: سيُتخطى %d URL مكتمل من جلسة سابقة", len(checkpoint_urls))
+    # ── سجّل بداية الجلسة في ملف الأخطاء ──
+    logger.info(
+        "═══ بدء جلسة كشط جديدة %s ═══",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
+    # Lastmod cache للكشط التزايدي
     lastmod_cache = _load_lastmod_cache() if incremental else {}
+
+    # اقرأ البيانات القديمة قبل أي شيء — لن تُمحى
     existing_rows = _load_existing_csv()
     logger.info("سجلات قديمة في CSV: %d", len(existing_rows))
 
     progress = Progress(stores, total_urls=len(stores) * max(max_products_per_store, 500))
 
+    # احسب عدد المنتجات المحفوظة مسبقاً لكل متجر (للعرض في الواجهة)
     from collections import Counter as _Counter
     _existing_by_store = _Counter(
         r.get("store", "").strip() for r in existing_rows.values() if r.get("store")
     )
     progress.update(stores_cached_counts=dict(_existing_by_store))
-
     all_new_rows: List[Dict[str, Any]] = []
+    rows_written = 0
     sem = asyncio.Semaphore(concurrency)
     new_lastmod_cache: Dict[str, str] = {}
-    circuit_breaker: Dict[str, int] = {}
+    circuit_breaker: Dict[str, int] = {}  # domain → فشل متتالٍ
+
+    from scrapers.sitemap_resolve import resolve_product_entries
 
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency + 4)
     timeout = ClientTimeout(total=30, connect=10)
@@ -862,60 +675,116 @@ async def run_scraper(
 
     async with aiohttp.ClientSession(
         connector=connector, timeout=timeout, headers=default_headers,
-        cookies={'currency': 'SAR'},
+        cookies={'currency': 'SAR'},   # إجبار منصة سلة على عرض الأسعار بالريال السعودي
     ) as session:
-        # معالجة المتاجر في دُفعات متوازية بحجم store_concurrency
-        for batch_start in range(0, len(stores), store_concurrency):
-            batch = stores[batch_start: batch_start + store_concurrency]
-            batch_labels = [urlparse(s).netloc for s in batch]
+        for store_url in stores:
+            domain = urlparse(store_url).netloc
+            progress.update(
+                current_store=domain,
+                stores_done=progress._data["stores_done"],
+                store_urls_total=0,
+                store_urls_done=0,
+                store_started_at=datetime.now().isoformat(),
+            )
+            logger.info("↳ %s", domain)
+
+            try:
+                entries = await resolve_product_entries(
+                    store_url, session, max_products=max_products_per_store
+                )
+            except Exception as exc:
+                progress.error(f"resolve {domain}: {exc}")
+                entries = []
+
+            if not entries:
+                logger.warning("لا روابط منتجات لـ %s (فشل Sitemap)", domain)
+                _res = dict(progress._data.get("stores_results") or {})
+                _res[domain] = 0
+                _failed = list(progress._data.get("stores_sitemap_failed") or [])
+                if domain not in _failed:
+                    _failed.append(domain)
+                progress.update(
+                    stores_done=progress._data["stores_done"] + 1,
+                    stores_results=_res,
+                    stores_sitemap_failed=_failed,
+                )
+                continue
+
+            # فلترة تزايدية: تخطي الصفحات التي لم يتغير lastmod
+            urls_to_fetch: List[str] = []
+            for entry in entries:
+                if incremental and entry.lastmod:
+                    cached = lastmod_cache.get(entry.url, "")
+                    if cached == entry.lastmod:
+                        continue
+                    new_lastmod_cache[entry.url] = entry.lastmod
+                urls_to_fetch.append(entry.url)
+
+            if not urls_to_fetch and entries:
+                _cached_n = _existing_by_store.get(domain, 0)
+                logger.info(
+                    "%s — %d منتج بلا تحديث (lastmod لم يتغير) → تخطّى، محفوظ مسبقاً: %d",
+                    domain, len(entries), _cached_n,
+                )
+                _res = dict(progress._data.get("stores_results") or {})
+                # نستخدم قيمة سالبة كإشارة للـ UI: "محفوظ — بلا تحديث"
+                _res[domain] = -_cached_n
+                progress.update(
+                    stores_done=progress._data["stores_done"] + 1,
+                    stores_results=_res,
+                )
+                continue
+
             logger.info(
-                "دُفعة متاجر [%d/%d]: %s",
-                batch_start // store_concurrency + 1,
-                (len(stores) + store_concurrency - 1) // store_concurrency,
-                " + ".join(batch_labels),
+                "%s — %d للكشط (من %d في Sitemap)",
+                domain, len(urls_to_fetch), len(entries),
             )
 
-            # تشغيل المتاجر في الدُفعة بالتوازي الكامل
-            coros = [
-                _scrape_single_store(
-                    store_url=s,
-                    session=session,
-                    sem=sem,
-                    progress=progress,
-                    circuit_breaker=circuit_breaker,
-                    existing_rows=existing_rows,
-                    all_new_rows=all_new_rows,
-                    lastmod_cache=lastmod_cache,
-                    new_lastmod_cache=new_lastmod_cache,
-                    checkpoint_urls=checkpoint_urls,
-                    max_products_per_store=max_products_per_store,
-                    incremental=incremental,
-                    existing_by_store=_existing_by_store,
-                )
-                for s in batch
-            ]
-            results = await asyncio.gather(*coros, return_exceptions=True)
+            progress.update(
+                store_urls_total=len(urls_to_fetch), store_urls_done=0
+            )
 
-            # تسجيل أي استثناءات من الكاشط المتوازي
-            for store_url, res in zip(batch, results):
-                if isinstance(res, Exception):
-                    domain = urlparse(store_url).netloc
-                    logger.error("استثناء غير معالَج في %s: %s", domain, res)
-                    progress.error(f"{domain}: {res}")
+            tasks = [
+                fetch_product(session, url, domain, sem, progress, circuit_breaker)
+                for url in urls_to_fetch
+            ]
+
+            _store_rows = 0
+            for _url_idx, coro in enumerate(asyncio.as_completed(tasks)):
+                result = await coro
+                progress.update(store_urls_done=_url_idx + 1)
+                if result:
+                    all_new_rows.append(result)
+                    rows_written += 1
+                    _store_rows += 1
+                    # كتابة تدريجية آمنة كل 50 منتج (تحفظ دون حذف القديم)
+                    if rows_written % 50 == 0:
+                        _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
+                        progress.update(rows_in_csv=_total_so_far)
+
+            _res = dict(progress._data.get("stores_results") or {})
+            _res[domain] = _store_rows
+            _total_so_far = _write_merged_csv(existing_rows, all_new_rows)
+            progress.update(
+                stores_done=progress._data["stores_done"] + 1,
+                rows_in_csv=_total_so_far,
+                stores_results=_res,
+                store_urls_done=0,
+                store_urls_total=0,
+            )
+            logger.info("  ✓ %s — %d منتج جديد | إجمالي CSV: %d", domain, _store_rows, _total_so_far)
 
     # كتابة نهائية شاملة
     total_csv = _write_merged_csv(existing_rows, all_new_rows)
 
+    # حفظ الـ lastmod cache
     if incremental:
         _save_lastmod_cache({**lastmod_cache, **new_lastmod_cache})
-
-    # حذف Checkpoint عند الانتهاء بنجاح
-    _clear_checkpoint()
 
     progress.done(total_csv)
     logger.info(
         "اكتمل الكشط — %d جديد، %d إجمالي في %s",
-        len(all_new_rows), total_csv, OUTPUT_CSV,
+        rows_written, total_csv, OUTPUT_CSV,
     )
     return total_csv
 
@@ -924,26 +793,18 @@ async def run_scraper(
 #  نقطة الدخول عند التشغيل المباشر
 # ══════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Async Competitor Scraper v3.0")
+    parser = argparse.ArgumentParser(description="Async Competitor Scraper v2.0")
     parser.add_argument(
         "--max-products", type=int, default=0,
         help="أقصى عدد منتجات لكل متجر (0 = جميع المنتجات بلا سقف)",
     )
     parser.add_argument(
         "--concurrency", type=int, default=3,
-        help="عدد الطلبات المتزامنة لكل متجر (الافتراضي 3)",
-    )
-    parser.add_argument(
-        "--store-concurrency", type=int, default=2,
-        help="عدد المتاجر التي تُكشط في نفس الوقت (الافتراضي 2)",
+        help="عدد الطلبات المتزامنة (الافتراضي 3 لتجنب الحجب)",
     )
     parser.add_argument(
         "--full", action="store_true",
         help="كشط كامل (يتخطى الـ lastmod cache)",
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="استئناف من Checkpoint — يتخطى الـ URLs المكتملة من جلسة سابقة",
     )
     args = parser.parse_args()
 
@@ -955,8 +816,6 @@ def main() -> None:
                 max_products_per_store=args.max_products,
                 concurrency=args.concurrency,
                 incremental=not args.full,
-                store_concurrency=args.store_concurrency,
-                resume=args.resume,
             )
         )
         sys.exit(0 if rows > 0 else 1)
@@ -964,13 +823,13 @@ def main() -> None:
         try:
             prog = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
             prog["running"] = False
-            prog["last_error"] = "أُوقف يدوياً"
+            prog["last_error"] = "⛔ أُوقف يدوياً"
             PROGRESS_FILE.write_text(
                 json.dumps(prog, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except Exception:
             pass
-        logger.info("الكشط أُوقف يدوياً — الـ Checkpoint محفوظ للاستئناف لاحقاً")
+        logger.info("الكشط أُوقف يدوياً")
         sys.exit(0)
     except Exception as exc:
         logger.error("خطأ فادح: %s", exc)
