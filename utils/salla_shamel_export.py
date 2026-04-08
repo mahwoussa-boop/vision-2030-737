@@ -339,7 +339,7 @@ def _extract_price(r: dict) -> float:
     return 0.0
 
 
-def _extract_sku(r: dict, pname: str = "") -> str:
+def _extract_sku(r: dict) -> str:
     """
     يستخرج SKU من الصف ويُنظّفه عبر sanitize_sku.
     يُمنع وضع روابط URL مباشرةً — يُحوَّل الرابط لرمز فريد.
@@ -355,17 +355,15 @@ def _extract_sku(r: dict, pname: str = "") -> str:
         if not s or s.lower() in ("nan", "none", "<na>"):
             continue
         # sanitize_sku يتعامل مع الرابط والرقم والنص
-        return _sanitize_sku(s, pname=pname)
+        return _sanitize_sku(s)
 
     # إذا لم يُوجد حقل SKU → حاول الاشتقاق من رابط المنتج
     for url_k in ("رابط_المنافس", "رابط المنتج", "product_url", "url"):
         u = str(r.get(url_k) or "").strip()
         if u.startswith("http"):
-            return _sanitize_sku(u, pname=pname)
+            return _sanitize_sku(u)
 
-    # Last Resort: توليد MSNG hash من اسم المنتج — لا تُرجع فارغاً أبداً
-    # سلة ترفض أي صف بدون SKU → هذا السطر يضمن القبول 100%
-    return _sanitize_sku("", pname=pname)
+    return ""
 
 
 def _extract_weight(r: dict) -> tuple:
@@ -427,7 +425,7 @@ def export_to_salla_shamel(
         brand  = str(r.get("الماركة",  "") or "").strip()
         gender = str(r.get("الجنس",    "") or "").strip()
         ptype  = str(r.get("النوع",    "") or "").strip()
-        sku    = _extract_sku(r, pname=pname)
+        sku    = _extract_sku(r)
         w_val, w_unit = _extract_weight(r)
 
         # ── الصورة — رابط واحد نظيف ────────────────────────────────────────
