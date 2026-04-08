@@ -304,18 +304,30 @@ def _adapt_cl_result_to_legacy(cl_result: dict) -> dict:
 
 
 def _resolve_comp_name_price_cols(comp_df: "pd.DataFrame"):
-    """يكتشف عمودَي الاسم والسعر في ملف المنافس."""
+    """
+    يكتشف عمودَي الاسم والسعر في ملف المنافس.
+    يتحقق أن العمود المختار يحتوي على بيانات فعلية (غير NaN بالكامل).
+    """
+    def _has_data(col):
+        """هل يحتوي العمود على قيم غير فارغة؟"""
+        try:
+            return comp_df[col].notna().any() and (comp_df[col].astype(str).str.strip() != "").any()
+        except Exception:
+            return False
+
     result    = resolve_catalog_columns(comp_df)
-    name_col  = result.get("name")
-    price_col = result.get("price")
+    name_col  = result.get("name") if result.get("name") and _has_data(result["name"]) else None
+    price_col = result.get("price") if result.get("price") and _has_data(result["price"]) else None
+
+    # fallback إذا العمود المكتشف فارغ: جرّب بقية المرشحين
     if not name_col:
         for c in comp_df.columns:
-            if any(kw in str(c).lower() for kw in ("name", "اسم", "منتج", "product", "title")):
+            if any(kw in str(c).lower() for kw in ("name", "اسم", "منتج", "product", "title")) and _has_data(c):
                 name_col = c
                 break
     if not price_col:
         for c in comp_df.columns:
-            if any(kw in str(c).lower() for kw in ("price", "سعر", "cost", "ثمن")):
+            if any(kw in str(c).lower() for kw in ("price", "سعر", "cost", "ثمن")) and _has_data(c):
                 price_col = c
                 break
     return name_col, price_col
@@ -2301,14 +2313,36 @@ if page == "📊 لوحة التحكم":
                     if not comp_dfs:
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
                     else:
+                        import json as _jb, time as _tb
+                        def _dblog_btn(msg, data=None, hyp="H-E"):
+                            try:
+                                e = {"sessionId":"bbc946","hypothesisId":hyp,"location":"app.py:btn_spinner","message":msg,"data":data or {},"timestamp":int(_tb.time()*1000)}
+                                open("debug-bbc946.log","a",encoding="utf-8").write(_jb.dumps(e,ensure_ascii=False)+"\n")
+                            except Exception: pass
+                        _dblog_btn("SPINNER_PREP_START", {"comp_dfs_keys": list(comp_dfs.keys())[:5], "our_rows": len(our_df) if our_df is not None else 0})
                         _catc = resolve_catalog_columns(our_df)
-                        r_our = upsert_our_catalog(
-                            our_df,
-                            name_col=_catc["name"] or "اسم المنتج",
-                            id_col=_catc["id"] or "رقم المنتج",
-                            price_col=_catc["price"] or "سعر المنتج",
-                        )
-                        r_comp = upsert_comp_catalog(comp_dfs)
+                        _dblog_btn("CATC_RESOLVED", {"catc": _catc})
+                        # DB: حفظ كتالوجنا
+                        try:
+                            r_our = upsert_our_catalog(
+                                our_df,
+                                name_col=_catc["name"] or "اسم المنتج",
+                                id_col=_catc["id"] or "رقم المنتج",
+                                price_col=_catc["price"] or "سعر المنتج",
+                            )
+                            _dblog_btn("UPSERT_OUR_OK", {"inserted": r_our.get("inserted",0), "updated": r_our.get("updated",0)})
+                        except Exception as _ou_err:
+                            _dblog_btn("UPSERT_OUR_ERROR", {"error": str(_ou_err)[:300]}, hyp="H-E")
+                            st.warning(f"⚠️ تحذير DB (كتالوجنا): {_ou_err}")
+                            r_our = {"inserted": 0, "updated": 0}
+                        # DB: حفظ كتالوج المنافسين
+                        try:
+                            r_comp = upsert_comp_catalog(comp_dfs)
+                            _dblog_btn("UPSERT_COMP_OK", {"new": r_comp.get("new_products",0)})
+                        except Exception as _oc_err:
+                            _dblog_btn("UPSERT_COMP_ERROR", {"error": str(_oc_err)[:300]}, hyp="H-E")
+                            st.warning(f"⚠️ تحذير DB (المنافسين): {_oc_err}")
+                            r_comp = {"new_products": 0, "updated": 0}
                         st.caption(
                             f"✅ كتالوجنا: {r_our['inserted']} جديد / {r_our['updated']} تحديث | "
                             f"المنافسين: {r_comp['new_products']} جديد / {r_comp.get('updated', 0)} تحديث"
@@ -2319,6 +2353,7 @@ if page == "📊 لوحة التحكم":
                         st.session_state.job_id = job_id
                         comp_names = ",".join(comp_dfs.keys())
                         _prep_ok = True
+                        _dblog_btn("PREP_DONE", {"job_id": job_id, "prep_ok": True})
 
             if _prep_ok and our_df is not None and comp_dfs:
                 _validate_uploaded_catalog(our_df, "ملف منتجاتنا")
