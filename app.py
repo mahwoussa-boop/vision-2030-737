@@ -82,14 +82,6 @@ from utils.data_helpers import (safe_results_for_json, restore_results_from_json
                                 upsert_competitors,
                                 filter_unique_competitors)
 from utils.data_paths import get_master_competitors_path
-from engines.pricing_engine import (
-    generate_pricing_report_from_dataframes,
-    CATALOG_PK_COL   as _PE_PK,
-    CATALOG_NAME_COL  as _PE_NAME,
-    CATALOG_PRICE_COL as _PE_PRICE,
-    DEFAULT_MATCH_THRESHOLD as _PE_THRESHOLD,
-    clean_price as _pe_clean_price,
-)
 from engines.closed_loop_engine import (
     run_closed_loop_matching,
     STATUS_MATCHED  as _CL_MATCHED,
@@ -223,6 +215,147 @@ def _split_results(df):
         "excluded":    df[_contains("القرار", "مستبعد")].reset_index(drop=True),
         "all":         df,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  دوال تكيّف المحرك الجديد ← نمط Adapter
+#  تحوّل مخرجات run_closed_loop_matching إلى البنية التي تقرأها الأقسام
+# ════════════════════════════════════════════════════════════════════════
+
+def _gcol(df: "pd.DataFrame", col: str, default=""):
+    """يُرجع عمود DataFrame بأمان أو قيمة افتراضية."""
+    if col in df.columns:
+        return df[col].fillna(default)
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _adapt_cl_result_to_legacy(cl_result: dict) -> dict:
+    """
+    يحوّل مخرجات run_closed_loop_matching إلى نفس البنية التي تتوقعها أقسام التطبيق.
+
+    خريطة الأعمدة:
+        أسم_المنتج_لدينا  → المنتج     (اسم منتجنا)
+        Raw_Name           → منتج_المنافس
+        سعر_المنتج_لدينا  → السعر
+        سعر_المنافس       → سعر_المنافس (نفس الاسم)
+        فرق_السعر.abs()   → الفرق
+        Match_Score        → نسبة_التطابق
+        القرار             ← مُحدَّد حسب القسم
+    """
+    cheaper = cl_result.get("matched_cheaper", pd.DataFrame())
+    pricier = cl_result.get("matched_pricier", pd.DataFrame())
+    review  = cl_result.get("review",          pd.DataFrame())
+    missing = cl_result.get("missing",         pd.DataFrame())
+
+    def _to_legacy(df: "pd.DataFrame", decision: str) -> "pd.DataFrame":
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = pd.DataFrame(index=df.index)
+        our_name = _gcol(df, "أسم_المنتج_لدينا", "")
+        raw_name = _gcol(df, "Raw_Name",          "")
+        # اسم المنتج: نفضّل اسمنا؛ إذا غاب نستخدم اسم المنافس
+        out["المنتج"]        = our_name.where(our_name.astype(bool), raw_name)
+        out["منتج_المنافس"]  = raw_name
+        out["السعر"]         = pd.to_numeric(_gcol(df, "سعر_المنتج_لدينا", 0), errors="coerce").fillna(0)
+        out["سعر_المنافس"]  = pd.to_numeric(_gcol(df, "سعر_المنافس",       0), errors="coerce").fillna(0)
+        out["الفرق"]         = pd.to_numeric(_gcol(df, "فرق_السعر",         0), errors="coerce").fillna(0).abs()
+        out["المنافس"]       = _gcol(df, "المنافس", "")
+        out["نسبة_التطابق"] = pd.to_numeric(_gcol(df, "Match_Score", 0), errors="coerce").fillna(0)
+        out["القرار"]        = decision
+        out["Match_Score"]   = out["نسبة_التطابق"]
+        out["Match_Reason"]  = _gcol(df, "Match_Reason",   "")
+        out["No."]           = _gcol(df, "No.",             "")
+        out["طبقة_المطابقة"] = _gcol(df, "طبقة_المطابقة", "")
+        out["الحالة"]        = _gcol(df, "الحالة",          decision)
+        return out.reset_index(drop=True)
+
+    price_raise_df = _to_legacy(cheaper, "سعر أعلى")
+    price_lower_df = _to_legacy(pricier, "سعر أقل")
+    review_df      = _to_legacy(review,  "مراجعة يدوية")
+
+    # مفقودات — منتجات المنافس التي لم يجد لها المحرك مطابقاً
+    missing_out = pd.DataFrame()
+    if missing is not None and not missing.empty:
+        mo = pd.DataFrame(index=missing.index)
+        raw = _gcol(missing, "Raw_Name", "")
+        mo["المنتج"]         = raw
+        mo["منتج_المنافس"]  = raw
+        mo["سعر_المنافس"]   = pd.to_numeric(_gcol(missing, "سعر_المنافس", 0), errors="coerce").fillna(0)
+        mo["المنافس"]        = _gcol(missing, "المنافس",    "")
+        mo["نسبة_التطابق"]  = pd.to_numeric(_gcol(missing, "Match_Score", 0), errors="coerce").fillna(0)
+        mo["Match_Reason"]   = _gcol(missing, "Match_Reason", "")
+        mo["القرار"]         = "مفقود"
+        mo["السعر"]          = 0.0
+        mo["الفرق"]          = 0.0
+        mo["Normalized_Name"] = _gcol(missing, "Normalized_Name", "")
+        missing_out = mo.reset_index(drop=True)
+
+    all_df = pd.concat([price_raise_df, price_lower_df, review_df], ignore_index=True)
+
+    return {
+        "price_raise": price_raise_df,
+        "price_lower": price_lower_df,
+        "approved":    pd.DataFrame(),
+        "review":      review_df,
+        "excluded":    pd.DataFrame(),
+        "missing":     missing_out,
+        "all":         all_df,
+    }
+
+
+def _resolve_comp_name_price_cols(comp_df: "pd.DataFrame"):
+    """يكتشف عمودَي الاسم والسعر في ملف المنافس."""
+    result    = resolve_catalog_columns(comp_df)
+    name_col  = result.get("name")
+    price_col = result.get("price")
+    if not name_col:
+        for c in comp_df.columns:
+            if any(kw in str(c).lower() for kw in ("name", "اسم", "منتج", "product", "title")):
+                name_col = c
+                break
+    if not price_col:
+        for c in comp_df.columns:
+            if any(kw in str(c).lower() for kw in ("price", "سعر", "cost", "ثمن")):
+                price_col = c
+                break
+    return name_col, price_col
+
+
+def _build_cl_competitor_entries(comp_dfs: dict) -> list:
+    """يبني قائمة competitor_entries للمحرك الجديد من comp_dfs."""
+    entries = []
+    for comp_name, comp_df in comp_dfs.items():
+        if comp_df is None or comp_df.empty:
+            continue
+        name_col, price_col = _resolve_comp_name_price_cols(comp_df)
+        if not name_col or not price_col:
+            continue
+        entries.append({
+            "df":              comp_df,
+            "name_col":        name_col,
+            "price_col":       price_col,
+            "competitor_name": comp_name,
+            "sku_col":         None,
+        })
+    return entries
+
+
+def _prepare_our_catalog_for_cl(our_df: "pd.DataFrame") -> "pd.DataFrame":
+    """يضمن أن كتالوج المتجر يحتوي على أعمدة المحرك الجديد: No. / أسم المنتج / سعر المنتج."""
+    col_map = resolve_catalog_columns(our_df)
+    rename  = {}
+    if col_map.get("id")    and col_map["id"]    not in ("No.",       ):
+        rename[col_map["id"]]    = "No."
+    if col_map.get("name")  and col_map["name"]  not in ("أسم المنتج", "اسم المنتج"):
+        rename[col_map["name"]]  = "أسم المنتج"
+    if col_map.get("price") and col_map["price"] not in ("سعر المنتج", ):
+        rename[col_map["price"]] = "سعر المنتج"
+    if rename:
+        our_df = our_df.rename(columns=rename)
+    # إذا لم يُوجد عمود "أسم المنتج" بعد — حاول أي عمود اسم
+    if "أسم المنتج" not in our_df.columns and "اسم المنتج" in our_df.columns:
+        our_df = our_df.rename(columns={"اسم المنتج": "أسم المنتج"})
+    return our_df
 
 
 def _merge_analysis_results(new_df: "pd.DataFrame", existing_df: "pd.DataFrame") -> "pd.DataFrame":
@@ -578,47 +711,40 @@ def _render_audit_bar(audit_stats: dict):
 
 
 def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
-    """تعمل في thread منفصل — تحفظ النتائج كل 10 منتجات مع حماية شاملة من الأخطاء"""
-    total     = len(our_df)
+    """تعمل في thread منفصل — تُشغّل المحرك الجديد وتحفظ النتائج."""
+    # إجمالي منتجات المنافسين كمقياس للتقدم
+    total     = sum(len(df) for df in comp_dfs.values()) or 1
     processed = 0
-    _last_save = [0]  # آخر عدد تم حفظه (mutable لـ closure)
-
-    def progress_cb(pct, current_results):
-        nonlocal processed
-        processed = int(pct * total)
-        # حفظ كل 25 منتجاً أو عند الاكتمال (تقليل ضغط SQLite)
-        if processed - _last_save[0] >= 25 or processed >= total:
-            _last_save[0] = processed
-            try:
-                safe_res = safe_results_for_json(current_results)
-                save_job_progress(
-                    job_id, total, processed,
-                    safe_res,
-                    "running",
-                    our_file_name, comp_names
-                )
-            except Exception as _save_err:
-                # لا نوقف المعالجة بسبب خطأ حفظ جزئي
-                import traceback
-                traceback.print_exc()
-
     analysis_df = pd.DataFrame()
     missing_df  = pd.DataFrame()
     audit_stats = {}
 
-    # ── المرحلة 1: التحليل الرئيسي ──────────────────────────────────
+    # ── المرحلة 1: إعداد المدخلات وتشغيل المحرك الجديد ─────────────
     try:
-        analysis_df, audit_stats = run_full_analysis(
-            our_df, comp_dfs,
-            progress_callback=progress_cb
+        save_job_progress(job_id, total, 0, [], "running", our_file_name, comp_names)
+
+        catalog_df   = _prepare_our_catalog_for_cl(our_df)
+        comp_entries = _build_cl_competitor_entries(comp_dfs)
+
+        if not comp_entries:
+            raise ValueError("❌ لم يُكتشف أي عمود صالح (اسم/سعر) في ملفات المنافسين")
+
+        cl_result   = run_closed_loop_matching(
+            catalog_df=catalog_df,
+            competitor_entries=comp_entries,
         )
+        adapted     = _adapt_cl_result_to_legacy(cl_result)
+        analysis_df = adapted["all"]
+        missing_df  = adapted["missing"]
+        audit_stats = cl_result.get("summary", {})
+        processed   = total
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        # حفظ ما تم تحليله حتى الآن كنتائج جزئية
         save_job_progress(
             job_id, total, processed,
-            [], f"error: تحليل المقارنة فشل — {str(e)[:200]}",
+            [], f"error: المحرك فشل — {str(e)[:200]}",
             our_file_name, comp_names
         )
         return
@@ -637,16 +763,7 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
                     str(row.get("القرار",         ""))
                 )
     except Exception:
-        pass  # تاريخ الأسعار ثانوي — لا نوقف المعالجة
-
-    # ── المرحلة 3: المنتجات المفقودة (منفصلة عن التحليل) ────────────
-    try:
-        raw_missing_df = find_missing_products(our_df, comp_dfs)
-        missing_df = smart_missing_barrier(raw_missing_df, our_df)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        missing_df = pd.DataFrame()  # فشلت المفقودة لكن النتائج الرئيسية محفوظة
+        pass  # تاريخ الأسعار ثانوي — لا يوقف المعالجة
 
     # ── المرحلة 4: الحفظ النهائي ────────────────────────────────────
     try:
@@ -2184,30 +2301,47 @@ if page == "📊 لوحة التحكم":
                     st.success(f"✅ بدأ التحليل في الخلفية (Job: {job_id})")
                     st.rerun()
                 else:
-                    prog = st.progress(0, "جاري التحليل...")
+                    prog = st.progress(0, "⏳ جاري إعداد المحرك...")
+                    try:
+                        catalog_df   = _prepare_our_catalog_for_cl(our_df)
+                        comp_entries = _build_cl_competitor_entries(comp_dfs)
+                        if not comp_entries:
+                            st.error("❌ لم يُكتشف أي عمود صالح (اسم/سعر) في ملفات المنافسين")
+                            st.stop()
 
-                    def upd(p, _r=None):
-                        prog.progress(min(float(p), 0.99), f"{float(p)*100:.0f}%")
+                        prog.progress(0.2, "🔨 تشغيل محرك المطابقة الدائري...")
+                        cl_result = run_closed_loop_matching(
+                            catalog_df=catalog_df,
+                            competitor_entries=comp_entries,
+                        )
+                        prog.progress(0.8, "🔀 تحويل النتائج...")
+                        adapted     = _adapt_cl_result_to_legacy(cl_result)
+                        df_all      = adapted["all"]
+                        missing_df  = adapted["missing"]
+                        audit_stats = cl_result.get("summary", {})
+                    except Exception as _sync_err:
+                        st.error(f"❌ خطأ في المحرك: {_sync_err}")
+                        st.stop()
 
-                    df_all, audit_stats = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
                     st.session_state.last_audit_stats = audit_stats
                     _render_audit_bar(audit_stats)
-                    raw_missing_df = find_missing_products(our_df, comp_dfs)
-                    missing_df = smart_missing_barrier(raw_missing_df, our_df)
 
-                    for _, row in df_all.iterrows():
-                        if row.get("نسبة_التطابق", 0) > 0:
-                            upsert_price_history(
-                                str(row.get("المنتج", "")),
-                                str(row.get("المنافس", "")),
-                                safe_float(row.get("سعر_المنافس", 0)),
-                                safe_float(row.get("السعر", 0)),
-                                safe_float(row.get("الفرق", 0)),
-                                safe_float(row.get("نسبة_التطابق", 0)),
-                                str(row.get("القرار", "")),
-                            )
+                    # حفظ تاريخ الأسعار
+                    try:
+                        for _, row in df_all.iterrows():
+                            if row.get("نسبة_التطابق", 0) > 0:
+                                upsert_price_history(
+                                    str(row.get("المنتج",       "")),
+                                    str(row.get("المنافس",       "")),
+                                    safe_float(row.get("سعر_المنافس", 0)),
+                                    safe_float(row.get("السعر",       0)),
+                                    safe_float(row.get("الفرق",        0)),
+                                    safe_float(row.get("نسبة_التطابق", 0)),
+                                    str(row.get("القرار",         "")),
+                                )
+                    except Exception:
+                        pass
 
-                    # دمج مع النتائج السابقة إن وجدت (يمنع حذف مطابقات من مصادر سابقة)
                     _prev_all = (
                         st.session_state.results.get("all", pd.DataFrame())
                         if st.session_state.results else pd.DataFrame()
@@ -2216,7 +2350,7 @@ if page == "📊 لوحة التحكم":
 
                     _r = _split_results(df_all)
                     _r["missing"] = missing_df
-                    st.session_state.results = _r
+                    st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
                     log_analysis(
                         _our_file_name,
@@ -4004,486 +4138,6 @@ elif page == "🕷️ كشط المنافسين":
             st.error(f"تعذّر تحميل وحدة الجدولة: {_sch_ex}")
 
 
-# ════════════════════════════════════════════════
-#  13. مقارنة الشامل — محرك المطابقة الدائري المغلق v1.0
-# ════════════════════════════════════════════════
-elif page == "📋 مقارنة الشامل":
-    st.header("📋 مقارنة الشامل — محرك المطابقة الدائري المغلق")
-    db_log("shamel_compare", "view")
-
-    st.info(
-        "🔒 **قانون حفظ البيانات:** المدخل = المتطابق + المراجعة + المفقود. "
-        "أي انحراف عن هذه المعادلة يُوقف المحرك فوراً. "
-        "لا يُعدَّل أي سعر تلقائياً — جميع القرارات يدوية.",
-        icon="🔒",
-    )
-
-    # ── 1) رفع ملف الشامل ────────────────────────────────────────────────
-    st.subheader("1️⃣  ملف الشامل (كتالوج سلة)")
-    _cl_shamel_file = st.file_uploader(
-        "ارفع ملف CSV بتنسيق الشامل (أعمدة إلزامية: No. / أسم المنتج / سعر المنتج)",
-        type=["csv"],
-        key="cl_shamel_upload",
-    )
-
-    _cl_shamel_df: pd.DataFrame | None = None
-    _cl_cat_sku_col: str | None = None
-
-    if _cl_shamel_file is not None:
-        try:
-            try:
-                _cl_shamel_df = pd.read_csv(
-                    _cl_shamel_file, dtype=str, encoding="utf-8-sig", low_memory=False
-                )
-            except UnicodeDecodeError:
-                _cl_shamel_file.seek(0)
-                _cl_shamel_df = pd.read_csv(
-                    _cl_shamel_file, dtype=str, encoding="cp1256", low_memory=False
-                )
-
-            _cl_missing_req = {_CL_PK, _CL_NAME, _CL_PRICE} - set(_cl_shamel_df.columns)
-            if _cl_missing_req:
-                st.error(
-                    f"❌ الأعمدة الإلزامية غير موجودة: **{_cl_missing_req}**\n\n"
-                    f"الأعمدة الموجودة: {list(_cl_shamel_df.columns)}"
-                )
-                _cl_shamel_df = None
-            else:
-                st.success(f"✅ الكتالوج: **{len(_cl_shamel_df):,}** صف")
-                # اختياري: عمود SKU في الكتالوج
-                _cl_all_cat_cols = ["— لا يوجد —"] + list(_cl_shamel_df.columns)
-                _cl_sku_sel = st.selectbox(
-                    "عمود SKU/باركود في الكتالوج (اختياري — للمطابقة القطعية)",
-                    options=_cl_all_cat_cols,
-                    key="cl_cat_sku",
-                )
-                _cl_cat_sku_col = None if _cl_sku_sel == "— لا يوجد —" else _cl_sku_sel
-
-                with st.expander("👁️ معاينة الكتالوج (أول 5 صفوف)"):
-                    st.dataframe(
-                        _cl_shamel_df[[_CL_PK, _CL_NAME, _CL_PRICE]].head(),
-                        use_container_width=True,
-                    )
-        except Exception as _cl_exc:
-            st.error(f"❌ خطأ في قراءة الكتالوج: {_cl_exc}")
-            _cl_shamel_df = None
-
-    # ── 2) رفع ملفات المنافسين ────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("2️⃣  ملفات المنافسين")
-
-    _cl_num_comp = st.number_input(
-        "عدد المنافسين", min_value=1, max_value=10, value=1, step=1,
-        key="cl_num_comp",
-    )
-
-    _cl_entries: list[dict] = []
-    for _ci in range(int(_cl_num_comp)):
-        with st.expander(f"📦 المنافس {_ci + 1}", expanded=(_ci == 0)):
-            _cl_cname = st.text_input(
-                "اسم المنافس (للعرض)",
-                value=f"منافس {_ci + 1}",
-                key=f"cl_cname_{_ci}",
-            )
-            _cl_cfile = st.file_uploader(
-                "ملف CSV للمنافس",
-                type=["csv"],
-                key=f"cl_cfile_{_ci}",
-            )
-
-            _cl_cdf: pd.DataFrame | None = None
-            _cl_ncol = ""
-            _cl_pcol = ""
-            _cl_scol: str | None = None
-
-            if _cl_cfile is not None:
-                try:
-                    _cl_cdf, _cl_detected_enc = read_csv_safe(_cl_cfile)
-                    st.caption(f"🔤 ترميز مكتشف: `{_cl_detected_enc}`")
-
-                    _cl_acols = list(_cl_cdf.columns)
-                    st.caption(f"الأعمدة: `{'` | `'.join(_cl_acols)}`")
-
-                    _cca, _ccb, _ccc = st.columns(3)
-                    with _cca:
-                        _cl_ncol = st.selectbox(
-                            "عمود اسم المنتج",
-                            options=_cl_acols,
-                            key=f"cl_ncol_{_ci}",
-                        )
-                    with _ccb:
-                        _cl_pcol = st.selectbox(
-                            "عمود السعر",
-                            options=_cl_acols,
-                            key=f"cl_pcol_{_ci}",
-                        )
-                    with _ccc:
-                        _cl_sku_opts = ["— لا يوجد —"] + _cl_acols
-                        _cl_sku_sel_c = st.selectbox(
-                            "عمود SKU/باركود (اختياري)",
-                            options=_cl_sku_opts,
-                            key=f"cl_scol_{_ci}",
-                        )
-                        _cl_scol = None if _cl_sku_sel_c == "— لا يوجد —" else _cl_sku_sel_c
-
-                    st.success(f"✅ {len(_cl_cdf):,} منتج")
-                    with st.expander("👁️ معاينة (أول 3 صفوف)"):
-                        st.dataframe(
-                            _cl_cdf[[_cl_ncol, _cl_pcol]].head(3),
-                            use_container_width=True,
-                        )
-                except Exception as _cl_ce:
-                    st.error(f"❌ خطأ في قراءة ملف المنافس: {_cl_ce}")
-
-            if _cl_cdf is not None and _cl_ncol and _cl_pcol:
-                _cl_entries.append({
-                    "df":              _cl_cdf,
-                    "name_col":        _cl_ncol,
-                    "price_col":       _cl_pcol,
-                    "competitor_name": _cl_cname,
-                    "sku_col":         _cl_scol,
-                })
-
-    # ── 3) إعدادات المحرك ────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("3️⃣  إعدادات الشلال الرباعي")
-    _cl_col_a, _cl_col_b = st.columns(2)
-    with _cl_col_a:
-        st.markdown(
-            "| الطبقة | الشرط | النتيجة |\n"
-            "|--------|--------|--------|\n"
-            "| 1 | SKU/باركود | متطابق 100% |\n"
-            "| 2 | نص تام بعد تطبيع | متطابق 100% |\n"
-            "| 3 | فازي + هيكل | ≥90%+هيكل=متطابق / 65-89%=مراجعة / <65%=مفقود |\n"
-            "| 4 | شبكة أمان | مراجعة يدوية دائماً |"
-        )
-    with _cl_col_b:
-        st.caption(
-            "المنطقة الرمادية: 65% ≤ نسبة < 90% → مراجعة يدوية إلزامية.\n\n"
-            "يُمنع على الآلة اتخاذ قرار هنا."
-        )
-
-    # ── 4) زر التشغيل ────────────────────────────────────────────────────
-    st.markdown("---")
-    _cl_can_run = (_cl_shamel_df is not None) and bool(_cl_entries)
-    if not _cl_can_run:
-        st.warning("⬆️ ارفع ملف الشامل + ملف منافس واحد على الأقل للمتابعة.")
-
-    if st.button(
-        "🚀 تشغيل المحرك الدائري المغلق",
-        type="primary",
-        disabled=not _cl_can_run,
-        key="cl_run_btn",
-    ):
-        with st.spinner("⚙️ الشلال الرباعي يعمل — تحقق الدائرة المغلقة جارٍ ..."):
-            try:
-                _cl_report = run_closed_loop_matching(
-                    catalog_df=_cl_shamel_df,
-                    competitor_entries=_cl_entries,
-                    catalog_sku_col=_cl_cat_sku_col,
-                )
-                st.session_state["cl_report"] = _cl_report
-                if _cl_report.get("sanity_passed"):
-                    st.success("✅ الدائرة المغلقة: تحقق مطابق — لا يوجد أي تسرب في البيانات.")
-                else:
-                    st.error("❌ فشل تحقق الدائرة المغلقة!")
-            except RuntimeError as _cl_rt:
-                st.error(f"⛔ انتهاك قانون حفظ البيانات:\n```\n{_cl_rt}\n```")
-                st.session_state["cl_report"] = None
-            except KeyError as _cl_ke:
-                st.error(f"❌ عمود مفقود: {_cl_ke}")
-                st.session_state["cl_report"] = None
-            except ValueError as _cl_ve:
-                st.error(f"❌ خطأ في البيانات: {_cl_ve}")
-                st.session_state["cl_report"] = None
-            except Exception as _cl_ex:
-                st.error(f"❌ خطأ غير متوقع: {_cl_ex}")
-                st.session_state["cl_report"] = None
-
-    # ── 5) عرض النتائج ────────────────────────────────────────────────────
-    _cl_report: dict | None = st.session_state.get("cl_report")
-
-    if _cl_report and _cl_report.get("sanity_passed"):
-        _cl_summ     = _cl_report["summary"]
-        _cl_cheaper  = _cl_report["matched_cheaper"]
-        _cl_pricier  = _cl_report["matched_pricier"]
-        _cl_review   = _cl_report["review"]
-        _cl_missing  = _cl_report["missing"]
-        _cl_all      = _cl_report["all_results"]
-
-        # ── بطاقات الدائرة المغلقة ────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("📊 لوحة الدائرة المغلقة")
-        _cl_m1, _cl_m2, _cl_m3, _cl_m4, _cl_m5 = st.columns(5)
-        _cl_m1.metric(
-            "🔢 إجمالي المدخل",
-            f"{_cl_summ.get('إجمالي_مدخل', 0):,}",
-            help="عدد منتجات المنافسين المستلمة",
-        )
-        _cl_m2.metric(
-            "✅ متطابق مؤكد",
-            f"{_cl_summ.get('متطابق_مؤكد', 0):,}",
-        )
-        _cl_m3.metric(
-            "⚠️ مراجعة يدوية",
-            f"{_cl_summ.get('مراجعة_يدوية', 0):,}",
-        )
-        _cl_m4.metric(
-            "🔴 مفقود",
-            f"{_cl_summ.get('مفقود', 0):,}",
-        )
-        _cl_m5.metric(
-            "🔒 الدائرة المغلقة",
-            _cl_summ.get("الدائرة_المغلقة", "—"),
-        )
-
-        # إحصائيات لكل منافس
-        _cl_per_comp = _cl_report.get("per_competitor", [])
-        if _cl_per_comp:
-            with st.expander("📋 إحصائيات لكل منافس"):
-                st.dataframe(
-                    pd.DataFrame(_cl_per_comp),
-                    use_container_width=True,
-                )
-
-        # ── 4 تبويبات العرض ───────────────────────────────────────────────
-        st.markdown("---")
-        _cl_t1, _cl_t2, _cl_t3, _cl_t4, _cl_t5 = st.tabs([
-            f"🟢 منافس أقل سعراً ({len(_cl_cheaper):,})",
-            f"🔴 منافس أعلى أو مساوٍ ({len(_cl_pricier):,})",
-            f"⚠️ مراجعة يدوية ({len(_cl_review):,})",
-            f"🔍 مفقودات ({len(_cl_missing):,})",
-            f"📜 سجل كامل — Audit ({len(_cl_all):,})",
-        ])
-
-        # طابع زمني واحد لجميع ملفات التصدير في هذه الجلسة
-        # يمنع الكتابة فوق تقارير سابقة (Anti-Overwrite Protection)
-        _cl_ts = __import__("datetime").datetime.now().strftime("%Y-%m-%d_%H%M%S")
-
-        # ── عمودا العرض المشتركة ──────────────────────────────────────────
-        _cl_rename_matched = {
-            "Raw_Name":          "منتج المنافس (خام)",
-            "Normalized_Name":   "اسم منظَّم",
-            "سعر_المنافس":       "سعر المنافس",
-            "المنافس":           "المنافس",
-            "No.":               "No. (سلة)",
-            "أسم_المنتج_لدينا":  "منتجنا",
-            "سعر_المنتج_لدينا":  "سعرنا",
-            "Match_Score":       "تطابق%",
-            "Match_Reason":      "سبب القرار",
-            "طبقة_المطابقة":    "الطبقة",
-            "فرق_السعر":         "فرق السعر",
-        }
-
-        # ── تاب 1: منافس أقل ─────────────────────────────────────────────
-        with _cl_t1:
-            st.caption("المنتجات المطابقة تماماً وسعر المنافس **أقل** — راجع تسعيرك.")
-            if _cl_cheaper.empty:
-                st.info("لا توجد منتجات في هذا القسم.")
-            else:
-                _cl_s1 = st.text_input("🔍 بحث", key="cl_s1", placeholder="اسم منتج...")
-                _cl_d1 = _cl_cheaper
-                if _cl_s1:
-                    _cl_d1 = _cl_d1[
-                        _cl_d1["Raw_Name"].str.contains(_cl_s1, case=False, na=False)
-                        | _cl_d1["أسم_المنتج_لدينا"].str.contains(_cl_s1, case=False, na=False)
-                    ]
-                _cl_d1 = _cl_d1.sort_values("فرق_السعر", ascending=True)
-                st.dataframe(
-                    _cl_d1.rename(columns=_cl_rename_matched),
-                    use_container_width=True, height=500,
-                )
-                _cl_x1 = export_to_excel(_cl_d1)
-                st.download_button(
-                    "📥 Excel — منافس أقل",
-                    data=_cl_x1,
-                    file_name=f"cl_cheaper_{_cl_ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="cl_dl1",
-                )
-
-        # ── تاب 2: منافس أعلى ────────────────────────────────────────────
-        with _cl_t2:
-            st.caption("المنتجات المطابقة تماماً وسعر المنافس **أعلى أو مساوٍ**.")
-            if _cl_pricier.empty:
-                st.info("لا توجد منتجات في هذا القسم.")
-            else:
-                _cl_s2 = st.text_input("🔍 بحث", key="cl_s2", placeholder="اسم منتج...")
-                _cl_d2 = _cl_pricier
-                if _cl_s2:
-                    _cl_d2 = _cl_d2[
-                        _cl_d2["Raw_Name"].str.contains(_cl_s2, case=False, na=False)
-                        | _cl_d2["أسم_المنتج_لدينا"].str.contains(_cl_s2, case=False, na=False)
-                    ]
-                _cl_d2 = _cl_d2.sort_values("فرق_السعر", ascending=False)
-                st.dataframe(
-                    _cl_d2.rename(columns=_cl_rename_matched),
-                    use_container_width=True, height=500,
-                )
-                _cl_x2 = export_to_excel(_cl_d2)
-                st.download_button(
-                    "📥 Excel — منافس أعلى",
-                    data=_cl_x2,
-                    file_name=f"cl_pricier_{_cl_ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="cl_dl2",
-                )
-
-        # ── تاب 3: مراجعة يدوية ──────────────────────────────────────────
-        with _cl_t3:
-            st.caption(
-                "المنطقة الرمادية — نسبة التطابق بين 65-89% أو اختلاف هيكلي. "
-                "**يُمنع على الآلة اتخاذ قرار هنا.** قارن الاسمين واتخذ قرارك."
-            )
-            if _cl_review.empty:
-                st.success("✅ لا توجد منتجات تحتاج مراجعة.")
-            else:
-                _cl_s3 = st.text_input("🔍 بحث", key="cl_s3", placeholder="اسم منتج...")
-                _cl_d3 = _cl_review
-                if _cl_s3:
-                    _cl_d3 = _cl_d3[
-                        _cl_d3["Raw_Name"].str.contains(_cl_s3, case=False, na=False)
-                        | _cl_d3["أسم_المنتج_لدينا"].fillna("").str.contains(_cl_s3, case=False, na=False)
-                    ]
-                _cl_d3 = _cl_d3.sort_values("Match_Score", ascending=False)
-
-                # عرض جانبي (اسم المنافس | اسمنا المقترح) + السبب
-                _cl_review_display = _cl_d3[[
-                    "Raw_Name", "أسم_المنتج_لدينا", "سعر_المنافس",
-                    "Match_Score", "Match_Reason", "المنافس", "No.", "طبقة_المطابقة",
-                ]].rename(columns={
-                    "Raw_Name":          "منتج المنافس (خام)",
-                    "أسم_المنتج_لدينا":  "مرشحنا المقترح",
-                    "سعر_المنافس":       "سعر المنافس",
-                    "Match_Score":       "تطابق%",
-                    "Match_Reason":      "سبب الإرسال للمراجعة",
-                    "المنافس":           "المنافس",
-                    "No.":               "No. (سلة)",
-                    "طبقة_المطابقة":    "الطبقة",
-                })
-                st.dataframe(
-                    _cl_review_display,
-                    use_container_width=True,
-                    height=500,
-                    column_config={
-                        "تطابق%": st.column_config.ProgressColumn(
-                            "تطابق%", min_value=0, max_value=100, format="%.1f%%"
-                        ),
-                    },
-                )
-                _cl_x3 = export_to_excel(_cl_d3)
-                st.download_button(
-                    "📥 Excel — مراجعة يدوية",
-                    data=_cl_x3,
-                    file_name=f"cl_review_{_cl_ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="cl_dl3",
-                )
-
-        # ── تاب 4: مفقودات ───────────────────────────────────────────────
-        with _cl_t4:
-            st.caption(
-                "المنتجات التي فشل المحرك في إيجاد مطابق لها (score < 65%). "
-                "يُعرض أفضل مرشح ضعيف كمرجع للمراجعة اليدوية."
-            )
-            if _cl_missing.empty:
-                st.success("✅ لا توجد مفقودات — جميع منتجات المنافس وُجد لها مرشح.")
-            else:
-                _cl_s4 = st.text_input("🔍 بحث", key="cl_s4", placeholder="اسم منتج...")
-                _cl_d4 = _cl_missing
-                if _cl_s4:
-                    _cl_d4 = _cl_d4[
-                        _cl_d4["Raw_Name"].str.contains(_cl_s4, case=False, na=False)
-                    ]
-                _cl_d4 = _cl_d4.sort_values("Match_Score", ascending=False)
-
-                _cl_missing_display = _cl_d4[[
-                    "Raw_Name", "Normalized_Name", "سعر_المنافس",
-                    "Match_Score", "Match_Reason", "أسم_المنتج_لدينا", "المنافس",
-                ]].rename(columns={
-                    "Raw_Name":          "منتج المنافس (خام)",
-                    "Normalized_Name":   "اسم منظَّم",
-                    "سعر_المنافس":       "سعر المنافس",
-                    "Match_Score":       "أعلى تطابق%",
-                    "Match_Reason":      "سبب التصنيف",
-                    "أسم_المنتج_لدينا":  "أفضل مرشح ضعيف",
-                    "المنافس":           "المنافس",
-                })
-                st.dataframe(
-                    _cl_missing_display,
-                    use_container_width=True,
-                    height=500,
-                )
-                _cl_x4 = export_to_excel(_cl_d4)
-                st.download_button(
-                    "📥 Excel — مفقودات",
-                    data=_cl_x4,
-                    file_name=f"cl_missing_{_cl_ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="cl_dl4",
-                )
-
-        # ── تاب 5: سجل Audit الكامل ──────────────────────────────────────
-        with _cl_t5:
-            st.caption(
-                "السجل الكامل لجميع المنتجات مع بصمة القرار (Match_Score + Match_Reason). "
-                "يُمكّن التتبع الكامل لكل قرار اتخذه المحرك."
-            )
-            _cl_s5 = st.text_input("🔍 بحث في السجل الكامل", key="cl_s5", placeholder="اسم أو سبب...")
-            _cl_d5 = _cl_all
-            if _cl_s5:
-                _cl_d5 = _cl_d5[
-                    _cl_d5["Raw_Name"].str.contains(_cl_s5, case=False, na=False)
-                    | _cl_d5["Match_Reason"].str.contains(_cl_s5, case=False, na=False)
-                    | _cl_d5["الحالة"].str.contains(_cl_s5, case=False, na=False)
-                ]
-
-            # فلتر الحالة
-            _cl_status_filter = st.multiselect(
-                "فلتر الحالة",
-                options=[_CL_MATCHED, _CL_REVIEW, _CL_MISSING],
-                default=[_CL_MATCHED, _CL_REVIEW, _CL_MISSING],
-                key="cl_status_filter",
-            )
-            if _cl_status_filter:
-                _cl_d5 = _cl_d5[_cl_d5["الحالة"].isin(_cl_status_filter)]
-
-            st.dataframe(
-                _cl_d5.rename(columns=_cl_rename_matched | {"الحالة": "الحالة", "Normalized_Name": "اسم منظَّم"}),
-                use_container_width=True,
-                height=600,
-            )
-
-            # تصدير شامل بـ 5 أوراق
-            _cl_sheets_all: dict = {}
-            if not _cl_cheaper.empty:
-                _cl_sheets_all["منافس_أقل"]    = _cl_cheaper
-            if not _cl_pricier.empty:
-                _cl_sheets_all["منافس_أعلى"]   = _cl_pricier
-            if not _cl_review.empty:
-                _cl_sheets_all["مراجعة_يدوية"] = _cl_review
-            if not _cl_missing.empty:
-                _cl_sheets_all["مفقودات"]       = _cl_missing
-            if not _cl_all.empty:
-                _cl_sheets_all["سجل_كامل"]      = _cl_all
-
-            if _cl_sheets_all:
-                _cl_excel_all = export_multiple_sheets(_cl_sheets_all)
-                st.download_button(
-                    "📥 تصدير كامل (Excel بـ 5 أوراق + Audit Trail)",
-                    data=_cl_excel_all,
-                    file_name=f"cl_full_report_{_cl_ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="cl_dl_all",
-                )
-
-    elif _cl_report and not _cl_report.get("sanity_passed"):
-        st.error("❌ فشل تحقق الدائرة المغلقة — راجع سجل الخطأ.")
-
-
-# ════════════════════════════════════════════════
-#  10. الإعدادات
-# ════════════════════════════════════════════════
 elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
