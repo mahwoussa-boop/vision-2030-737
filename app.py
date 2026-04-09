@@ -67,6 +67,7 @@ from utils.make_helper import (send_price_updates, send_new_products,
                                 verify_webhook_connection, export_to_make_format,
                                 send_batch_smart)
 from utils.salla_shamel_export import export_to_salla_shamel
+from utils.product_analyzer import analyze_product_inline, render_analysis_result
 from utils.filter_ui import (render_sidebar_filters, apply_global_filters,
                               get_active_filter_summary)
 from utils.data_helpers import (safe_results_for_json, restore_results_from_json,
@@ -1181,7 +1182,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
             # قسم الموافقات: بدون تكرار «تحقق» الثاني ولا «تاريخ» — يبقى 🤖 تحقق في b1
             b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
         else:
-            b1, b2, b3, b4, b5, b6, b7, b8, b9 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1])
+            b1, b2, b3, b4, b5, b6, b7, b8, b9, ba = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 
         with b1:  # AI تحقق ذكي — يُصحح القسم
             _ai_label = {"raise": "🤖 هل نخفض؟", "lower": "🤖 هل نرفع؟",
@@ -1290,10 +1291,13 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                 _hk3 = f"{prefix}_{our_name}_{idx}"
                 st.session_state.hidden_products.add(_hk3)
                 save_hidden_product(_hk3, our_name, "approved")
-                save_processed(_hk3, our_name, comp_src, "approved",
-                               old_price=our_price, new_price=our_price,
-                               product_id=str(row.get("معرف_المنتج","")),
-                               notes=f"موافق من {prefix} | منافس: {comp_src}")
+                # ── توجيه آلي → تمت المعالجة ──
+                _auto_route_to_processed(
+                    our_name, str(row.get("معرف_المنتج","")),
+                    comp_src, "approved",
+                    old_price=our_price, new_price=our_price,
+                    notes=f"موافق من {prefix}",
+                )
                 st.rerun()
 
         with b4:  # تأجيل
@@ -1363,10 +1367,14 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                         _hk = f"{prefix}_{our_name}_{idx}"
                         st.session_state.hidden_products.add(_hk)
                         save_hidden_product(_hk, our_name, "sent_to_make")
-                        save_processed(_hk, our_name, comp_src, "send_price",
-                                       old_price=our_price, new_price=_final_price,
-                                       product_id=_pid,
-                                       notes=f"Make ← {prefix} | منافس: {comp_src} | {comp_price:.0f}→{_final_price:.0f}ر.س")
+                        # ── توجيه آلي → تمت المعالجة ──
+                        _auto_route_to_processed(
+                            our_name, _pid,
+                            comp_src, "send_price",
+                            old_price=our_price, new_price=_final_price,
+                            notes=f"إرسال لـ Make من {prefix}",
+                        )
+                        st.success(f"✅ تم الإرسال: {_pid}")
                         st.rerun()
 
         if prefix != "approved":
@@ -1392,11 +1400,40 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                     else:
                         st.info("لا يوجد تاريخ بعد")
 
+            with ba:  # 📊 تحليل المنتج الموضعي
+                if st.button("📊 تحليل", key=f"analyze_{prefix}_{idx}",
+                             help="تحليل شامل: سعر + مطابقة + قسم صحيح"):
+                    _section_map_an = {
+                        "raise": "price_raise", "lower": "price_lower",
+                        "approved": "approved", "review": "review",
+                        "excluded": "excluded",
+                    }
+                    with st.spinner("🔍 يتم التحليل الآن..."):
+                        an_res = analyze_product_inline(row, _section_map_an.get(prefix, prefix))
+                        render_analysis_result(an_res)
+
         _hr_m = "3px 0" if (compact_cards and prefix == "raise") else "6px 0"
         st.markdown(
             f'<hr style="border:none;border-top:1px solid #1a1a2e;margin:{_hr_m}">',
             unsafe_allow_html=True,
         )
+
+
+# ════════════════════════════════════════════════
+# ════════════════════════════════════════════════
+#  نظام التوجيه الآلي (Auto-Routing)
+# ════════════════════════════════════════════════
+def _auto_route_to_processed(our_name, our_id, comp_src, status, old_price=0, new_price=0, notes=""):
+    """نقل المنتج تلقائياً إلى 'تمت المعالجة' وحفظ حالته في DB."""
+    try:
+        # 1. حفظ في جدول المعالجة
+        save_processed(our_name, our_id, comp_src, status, old_price, new_price, notes)
+        # 2. إخفاء من الواجهة (حفظ في جدول المنتجات المخفية)
+        save_hidden_product(our_name, our_id, comp_src)
+        return True
+    except Exception as e:
+        st.error(f"خطأ في التوجيه الآلي: {e}")
+        return False
 
 
 # ════════════════════════════════════════════════
