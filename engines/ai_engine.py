@@ -738,9 +738,14 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
     """
     frag_info = ""
     if fragrantica_data and fragrantica_data.get("success"):
-        top = ", ".join(fragrantica_data.get("top_notes", [])[:5])
-        mid = ", ".join(fragrantica_data.get("middle_notes", [])[:5])
-        base = ", ".join(fragrantica_data.get("base_notes", [])[:5])
+        def _to_list(v):
+            """يحوّل أي قيمة (str/list/None) إلى list بأمان."""
+            if isinstance(v, list):   return v
+            if isinstance(v, str):    return [x.strip() for x in v.split(",") if x.strip()]
+            return []
+        top  = ", ".join(_to_list(fragrantica_data.get("top_notes",    []))[:5])
+        mid  = ", ".join(_to_list(fragrantica_data.get("middle_notes", []))[:5])
+        base = ", ".join(_to_list(fragrantica_data.get("base_notes",   []))[:5])
         desc = fragrantica_data.get("description_ar", "")
         brand = fragrantica_data.get("brand", "")
         ptype = fragrantica_data.get("type", "")
