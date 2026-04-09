@@ -72,13 +72,26 @@ def calculate_match_score(name1: str, name2: str) -> float:
         
     return min(100.0, score)
 
-def run_full_analysis(our_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) -> pd.DataFrame:
-    """المحرك الرئيسي للمطابقة: يجمع كل البيانات ويقوم بعملية المطابقة والفرز."""
+def run_full_analysis(our_df: pd.DataFrame, comp_dfs: List[pd.DataFrame], enable_routing: bool = True) -> pd.DataFrame:
+    """المحرك الرئيسي للمطابقة: يجمع كل البيانات ويقوم بعملية المطابقة والفرز.
+    
+    Args:
+        our_df: بيانات منتجاتنا
+        comp_dfs: قائمة بيانات المنافسين
+        enable_routing: تفعيل محرك التوزيع الآمن
+    """
     if our_df is None or our_df.empty or not comp_dfs:
         return pd.DataFrame()
     
-    # توحيد بيانات المنافسين
-    all_comp = pd.concat(comp_dfs, ignore_index=True)
+    # توحيد بيانات المنافسين مع إضافة معرفات المصدر
+    all_comp_with_source = []
+    for idx, df in enumerate(comp_dfs):
+        df_copy = df.copy()
+        df_copy['_competitor_source'] = f'competitor_{idx}'
+        df_copy['_competitor_name'] = f'المنافس {idx + 1}'
+        all_comp_with_source.append(df_copy)
+    
+    all_comp = pd.concat(all_comp_with_source, ignore_index=True)
     all_comp, _ = apply_strict_pipeline_filters(all_comp)
     
     results = []
@@ -102,6 +115,11 @@ def run_full_analysis(our_df: pd.DataFrame, comp_dfs: List[pd.DataFrame]) -> pd.
         # تصنيف النتيجة بناءً على نسبة المطابقة
         res_row = our_row.to_dict()
         res_row["نسبة_المطابقة"] = best_score
+        
+        # إضافة معرفات المصدر للتتبع الآمن
+        if best_match is not None:
+            res_row["_source_competitor"] = best_match.get("_competitor_source", "unknown")
+            res_row["_source_competitor_name"] = best_match.get("_competitor_name", "unknown")
         
         if best_score >= STRICT_MATCH_THRESHOLD:
             # مطابقة مؤكدة
@@ -169,3 +187,140 @@ def resolve_catalog_columns(df): return df
 def detect_input_columns(df): return {c:c for c in df.columns}
 def apply_user_column_map(df, m): return df
 def _first_image_url_from_row(r): return r.get("صورة_المنافس", r.get("image_url", ""))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دوال جديدة لدعم إعادة التحليل الفردي والتوزيع الآمن v28.0
+# ═══════════════════════════════════════════════════════════════════
+
+def reanalyze_single_product(
+    product_id: str, 
+    product_data: Dict, 
+    our_df: pd.DataFrame, 
+    match_threshold: float = STRICT_MATCH_THRESHOLD
+) -> Dict:
+    """
+    إعادة تحليل منتج واحد من الصفر
+    
+    Args:
+        product_id: معرف المنتج
+        product_data: بيانات المنتج
+        our_df: الكتالوج الأساسي
+        match_threshold: حد المطابقة
+    
+    Returns:
+        قاموس بنتائج إعادة التحليل
+    """
+    product_name = str(product_data.get("المنتج", product_data.get("اسم المنتج", "")))
+    
+    best_match = None
+    best_score = 0
+    
+    for _, our_row in our_df.iterrows():
+        our_name = str(our_row.get("المنتج", our_row.get("اسم المنتج", "")))
+        score = calculate_match_score(product_name, our_name)
+        
+        if score > best_score:
+            best_score = score
+            best_match = our_row
+    
+    # اتخاذ القرار
+    decision = "✅ تم المطابقة" if best_score >= match_threshold else "🔍 منتج مفقود"
+    
+    return {
+        "product_id": product_id,
+        "product_name": product_name,
+        "new_decision": decision,
+        "match_score": best_score,
+        "matched_with": best_match.get("المنتج") if best_match is not None else None,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+def validate_data_isolation(df: pd.DataFrame, competitor_id: str = None) -> Tuple[bool, List[str]]:
+    """
+    التحقق من عزل البيانات (عدم وجود بيانات مكررة من مصادر أخرى)
+    
+    Args:
+        df: البيانات المراد التحقق منها
+        competitor_id: معرف المنافس (اختياري)
+    
+    Returns:
+        (صحيح/خطأ، قائمة المشاكل)
+    """
+    issues = []
+    
+    # التحقق من عمود معرف المصدر
+    if "_competitor_source" in df.columns and competitor_id:
+        invalid_sources = df[df["_competitor_source"] != competitor_id]
+        if not invalid_sources.empty:
+            issues.append(f"وجدت {len(invalid_sources)} صف من مصادر أخرى (تسرب بيانات)")
+    
+    # التحقق من تكرار المنتجات
+    name_col = "المنتج" if "المنتج" in df.columns else "اسم المنتج"
+    if name_col in df.columns:
+        duplicates = df[name_col].duplicated().sum()
+        if duplicates > 0:
+            issues.append(f"وجدت {duplicates} منتج مكرر")
+    
+    return len(issues) == 0, issues
+
+
+def get_products_for_reanalysis(
+    results_df: pd.DataFrame, 
+    decision_filter: str = "⚠️ تحت المراجعة"
+) -> Dict[str, Dict]:
+    """
+    الحصول على قائمة المنتجات التي تحتاج إلى إعادة تحليل
+    
+    Args:
+        results_df: نتائج التحليل السابق
+        decision_filter: فلتر القرار (مثل "⚠️ تحت المراجعة")
+    
+    Returns:
+        قاموس {product_id: product_data}
+    """
+    products_to_reanalyze = {}
+    
+    if decision_filter not in results_df.columns and "القرار" not in results_df.columns:
+        return products_to_reanalyze
+    
+    decision_col = "القرار" if "القرار" in results_df.columns else decision_filter
+    
+    filtered = results_df[results_df[decision_col] == decision_filter]
+    
+    for idx, row in filtered.iterrows():
+        product_id = f"product_{idx}"
+        products_to_reanalyze[product_id] = row.to_dict()
+    
+    return products_to_reanalyze
+
+
+def batch_reanalyze_products(
+    products_dict: Dict[str, Dict],
+    our_df: pd.DataFrame,
+    match_threshold: float = STRICT_MATCH_THRESHOLD
+) -> List[Dict]:
+    """
+    إعادة تحليل مجموعة من المنتجات
+    
+    Args:
+        products_dict: قاموس المنتجات
+        our_df: الكتالوج الأساسي
+        match_threshold: حد المطابقة
+    
+    Returns:
+        قائمة بنتائج إعادة التحليل
+    """
+    results = []
+    
+    for product_id, product_data in products_dict.items():
+        result = reanalyze_single_product(
+            product_id,
+            product_data,
+            our_df,
+            match_threshold
+        )
+        results.append(result)
+    
+    return results
