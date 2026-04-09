@@ -1176,12 +1176,15 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
             )
             st.markdown(_hr_act, unsafe_allow_html=True)
 
+        # ── تعريف الأعمدة (b1..ba) لجميع الأقسام لضمان عدم حدوث UnboundLocalError ──
         if prefix in ("raise", "lower"):
-            b1, b2, b3, b4, b8, b9 = st.columns([1, 1, 1, 1, 1, 1])
+            # b1:AI, b2:Market, b3:OK, b4:Defer, b8:Verify, b9:History, ba:Analyze
+            b1, b2, b3, b4, b8, b9, ba = st.columns([1, 1, 1, 1, 1, 1, 1])
         elif prefix == "approved":
-            # قسم الموافقات: بدون تكرار «تحقق» الثاني ولا «تاريخ» — يبقى 🤖 تحقق في b1
+            # b1:AI, b2:Market, b3:OK, b4:Defer, b5:Remove, b6:Price, b7:Make
             b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
         else:
+            # b1..ba (10 columns)
             b1, b2, b3, b4, b5, b6, b7, b8, b9, ba = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 
         with b1:  # AI تحقق ذكي — يُصحح القسم
