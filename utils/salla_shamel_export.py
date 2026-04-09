@@ -17,6 +17,7 @@ from engines.mahwous_core import sanitize_salla_text, format_mahwous_description
 from utils.helpers import safe_float
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ALT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u0600-\u06FF\s]")
 
 # رؤوس الأعمدة كما في ملف "منتججديد.csv"
 SALLA_SHAMEL_COLUMNS = [
@@ -84,6 +85,14 @@ def _plain_missing_product_name(r: dict) -> str:
     return "منتج عطر"
 
 
+def _safe_alt_text(s: str) -> str:
+    """وصف صورة نصي فقط بدون رموز خاصة لتوافق تحقق سلة."""
+    t = sanitize_salla_text(_strip_html_visible(s or "")).strip()
+    t = _ALT_SAFE_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:180]
+
+
 def _real_price(r: dict) -> str:
     for k in ("سعر_المنافس", "سعر المنافس", "السعر", "سعر المنتج", "Price", "price", "PRICE"):
         if k not in r: continue
@@ -121,7 +130,11 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         r = row.to_dict()
         pname = _plain_missing_product_name(r)
         comp_price = _real_price(r)
-        brand = sanitize_salla_text(str(r.get("الماركة", "ماركة عالمية")))
+        brand = sanitize_salla_text(
+            str(r.get("الماركة_الرسمية", "") or r.get("الماركة", "")).strip()
+        )
+        if brand in ("", "ماركة عالمية", "Unknown", "unknown"):
+            brand = ""
         img = str(r.get("صورة_المنافس", r.get("image_url", ""))).strip()
         sku = _real_sku(r)
         
@@ -138,8 +151,19 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         }
         desc_text = format_mahwous_description(product_data)
         
-        category = auto_infer_category(pname, str(r.get("الجنس", "")))
-        alt_txt = sanitize_salla_text(f"زجاجة عطر {pname} الأصلية")
+        category = sanitize_salla_text(
+            str(r.get("التصنيف_الرسمي", "") or r.get("تصنيف المنتج", "")).strip()
+        )
+        if not category:
+            category = auto_infer_category(pname, str(r.get("الجنس", "")))
+        # إذا AI فشل بالمطابقة الدقيقة نتركه فارغاً لتجنب رفض الاستيراد بسبب تصنيف غير معرف
+        if category in ("", "العطور", "عطور للجنسين", "غير محدد", "منتجات عامة"):
+            category = ""
+        alt_txt = _safe_alt_text(f"صورة {pname}")
+
+        final_desc = sanitize_salla_text(str(r.get("وصف_AI", "") or "").strip())
+        if not final_desc:
+            final_desc = desc_text
 
         row_csv = {
             "النوع ": "منتج",
@@ -149,16 +173,16 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             "وصف صورة المنتج": alt_txt,
             "نوع المنتج": "منتج جاهز",
             "سعر المنتج": comp_price,
-            "الوصف": desc_text,
+            "الوصف": final_desc,
             "هل يتطلب شحن؟": "نعم",
             "رمز المنتج sku": sku,
             "سعر التكلفة": "",
             "السعر المخفض": "",
             "تاريخ بداية التخفيض": "",
             "تاريخ نهاية التخفيض": "",
-            "اقصي كمية لكل عميل": "0",
-            "إخفاء خيار تحديد الكمية": "0",
-            "اضافة صورة عند الطلب": "0",
+            "اقصي كمية لكل عميل": "1",
+            "إخفاء خيار تحديد الكمية": "لا",
+            "اضافة صورة عند الطلب": "لا",
             "الوزن": "0.2",
             "وحدة الوزن": "kg",
             "الماركة": brand,
