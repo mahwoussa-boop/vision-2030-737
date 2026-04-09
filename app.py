@@ -2315,18 +2315,34 @@ elif page == "🔍 منتجات مفقودة":
                                 if frag_info.get("success"):
                                     raw_data += f", المكونات: {', '.join(frag_info.get('top_notes', []))}"
 
-                                enriched_data = generate_seo_description(raw_data)
+                                # ── توليد الوصف بصيغة HTML (لا Markdown) ──────────────────────
+                                # generate_mahwous_description ترجع نصاً Markdown ثم نحوّله لـ HTML
+                                # عبر _markdown_to_salla_html في وقت التصدير (salla_shamel_export).
+                                # لكن الأفضل: نمرر بيانات Fragrantica لـ generate_mahwous_description
+                                # فتولّد وصفاً أكثر دقةً وأطول من generate_seo_description.
+                                html_body = generate_mahwous_description(
+                                    product_name=p_name,
+                                    price=p_price,
+                                    fragrantica_data=frag_info if frag_info.get("success") else None,
+                                )
+                                # الماركة والتصنيف نستخرجهما من generate_seo_description (JSON structured)
+                                seo_data = generate_seo_description(raw_data)
 
                                 new_row = row.copy()
-                                new_row["وصف_AI"] = enriched_data.get("markdown_desc", "")
-                                new_row["الماركة_الرسمية"] = enriched_data.get(
+                                new_row["وصف_AI"] = html_body or seo_data.get("markdown_desc", "")
+                                new_row["الماركة_الرسمية"] = seo_data.get(
                                     "exact_brand",
                                     str(row.get("الماركة", "")),
                                 )
-                                new_row["التصنيف_الرسمي"] = enriched_data.get(
+                                new_row["التصنيف_الرسمي"] = seo_data.get(
                                     "exact_category",
                                     "العطور",
                                 )
+                                # حفظ المكونات منفصلة لتحسين الوصف الاحتياطي
+                                if frag_info.get("success"):
+                                    new_row["top_notes"]   = ", ".join(frag_info.get("top_notes", []))
+                                    new_row["heart_notes"] = ", ".join(frag_info.get("middle_notes", []))
+                                    new_row["base_notes"]  = ", ".join(frag_info.get("base_notes", []))
                                 processed_rows.append(new_row)
 
                             if uncertain_pending and uncertain_policy == "⏸️ إيقاف وطلب قرار":
