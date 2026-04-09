@@ -1,6 +1,7 @@
 """
 mahwous_core — فلاتر مسار صارمة، استخراج المكونات، وتنسيق "مهووس" الاحترافي.
 متوافق 100% مع منصة سلة و Make.
+v28.0 - النسخة الكاملة المدمجة.
 """
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ except ImportError:
 
 # تعبيرات نمطية لتنظيف النصوص لمنصة سلة
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_NON_TEXT_RE = re.compile(r"[^\w\s\.\-\(\)\[\]\!\؟\:\,\|\/]")
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     try:
@@ -60,12 +60,13 @@ def apply_strict_pipeline_filters(
     if df is None or df.empty:
         return df, {"dropped": 0}
 
+    # محاولة البحث عن عمود الاسم الصحيح
+    actual_col = name_col
     if name_col not in df.columns:
-        # محاولة البحث عن عمود الاسم البديل
-        alt_cols = ["المنتج", "اسم المنتج", "Product", "Name"]
+        alt_cols = ["المنتج", "اسم المنتج", "Product", "Name", "أسم المنتج"]
         for c in alt_cols:
             if c in df.columns:
-                name_col = c
+                actual_col = c
                 break
         else:
             return df.copy(), {"dropped": 0, "warning": f"عمود غير موجود: {name_col}"}
@@ -79,7 +80,7 @@ def apply_strict_pipeline_filters(
     keep_idx: List[Any] = []
 
     for idx, row in df.iterrows():
-        name = str(row.get(name_col, "")).strip()
+        name = str(row.get(actual_col, "")).strip()
         if not name or name.lower() in ("nan", "none", "<na>"):
             stats["dropped_empty_name"] += 1
             continue
@@ -104,49 +105,46 @@ def apply_strict_pipeline_filters(
 def sanitize_salla_text(text: str) -> str:
     """تنظيف النصوص من الرموز البرمجية والأحرف الخاصة المعيقة للرفع لسلة."""
     if not text: return ""
-    # إزالة الـ HTML
     text = _HTML_TAG_RE.sub(" ", str(text))
-    # فك ترميز HTML entities
     text = html.unescape(text)
-    # إزالة الأحرف الغريبة مع الحفاظ على العربية والإنجليزية والترقيم الأساسي
-    # text = _NON_TEXT_RE.sub("", text)
     # تنظيف المسافات الزائدة
     return re.sub(r"\s+", " ", text).strip()
 
 def format_mahwous_description(product_data: dict) -> str:
-    """تنسيق الوصف بأسلوب مهووس الاحترافي."""
+    """تنسيق الوصف بأسلوب مهووس الاحترافي (Mahwous Format)."""
     name = sanitize_salla_text(product_data.get("name", "عطر فاخر"))
     brand = sanitize_salla_text(product_data.get("brand", "ماركة عالمية"))
     desc = product_data.get("description", "")
-    notes = product_data.get("notes", {}) # الهرم العطري
-    features = product_data.get("features", [
-        "عطر أصلي 100% بضمان متجر مهووس",
-        "ثبات عالي وفوحان يأسر الحواس",
-        "مناسب للاستخدام اليومي والمناسبات الخاصة"
-    ])
-
-    # بناء الوصف بتنسيق مهووس
+    notes = product_data.get("notes", {}) 
+    
+    # بناء الهيكل الاحترافي
     lines = [
-        f"## {name} من {brand}",
-        f"\nاستمتع بتجربة عطرية فريدة مع {name}، العطر الذي يجسد الأناقة والفخامة في كل رشة. متوفر الآن في متجر مهووس، وجهتك الأولى لأرقى العطور العالمية.",
-        "\n### ✨ مميزات المنتج",
+        f"<h2>{name} من {brand}</h2>",
+        f"<p>اكتشف سحر <strong>{name}</strong> من <strong>{brand}</strong> — عطر فاخر يجمع بين الأصالة والتميز. متوفر الآن في متجر مهووس، وجهتك الأولى لأرقى العطور العالمية.</p>",
+        "<h3>✨ مميزات المنتج</h3>",
+        "<ul>",
+        "<li><strong>الأصالة:</strong> عطر أصلي 100% بضمان متجر مهووس.</li>",
+        "<li><strong>الأداء:</strong> ثبات عالي وفوحان يأسر الحواس طوال اليوم.</li>",
+        "<li><strong>التصميم:</strong> زجاجة أنيقة تعكس فخامة المحتوى.</li>",
+        "</ul>"
     ]
     
-    for feat in features:
-        lines.append(f"* {sanitize_salla_text(feat)}")
-    
-    if notes:
-        lines.append("\n### 🎼 الهرم العطري (المكونات الحقيقية)")
-        if notes.get("top"): lines.append(f"* **الافتتاحية:** {sanitize_salla_text(notes['top'])}")
-        if notes.get("heart"): lines.append(f"* **القلب:** {sanitize_salla_text(notes['heart'])}")
-        if notes.get("base"): lines.append(f"* **القاعدة:** {sanitize_salla_text(notes['base'])}")
+    if notes and any(notes.values()):
+        lines.append("<h3>🎼 الهرم العطري (المكونات الحقيقية)</h3>")
+        lines.append("<ul>")
+        if notes.get("top"): lines.append(f"<li><strong>الافتتاحية (Top Notes):</strong> {sanitize_salla_text(notes['top'])}</li>")
+        if notes.get("heart"): lines.append(f"<li><strong>القلب (Heart Notes):</strong> {sanitize_salla_text(notes['heart'])}</li>")
+        if notes.get("base"): lines.append(f"<li><strong>القاعدة (Base Notes):</strong> {sanitize_salla_text(notes['base'])}</li>")
+        lines.append("</ul>")
     elif desc:
-        lines.append("\n### 📝 وصف العطر")
-        lines.append(sanitize_salla_text(desc))
+        lines.append("<h3>📝 وصف العطر</h3>")
+        lines.append(f"<p>{sanitize_salla_text(desc)}</p>")
 
-    lines.append("\n---\n*جميع عطورنا أصلية 100% ونضمن لك الجودة والتميز في كل طلب.*")
+    lines.append("<h3>لمسة خبير من مهووس</h3>")
+    lines.append("<p>هذا العطر يمثل التوازن المثالي بين القوة والنعومة. ننصح برشه على نقاط النبض للحصول على أفضل أداء وفوحان.</p>")
+    lines.append("<p><strong>عالمك العطري يبدأ من مهووس.</strong> أصلي 100% | شحن سريع داخل السعودية.</p>")
     
-    return "\n".join(lines)
+    return "".join(lines)
 
 def validate_export_product_dataframe(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     issues: List[str] = []
@@ -163,11 +161,9 @@ def validate_export_product_dataframe(df: pd.DataFrame) -> Tuple[bool, List[str]
         price = _safe_float(
             row.get("سعر_المنافس", row.get("سعر المنافس", row.get("السعر", 0)))
         )
-        label = name[:48] + ("…" if len(name) > 48 else "") if name else "(بدون اسم)"
-
         if not name or name.lower() in ("nan", "none"):
-            issues.append(f"صف {i + 1}: اسم المنتج فارغ — {label}")
+            issues.append(f"صف {i + 1}: اسم المنتج فارغ")
         if price <= 0:
-            issues.append(f"صف {i + 1}: السعر غير صالح أو صفر ({price}) — {label}")
+            issues.append(f"صف {i + 1}: السعر غير صالح")
 
     return (len(issues) == 0, issues)
