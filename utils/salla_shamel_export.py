@@ -8,6 +8,8 @@ import io
 import csv
 import re
 import json
+import uuid
+import difflib
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -18,6 +20,8 @@ from engines.mahwous_core import sanitize_salla_text, format_mahwous_description
 from engines.prompts import (
     SALLA_BRANDS_FILE, SALLA_BRANDS_COL,
     BRANDS_CSV_FILE, BRANDS_CSV_COL,
+    SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL,
+    CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL,
 )
 from utils.data_paths import get_catalog_data_path
 from utils.helpers import safe_float
@@ -76,6 +80,29 @@ def _load_store_brands() -> list[str]:
     return list(dict.fromkeys(brands))
 
 
+def _load_store_categories() -> list[str]:
+    cats: list[str] = []
+    salla_path = get_catalog_data_path(SALLA_CATEGORIES_FILE)
+    fallback_path = get_catalog_data_path(CATEGORIES_CSV_FILE)
+    try:
+        if salla_path and pd.io.common.file_exists(salla_path):
+            _df = pd.read_csv(salla_path, encoding="utf-8-sig")
+            if SALLA_CATEGORIES_COL in _df.columns:
+                cats = [str(x).strip() for x in _df[SALLA_CATEGORIES_COL].dropna().astype(str).tolist() if str(x).strip()]
+    except Exception:
+        cats = []
+    if cats:
+        return list(dict.fromkeys(cats))
+    try:
+        if fallback_path and pd.io.common.file_exists(fallback_path):
+            _df = pd.read_csv(fallback_path, encoding="utf-8-sig", header=None)
+            if CATEGORIES_CSV_COL < len(_df.columns):
+                cats = [str(x).strip() for x in _df.iloc[:, CATEGORIES_CSV_COL].dropna().astype(str).tolist() if str(x).strip()]
+    except Exception:
+        cats = []
+    return list(dict.fromkeys(cats))
+
+
 def _brand_aliases(brand_label: str) -> set[str]:
     """يبني مفاتيح مطابقة لاسم ماركة مركب مثل: عربي | English."""
     s = str(brand_label or "").strip()
@@ -101,6 +128,49 @@ def _resolve_brand_to_store(brand_value: str, store_brands: list[str]) -> str:
         if target_keys & _brand_aliases(sb):
             return sb
     return bv
+
+
+def _norm_category(s: str) -> str:
+    t = sanitize_salla_text(str(s or "")).strip().lower()
+    t = re.sub(r"[>|\-_/]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _resolve_category_to_store(cat_value: str, store_categories: list[str], gender_hint: str = "") -> str:
+    cv = str(cat_value or "").strip()
+    if not store_categories:
+        return cv
+    if cv in store_categories:
+        return cv
+
+    norm_map = {_norm_category(c): c for c in store_categories if _norm_category(c)}
+    ncv = _norm_category(cv)
+    if ncv in norm_map:
+        return norm_map[ncv]
+
+    gh = str(gender_hint or "").strip()
+    if gh == "نسائي":
+        for c in store_categories:
+            if "نسائي" in c:
+                return c
+    elif gh == "رجالي":
+        for c in store_categories:
+            if "رجالي" in c:
+                return c
+    elif gh == "للجنسين":
+        for c in store_categories:
+            if "للجنسين" in c:
+                return c
+
+    matches = difflib.get_close_matches(ncv, list(norm_map.keys()), n=1, cutoff=0.5)
+    if matches:
+        return norm_map[matches[0]]
+
+    for c in store_categories:
+        if "عطور" in c:
+            return c
+    return store_categories[0]
 
 
 def _concentration_ar(s: str) -> str:
@@ -263,11 +333,14 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
 
     rows_out = []
     _store_brands = _load_store_brands()
+    _store_categories = _load_store_categories()
     _store_brands_norm = {_norm_brand(b): b for b in _store_brands if _norm_brand(b)}
     _debug_log("H6", "salla_shamel_export.py:export_start", "Started Salla export", {
         "rows": int(len(missing_df)),
         "store_brands_count": int(len(_store_brands)),
+        "store_categories_count": int(len(_store_categories)),
     })
+    _seen_skus: set[str] = set()
     for _, row in missing_df.iterrows():
         r = row.to_dict()
         raw_pname = _plain_missing_product_name(r)
@@ -294,7 +367,12 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             "store_brand_norm_match": _store_brands_norm.get(_norm_brand(brand), "")[:120],
         })
         img = str(r.get("صورة_المنافس", r.get("image_url", ""))).strip()
-        sku = _real_sku(r)
+        sku_raw = _real_sku(r)
+        sku = sanitize_salla_text(str(sku_raw or "").strip())
+        _sku_invalid = (not sku) or ("/" in sku) or ("http" in sku.lower()) or (sku in _seen_skus)
+        if _sku_invalid:
+            sku = f"MS-{uuid.uuid4().hex[:10].upper()}"
+        _seen_skus.add(sku)
         
         # استخراج المكونات وتنسيق الوصف بأسلوب مهووس
         product_data = {
@@ -323,9 +401,9 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
                 category = "العطور > عطور للجنسين"
             else:
                 category = "العطور > عطور للجنسين"
-        # إذا AI فشل بالمطابقة الدقيقة نتركه فارغاً لتجنب رفض الاستيراد بسبب تصنيف غير معرف
+        category = _resolve_category_to_store(category, _store_categories, gender_inferred)
         if category in ("", "العطور", "عطور للجنسين", "غير محدد", "منتجات عامة"):
-            category = ""
+            category = _resolve_category_to_store("", _store_categories, gender_inferred)
         alt_txt = _safe_alt_text(f"صورة {pname}")
         _debug_log("H7", "salla_shamel_export.py:title_category_probe", "Row title/category probe", {
             "product_raw": str(r.get("منتج_المنافس", ""))[:180],
@@ -334,6 +412,12 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             "gender_inferred": gender_inferred,
             "category_final": category,
             "category_source_exact": bool(str(r.get("التصنيف_الرسمي", "")).strip()),
+        })
+        _debug_log("H8", "salla_shamel_export.py:sku_probe", "SKU resolved for row", {
+            "product": pname[:120],
+            "sku_raw": str(sku_raw)[:140],
+            "sku_final": sku,
+            "sku_regenerated": _sku_invalid,
         })
 
         final_desc = sanitize_salla_text(str(r.get("وصف_AI", "") or "").strip())
