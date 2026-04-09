@@ -1230,3 +1230,17 @@ def generate_salla_brand_info(brand_name: str) -> str:
     info = f"<h2>معلومات عن ماركة {brand_name}</h2>"
     info += "<p>هنا ستجد معلومات مفصلة عن الماركة، تاريخها، وفلسفتها...</p>"
     return info
+
+
+def visual_verify_match(product_image_url: str, competitor_image_url: str) -> bool:
+    """
+    دالة وهمية للتحقق البصري من تطابق المنتجات باستخدام صورها.
+    تحتاج إلى تطوير لاحقاً لدمج نماذج رؤية حاسوبية.
+    """
+    # هذا مجرد مثال، يجب تطوير هذه الدالة للتحقق البصري الفعلي
+    # في الوقت الحالي، سنفترض تطابقاً عشوائياً أو بناءً على منطق بسيط
+    print(f"Visual verification requested for: {product_image_url} vs {competitor_image_url}")
+    # منطق وهمي: إذا كانت الروابط متشابهة جداً، اعتبرها متطابقة
+    if product_image_url and competitor_image_url and product_image_url.split('/')[-1] == competitor_image_url.split('/')[-1]:
+        return True
+    return False
