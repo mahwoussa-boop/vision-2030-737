@@ -1206,3 +1206,17 @@ def get_catalog_status() -> dict:
                                       CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
         "missing_brands": missing_stat,
     }
+
+
+def generate_salla_html_description(product_name: str, product_details: dict) -> str:
+    """
+    دالة وهمية لإنشاء وصف HTML لمنتجات سلة. تحتاج إلى تطوير لاحقاً.
+    """
+    # هذا مجرد مثال، يجب تطوير هذه الدالة لإنشاء وصف HTML فعلي
+    html_desc = f"<h1>{product_name}</h1>"
+    html_desc += "<ul>"
+    for key, value in product_details.items():
+        html_desc += f"<li><b>{key}:</b> {value}</li>"
+    html_desc += "</ul>"
+    html_desc += "<p>وصف تفصيلي للمنتج هنا...</p>"
+    return html_desc
