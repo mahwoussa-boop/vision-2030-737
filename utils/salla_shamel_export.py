@@ -1,6 +1,7 @@
 """
 تصدير منتجات مفقودة بتنسيق CSV سلة الشامل المحدث.
 مطابق تماماً لنموذج "منتججديد.csv" المرفق.
+v28.0 - النسخة الكاملة المدمجة.
 """
 import html
 import io
@@ -76,7 +77,7 @@ def _is_url_text(s: str) -> bool:
 
 
 def _plain_missing_product_name(r: dict) -> str:
-    for key in ("المنتج", "اسم المنتج", "اسم_المنتج", "Product", "Name", "name", "title", "الاسم", "منتج_المنافس"):
+    for key in ("المنتج", "اسم المنتج", "اسم_المنتج", "Product", "Name", "name", "title", "الاسم", "منتج_المنافس", "أسم المنتج"):
         v = r.get(key)
         if v and not _is_url_text(v):
             return sanitize_salla_text(str(v))
@@ -177,11 +178,10 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
 
     buf = io.StringIO(newline="")
     writer = csv.writer(buf)
-    # إضافة BOM يدوياً في أول سطر
+    # إضافة BOM يدوياً في أول سطر لضمان توافق سلة
     writer.writerow(["﻿بيانات المنتج"] + [""] * (ncols - 1))
     writer.writerow(SALLA_SHAMEL_COLUMNS)
     for line in rows_out:
         writer.writerow(line)
     
-    # تحويل لـ bytes مع ترميز UTF-8
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
