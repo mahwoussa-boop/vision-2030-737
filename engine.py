@@ -1514,7 +1514,12 @@ def apply_user_column_map(df, name=None, price=None, id_col=None, img=None, url=
 class CompIndex:
     """فهرس المنافس المطبَّع مسبقاً"""
     def __init__(self, df, name_col, id_col, comp_name, img_col=None, url_col=None):
-        self.comp_name = comp_name
+        # ── Phase 1: حل اسم المنافس عبر جدول aliases لمنع التكرار ──────────
+        try:
+            from utils.db_manager import resolve_competitor as _resolve_comp
+            self.comp_name = _resolve_comp(comp_name)
+        except Exception:
+            self.comp_name = comp_name  # fallback آمن بدون كسر التوافقية
         self.name_col  = name_col
         self.id_col    = id_col
         self.img_col   = (img_col or "") or ""
@@ -1577,7 +1582,14 @@ class CompIndex:
 
             # ═══ فلاتر سريعة ═══
             if our_br and c_br and normalize(our_br) != normalize(c_br): continue
-            if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 30: continue
+
+            # ── Phase 1: Zero Tolerance للحجم ──────────────────────────────
+            # ① استبعاد المنافس مجهول الحجم (c_sz == 0) تماماً عند معرفة حجمنا
+            if our_sz > 0 and c_sz == 0: continue
+            # ② مطابقة تامة للحجم — صفر تسامح (our_sz != c_sz بدل > 30)
+            if our_sz > 0 and c_sz > 0 and our_sz != c_sz: continue
+            # ── نهاية Zero Tolerance ────────────────────────────────────────
+
             if our_tp and c_tp and our_tp != c_tp:
                 if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 3: continue
             if our_gd and c_gd and our_gd != c_gd: continue

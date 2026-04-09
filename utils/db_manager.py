@@ -800,10 +800,149 @@ def migrate_db_v26():
         except Exception:
             pass
 
+        # ── 6. جدول المنافسين الرئيسي (Phase 1) ──
+        cur.execute("""CREATE TABLE IF NOT EXISTS competitors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            domain TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            added_at TEXT DEFAULT (datetime('now','localtime')),
+            notes TEXT DEFAULT ''
+        )""")
+
+        # ── 7. جدول الأسماء البديلة — Aliases (Phase 1) ──
+        # يُربط كل اسم بديل/مشوّه بالاسم الرسمي الوحيد للمنافس
+        # مثال: alias="نمشي كوم" → canonical_name="Namshi"
+        cur.execute("""CREATE TABLE IF NOT EXISTS competitor_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL UNIQUE,
+            canonical_name TEXT NOT NULL,
+            added_at TEXT DEFAULT (datetime('now','localtime'))
+        )""")
+
+        # ── 8. تسجيل إصدار Phase 1 ──
+        cur.execute("""INSERT OR IGNORE INTO db_version (version, description)
+                       VALUES ('v26.1', 'إضافة جداول competitors و competitor_aliases + resolve_competitor')""")
+
         conn.commit()
         conn.close()
     except Exception as e:
         _logger.error("Migration v26 error: %s", e)
         try: conn.close()
         except: pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 1 — resolve_competitor + إدارة Aliases
+# ═══════════════════════════════════════════════════════════════
+
+def resolve_competitor(name: str) -> str:
+    """
+    يحل اسم المنافس عبر جدول competitor_aliases أولاً (Phase 1).
+
+    المنطق:
+      - إذا وُجد alias مطابق → يعيد canonical_name (الاسم الرسمي)
+      - إذا لم يوجد          → يعيد الاسم بعد trim بدون تغيير
+
+    يضمن عدم تكرار نفس المنافس بأسماء مختلفة في التقارير والمطابقة.
+    مثال: resolve_competitor("نمشي") == resolve_competitor("namshi.com") == "Namshi"
+    """
+    if not name:
+        return name
+    clean = name.strip()
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT canonical_name FROM competitor_aliases "
+            "WHERE alias = ? COLLATE NOCASE",
+            (clean,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return str(row["canonical_name"]).strip()
+    except Exception as exc:
+        _logger.debug("resolve_competitor error: %s", exc)
+    return clean
+
+
+def add_competitor_alias(alias: str, canonical_name: str) -> bool:
+    """
+    يضيف اسماً بديلاً (alias) ويربطه بالاسم الرسمي (canonical_name).
+
+    مثال الاستخدام:
+      add_competitor_alias("نمشي", "Namshi")
+      add_competitor_alias("namshi.com", "Namshi")
+      add_competitor_alias("NAMSHI", "Namshi")
+
+    يعيد True عند النجاح، False عند الخطأ أو المدخلات الفارغة.
+    """
+    alias = (alias or "").strip()
+    canonical_name = (canonical_name or "").strip()
+    if not alias or not canonical_name:
+        return False
+    try:
+        conn = get_db()
+        conn.execute(
+            """INSERT OR REPLACE INTO competitor_aliases
+               (alias, canonical_name, added_at)
+               VALUES (?, ?, datetime('now','localtime'))""",
+            (alias, canonical_name)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        _logger.error("add_competitor_alias error: %s", exc)
+        return False
+
+
+def get_all_aliases() -> list:
+    """يُرجع كل الأسماء البديلة المسجلة مرتبة حسب الاسم الرسمي."""
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT alias, canonical_name, added_at "
+            "FROM competitor_aliases ORDER BY canonical_name"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def register_competitor(name: str, domain: str = "", notes: str = "") -> bool:
+    """
+    يسجل منافساً رسمياً في جدول competitors.
+    آمن للاستدعاء المتكرر (INSERT OR IGNORE).
+    """
+    name = (name or "").strip()
+    if not name:
+        return False
+    try:
+        conn = get_db()
+        conn.execute(
+            """INSERT OR IGNORE INTO competitors (name, domain, notes)
+               VALUES (?, ?, ?)""",
+            (name, domain.strip(), notes.strip())
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        _logger.error("register_competitor error: %s", exc)
+        return False
+
+
+def get_all_competitors() -> list:
+    """يُرجع كل المنافسين المسجلين في جدول competitors."""
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, name, domain, is_active, added_at, notes "
+            "FROM competitors ORDER BY name"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 

@@ -1,14 +1,19 @@
 """
-scrapers/sitemap_resolve.py — حل روابط Sitemap v2.0 (2026)
-═══════════════════════════════════════════════════════════════
+engines/sitemap_resolve.py — حل روابط Sitemap v2.1 (2026)  *** MASTER ***
+═══════════════════════════════════════════════════════════════════════════
+هذا الملف هو المصدر الوحيد للحقيقة (Single Source of Truth).
+scrapers/sitemap_resolve.py و make/sitemap_resolve.py مجرد Shims تستورد منه.
+
 يحدّد مسار Sitemap لأي متجر إلكتروني بأولوية:
   1. robots.txt → سطور Sitemap: (المصدر الأكثر شرعية)
   2. مسارات سلة / زد / Shopify / WooCommerce
   3. /sitemap.xml   /sitemap_index.xml  (المعيار العام)
 
-يُعيد قائمة URLs لمنتجات المتجر جاهزة للكشط مع تاريخ آخر تعديل.
+التحسينات في v2.1:
+  - Semaphore لتقييد التزامن عند معالجة sitemapindex الضخمة
+  - batch processing للـ sub-sitemaps لمنع انفجار coroutines
 
-ملف Sitemap هو دليل علني تضعه المتاجر عمداً لمحركات البحث — وليس ثغرة أمنية.
+يُعيد قائمة URLs لمنتجات المتجر جاهزة للكشط مع تاريخ آخر تعديل.
 """
 from __future__ import annotations
 
@@ -77,10 +82,13 @@ _PRODUCT_URL_RE = re.compile(
 _EXCLUDE_URL_RE = re.compile(
     r"(/blog/|/page/|/category/|/categories/|/tag/|/cart|/checkout"
     r"|/account|/contact|/about|/faq|/privacy|/terms"
-    r"|/cdn\.|\.js$|\.css$|\.png$|\.jpg$|\.webp$|\.svg$"
+    r"|/cdn\.|\\.js$|\\.css$|\\.png$|\\.jpg$|\\.webp$|\\.svg$"
     r"|/feed/|/rss|/amp/)",
     re.I,
 )
+
+# الحد الأقصى لطلبات sitemap المتزامنة في نفس الوقت
+_SITEMAP_CONCURRENCY = 10
 
 
 @dataclass
@@ -192,30 +200,46 @@ def _parse_sitemap_xml(xml_text: str) -> Tuple[List[SitemapEntry], List[str]]:
 
 
 async def _fetch_and_parse_sitemap(
-    session: aiohttp.ClientSession, url: str, depth: int = 0, max_depth: int = 3
+    session: aiohttp.ClientSession,
+    url: str,
+    depth: int = 0,
+    max_depth: int = 3,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[SitemapEntry]:
-    """يجلب ويحلل sitemap (يتتبع sitemapindex بشكل متكرر حتى max_depth)."""
+    """
+    يجلب ويحلل sitemap (يتتبع sitemapindex بشكل متكرر حتى max_depth).
+    يستخدم Semaphore لتقييد التزامن ومنع انفجار coroutines عند sitemapindex ضخم.
+    """
     if depth > max_depth:
         return []
 
-    xml = await _fetch_xml(session, url)
-    if not xml:
-        return []
+    # إنشاء السيمافور عند أول استدعاء — يُمرَّر للاستدعاءات الفرعية
+    if sem is None:
+        sem = asyncio.Semaphore(_SITEMAP_CONCURRENCY)
 
-    if "<urlset" not in xml[:2000] and "<sitemapindex" not in xml[:2000]:
-        return []
+    async with sem:
+        xml = await _fetch_xml(session, url)
+        if not xml:
+            return []
 
-    entries, sub_sitemaps = _parse_sitemap_xml(xml)
+        if "<urlset" not in xml[:2000] and "<sitemapindex" not in xml[:2000]:
+            return []
+
+        entries, sub_sitemaps = _parse_sitemap_xml(xml)
 
     if sub_sitemaps:
-        tasks = [
-            _fetch_and_parse_sitemap(session, sub_url, depth + 1, max_depth)
-            for sub_url in sub_sitemaps
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, list):
-                entries.extend(r)
+        # تقسيم الطلبات الفرعية إلى دفعات لمنع إنشاء آلاف coroutines دفعة واحدة
+        batch_size = _SITEMAP_CONCURRENCY
+        for i in range(0, len(sub_sitemaps), batch_size):
+            batch = sub_sitemaps[i:i + batch_size]
+            tasks = [
+                _fetch_and_parse_sitemap(session, sub_url, depth + 1, max_depth, sem)
+                for sub_url in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, list):
+                    entries.extend(r)
 
     return entries
 
@@ -284,7 +308,7 @@ def _filter_product_entries(entries: List[SitemapEntry], base: str) -> List[Site
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  الدالة الرئيسية
+#  الدوال الرئيسية العامة
 # ══════════════════════════════════════════════════════════════════════════
 async def resolve_product_urls(
     store_url: str,
@@ -296,12 +320,26 @@ async def resolve_product_urls(
     تُرجع قائمة URLs لصفحات المنتجات الجاهزة للكشط.
 
     max_products=0 → كل المنتجات بلا سقف.
+    """
+    entries = await resolve_product_entries(store_url, session, max_products=max_products)
+    return [e.url for e in entries]
+
+
+async def resolve_product_entries(
+    store_url: str,
+    session: aiohttp.ClientSession,
+    *,
+    max_products: int = 0,
+) -> List[SitemapEntry]:
+    """
+    مثل resolve_product_urls لكن يُعيد SitemapEntry (url + lastmod) للكشط التزايدي.
 
     الخوارزمية:
     1. robots.txt → سطور Sitemap
     2. مسارات خاصة بسلة / زد / Shopify
     3. مسارات Sitemap المعيارية
-    4. فلترة → صفحات منتجات فقط
+    4. Fallback: Shopify /products.json
+    5. Fallback: HTML crawl لصفحة /products
     """
     base = _base_url(store_url)
     all_entries: List[SitemapEntry] = []
@@ -321,8 +359,7 @@ async def resolve_product_urls(
             extra_paths = _ZID_EXTRA_PATHS
 
         for path in extra_paths:
-            candidate = f"{base}{path}"
-            entries = await _fetch_and_parse_sitemap(session, candidate)
+            entries = await _fetch_and_parse_sitemap(session, f"{base}{path}")
             if entries:
                 all_entries.extend(entries)
                 break
@@ -330,22 +367,21 @@ async def resolve_product_urls(
     # 3) مسارات معيارية
     if not all_entries:
         for path in _SITEMAP_CANDIDATES:
-            candidate = f"{base}{path}"
-            entries = await _fetch_and_parse_sitemap(session, candidate)
+            entries = await _fetch_and_parse_sitemap(session, f"{base}{path}")
             if entries:
                 all_entries.extend(entries)
                 break
 
-    # 4) Shopify /products.json API
+    # 4) Fallback: Shopify /products.json API
     if not all_entries:
         all_entries.extend(await _fallback_shopify_api(session, base, max_products))
 
-    # 5) HTML crawl of /products page
+    # 5) Fallback: HTML crawl of /products page
     if not all_entries:
         all_entries.extend(await _fallback_html_product_page(session, base))
 
     # إزالة التكرار مع الحفاظ على الترتيب
-    seen = set()
+    seen: set = set()
     unique: List[SitemapEntry] = []
     for e in all_entries:
         if e.url not in seen:
@@ -366,72 +402,15 @@ async def resolve_product_urls(
         product_entries = product_entries[:max_products]
 
     logger.info(
-        "resolve_product_urls %s → %d منتج (من %d رابط كلي)",
+        "resolve_product_entries %s → %d منتج (من %d رابط كلي)",
         base, len(product_entries), len(unique),
     )
-    return [e.url for e in product_entries]
-
-
-async def resolve_product_entries(
-    store_url: str,
-    session: aiohttp.ClientSession,
-    *,
-    max_products: int = 0,
-) -> List[SitemapEntry]:
-    """مثل resolve_product_urls لكن يُعيد SitemapEntry (url + lastmod) للكشط التزايدي."""
-    base = _base_url(store_url)
-    all_entries: List[SitemapEntry] = []
-
-    robots_urls = await _sitemaps_from_robots(session, base)
-    for surl in robots_urls:
-        entries = await _fetch_and_parse_sitemap(session, surl)
-        all_entries.extend(entries)
-
-    if not all_entries:
-        extra_paths = []
-        if _is_salla(base):
-            extra_paths = _SALLA_EXTRA_PATHS
-        elif _is_zid(base):
-            extra_paths = _ZID_EXTRA_PATHS
-
-        for path in extra_paths:
-            entries = await _fetch_and_parse_sitemap(session, f"{base}{path}")
-            if entries:
-                all_entries.extend(entries)
-                break
-
-    if not all_entries:
-        for path in _SITEMAP_CANDIDATES:
-            entries = await _fetch_and_parse_sitemap(session, f"{base}{path}")
-            if entries:
-                all_entries.extend(entries)
-                break
-
-    # ── Fallback 4: Shopify /products.json API ─────────────────────────────
-    if not all_entries:
-        all_entries.extend(await _fallback_shopify_api(session, base, max_products))
-
-    # ── Fallback 5: crawl /products page for anchor hrefs ──────────────────
-    if not all_entries:
-        all_entries.extend(await _fallback_html_product_page(session, base))
-
-    seen = set()
-    unique: List[SitemapEntry] = []
-    for e in all_entries:
-        if e.url not in seen:
-            seen.add(e.url)
-            unique.append(e)
-
-    product_entries = _filter_product_entries(unique, base)
-    if not product_entries and unique:
-        product_entries = unique
-
-    if max_products > 0:
-        product_entries = product_entries[:max_products]
-
     return product_entries
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Fallbacks
+# ══════════════════════════════════════════════════════════════════════════
 async def _fallback_shopify_api(
     session: aiohttp.ClientSession,
     base: str,
@@ -445,7 +424,11 @@ async def _fallback_shopify_api(
         while True:
             url = f"{base}/products.json?limit={limit}&page={page}"
             try:
-                async with session.get(url, headers=get_browser_headers(), timeout=aiohttp.ClientTimeout(total=15)) as r:
+                async with session.get(
+                    url,
+                    headers=get_browser_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
                     if r.status != 200:
                         break
                     data = await r.json(content_type=None)
@@ -504,7 +487,10 @@ async def _fallback_html_product_page(
                 seen_local.add(full)
                 entries.append(SitemapEntry(url=full))
         if entries:
-            logger.info("_fallback_html_product_page %s → %d روابط من %s", base, len(entries), path)
+            logger.info(
+                "_fallback_html_product_page %s → %d روابط من %s",
+                base, len(entries), path,
+            )
             break
     return entries
 
