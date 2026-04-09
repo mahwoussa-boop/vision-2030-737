@@ -30,6 +30,37 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ALT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u0600-\u06FF\s]")
 
 
+def _markdown_to_salla_html(md_text: str) -> str:
+    """تحويل نص Markdown إلى HTML بسيط مناسب لسلة."""
+    lines = md_text.strip().split("\n")
+    out = []
+    in_ul = False
+    for line in lines:
+        line = line.rstrip()
+        if line.startswith("### "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h3>{line[4:].strip()}</h3>")
+        elif line.startswith("## "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h2>{line[3:].strip()}</h2>")
+        elif line.startswith("# "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h2>{line[2:].strip()}</h2>")
+        elif line.startswith("* ") or line.startswith("- "):
+            if not in_ul: out.append("<ul>"); in_ul = True
+            item = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line[2:].strip())
+            out.append(f"<li>{item}</li>")
+        elif not line.strip():
+            if in_ul: out.append("</ul>"); in_ul = False
+        else:
+            if in_ul: out.append("</ul>"); in_ul = False
+            para = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+            out.append(f"<p>{para}</p>")
+    if in_ul: out.append("</ul>")
+    return "\n".join(out)
+
+
+
 def _debug_log(hypothesis_id: str, location: str, message: str, data: dict | None = None, run_id: str = "pre-fix") -> None:
     pass
 
@@ -108,8 +139,10 @@ def _brand_aliases(brand_label: str) -> set[str]:
 def _resolve_brand_to_store(brand_value: str, store_brands: list[str]) -> str:
     """
     (مطابقة صارمة): يرجع الاسم الرسمي المطابق من الكتالوج.
+    يدعم تنسيق عربي | English في ملف الماركات.
     إذا لم يجد الماركة في ملفاتك، يرجع فارغاً لتجنب خطأ سلة.
     """
+    import re as _re
     bv = str(brand_value or "").strip()
     if not bv or not store_brands:
         return ""
@@ -121,7 +154,13 @@ def _resolve_brand_to_store(brand_value: str, store_brands: list[str]) -> str:
     for sb in store_brands:
         if target_keys & _brand_aliases(sb):
             return sb
-    return "" # إرجاع فارغ لمنع الرفض
+    # مطابقة جزئية: هل قيمة الماركة موجودة كجزء داخل ماركة الكتالوج؟
+    bv_lower = bv.lower().strip()
+    for sb in store_brands:
+        parts = [p.strip().lower() for p in _re.split(r"[|/\\]", sb.lower()) if p.strip()]
+        if bv_lower in parts or any(bv_lower == p or bv_lower in p.split() for p in parts):
+            return sb
+    return ""  # إرجاع فارغ لمنع الرفض
 
 
 def _norm_category(s: str) -> str:
@@ -181,21 +220,53 @@ def _concentration_ar(s: str) -> str:
     return ""
 
 
+def _brand_display(brand: str) -> str:
+    """للعرض في العنوان: يأخذ الجزء العربي إذا كان التنسيق 'عربي | English'."""
+    if not brand:
+        return ""
+    if "|" in brand:
+        parts = [p.strip() for p in brand.split("|")]
+        # إذا وُجد جزء عربي، أعده؛ وإلا الأول
+        ar_parts = [p for p in parts if re.search(r"[؀-ۿ]", p)]
+        if ar_parts:
+            return ar_parts[0]
+        return parts[0]
+    return brand.strip()
+
+
 def _build_export_title(raw_name: str, brand: str, gender: str) -> str:
-    """عنوان عربي إلزامي يبدأ بكلمة عطر."""
+    """عنوان يبدأ بكلمة عطر مع الاحتفاظ بالاسم الإنجليزي إذا لم يوجد عربي."""
     _sz = safe_float(re.search(r"(\d{2,4})\s*ml", str(raw_name).lower()).group(1), 0) if re.search(r"(\d{2,4})\s*ml", str(raw_name).lower()) else 0
     size_txt = f"{int(_sz)} مل" if _sz > 0 else ""
     conc_txt = _concentration_ar(raw_name)
     line_txt = sanitize_salla_text(str(raw_name or "").strip())
+
+    # إزالة جميع مرادفات الماركة من اسم المنتج لتجنب التكرار
     line_norm = _norm_brand(line_txt)
     for _bk in sorted(_brand_aliases(brand), key=len, reverse=True):
         if _bk:
             line_norm = re.sub(rf"\b{re.escape(_bk)}\b", " ", line_norm, flags=re.I)
+    line_norm = re.sub(r"\s+", " ", line_norm).strip()
+
+    # محاولة استخراج النص العربي أولاً
     line_ar = " ".join(re.findall(r"[\u0600-\u06FF]+", line_norm))
     line_ar = sanitize_salla_text(line_ar).strip()
+
+    # إذا لم يوجد نص عربي → استخدم الاسم المنظّف (إنجليزي أو مختلط)
     if not line_ar:
-        line_ar = "منتج عطري"
-    pieces = ["عطر", sanitize_salla_text(str(brand or "").strip()), line_ar, conc_txt, size_txt, gender]
+        clean_name = re.sub(r"\b(edp|edt|edc|parfum|cologne|extrait)\b", "", line_txt, flags=re.I)
+        clean_name = re.sub(r"\b\d{2,4}\s*ml\b", "", clean_name, flags=re.I)
+        # احذف جميع مرادفات الماركة من البداية
+        for alias in sorted(_brand_aliases(brand), key=len, reverse=True):
+            if alias and clean_name.lower().startswith(alias):
+                clean_name = clean_name[len(alias):].strip()
+                break
+        line_ar = re.sub(r"\s+", " ", clean_name).strip()
+        if not line_ar:
+            line_ar = line_txt
+
+    brand_disp = _brand_display(brand)
+    pieces = ["عطر", brand_disp, line_ar, conc_txt, size_txt, gender]
     title = " ".join([p for p in pieces if p]).strip()
     title = re.sub(r"\s+", " ", title)
     return title[:220]
@@ -375,9 +446,18 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         
         alt_txt = _safe_alt_text(f"صورة {pname}")
 
-        final_desc = sanitize_salla_text(str(r.get("وصف_AI", "") or "").strip())
-        if not final_desc:
-            final_desc = desc_text
+        # ── الوصف: لا نستخدم sanitize_salla_text لأنها تحذف وسوم HTML ──
+        raw_ai_desc = str(r.get("وصف_AI", "") or "").strip()
+        if raw_ai_desc:
+            # إذا كان الوصف بصيغة Markdown (يحتوي ## أو ###) حوّله إلى HTML
+            if "##" in raw_ai_desc or "
+### " in raw_ai_desc:
+                final_desc = _markdown_to_salla_html(raw_ai_desc)
+            else:
+                # وصف HTML جاهز: نظّفه بدون حذف وسوم HTML
+                final_desc = raw_ai_desc.strip()
+        else:
+            final_desc = desc_text  # fallback: HTML من format_mahwous_description
 
         row_csv = {
             "النوع ": "منتج",
