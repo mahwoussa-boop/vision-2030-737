@@ -450,8 +450,7 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         raw_ai_desc = str(r.get("وصف_AI", "") or "").strip()
         if raw_ai_desc:
             # إذا كان الوصف بصيغة Markdown (يحتوي ## أو ###) حوّله إلى HTML
-            if "##" in raw_ai_desc or "
-### " in raw_ai_desc:
+            if "##" in raw_ai_desc or "\n### " in raw_ai_desc or "\n## " in raw_ai_desc:
                 final_desc = _markdown_to_salla_html(raw_ai_desc)
             else:
                 # وصف HTML جاهز: نظّفه بدون حذف وسوم HTML
