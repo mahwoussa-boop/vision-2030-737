@@ -1,10 +1,11 @@
 """
-mahwous_core — فلاتر مسار صارمة ومدقق تصدير متوافق مع سلة / Make.
-لا يستورد من engines.engine لتجنب الاستيراد الدائري.
+mahwous_core — فلاتر مسار صارمة، استخراج المكونات، وتنسيق "مهووس" الاحترافي.
+متوافق 100% مع منصة سلة و Make.
 """
 from __future__ import annotations
 
 import re
+import html
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -17,6 +18,9 @@ except ImportError:
         "split", "miniature", "0.5ml", "1ml", "2ml", "3ml",
     ]
 
+# تعبيرات نمطية لتنظيف النصوص لمنصة سلة
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_NON_TEXT_RE = re.compile(r"[^\w\s\.\-\(\)\[\]\!\؟\:\,\|\/]")
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     try:
@@ -26,16 +30,13 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-
 def _is_sample_strict(name: str) -> bool:
     if not isinstance(name, str) or not name.strip():
         return True
     nl = name.lower()
     return any(k.lower() in nl for k in REJECT_KEYWORDS)
 
-
 def _extract_ml(name: str) -> float:
-    """استخراج حجم بالمل من الاسم؛ ‎-1 إن لم يُعثر."""
     if not isinstance(name, str):
         return -1.0
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:ml|مل|ملي)\b", name, re.I)
@@ -46,42 +47,28 @@ def _extract_ml(name: str) -> float:
             return -1.0
     return -1.0
 
-
 def _classify_rejected(name: str) -> bool:
-    """عينات ومسارات مرفوضة للمسار الصارم (مثل classify_product rejected)."""
     if not isinstance(name, str):
         return True
     nl = name.lower()
-    if any(
-        w in nl
-        for w in (
-            "sample",
-            "عينة",
-            "عينه",
-            "miniature",
-            "مينياتشر",
-            "travel size",
-            "decant",
-            "تقسيم",
-            "split",
-        )
-    ):
-        return True
-    return False
-
+    rejects = ["sample", "عينة", "عينه", "miniature", "مينياتشر", "travel size", "decant", "تقسيم", "split"]
+    return any(w in nl for w in rejects)
 
 def apply_strict_pipeline_filters(
     df: pd.DataFrame, name_col: str = "منتج_المنافس"
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    فلترة صارمة: عينات، أحجام صغيرة جداً في الاسم، وكلمات/تصنيف مرفوض.
-    يعيد (dataframe_المصفّى، إحصاءات).
-    """
     if df is None or df.empty:
         return df, {"dropped": 0}
 
     if name_col not in df.columns:
-        return df.copy(), {"dropped": 0, "warning": f"عمود غير موجود: {name_col}"}
+        # محاولة البحث عن عمود الاسم البديل
+        alt_cols = ["المنتج", "اسم المنتج", "Product", "Name"]
+        for c in alt_cols:
+            if c in df.columns:
+                name_col = c
+                break
+        else:
+            return df.copy(), {"dropped": 0, "warning": f"عمود غير موجود: {name_col}"}
 
     stats: Dict[str, Any] = {
         "dropped_sample_kw": 0,
@@ -114,12 +101,54 @@ def apply_strict_pipeline_filters(
     stats["kept"] = len(out)
     return out, stats
 
+def sanitize_salla_text(text: str) -> str:
+    """تنظيف النصوص من الرموز البرمجية والأحرف الخاصة المعيقة للرفع لسلة."""
+    if not text: return ""
+    # إزالة الـ HTML
+    text = _HTML_TAG_RE.sub(" ", str(text))
+    # فك ترميز HTML entities
+    text = html.unescape(text)
+    # إزالة الأحرف الغريبة مع الحفاظ على العربية والإنجليزية والترقيم الأساسي
+    # text = _NON_TEXT_RE.sub("", text)
+    # تنظيف المسافات الزائدة
+    return re.sub(r"\s+", " ", text).strip()
+
+def format_mahwous_description(product_data: dict) -> str:
+    """تنسيق الوصف بأسلوب مهووس الاحترافي."""
+    name = sanitize_salla_text(product_data.get("name", "عطر فاخر"))
+    brand = sanitize_salla_text(product_data.get("brand", "ماركة عالمية"))
+    desc = product_data.get("description", "")
+    notes = product_data.get("notes", {}) # الهرم العطري
+    features = product_data.get("features", [
+        "عطر أصلي 100% بضمان متجر مهووس",
+        "ثبات عالي وفوحان يأسر الحواس",
+        "مناسب للاستخدام اليومي والمناسبات الخاصة"
+    ])
+
+    # بناء الوصف بتنسيق مهووس
+    lines = [
+        f"## {name} من {brand}",
+        f"\nاستمتع بتجربة عطرية فريدة مع {name}، العطر الذي يجسد الأناقة والفخامة في كل رشة. متوفر الآن في متجر مهووس، وجهتك الأولى لأرقى العطور العالمية.",
+        "\n### ✨ مميزات المنتج",
+    ]
+    
+    for feat in features:
+        lines.append(f"* {sanitize_salla_text(feat)}")
+    
+    if notes:
+        lines.append("\n### 🎼 الهرم العطري (المكونات الحقيقية)")
+        if notes.get("top"): lines.append(f"* **الافتتاحية:** {sanitize_salla_text(notes['top'])}")
+        if notes.get("heart"): lines.append(f"* **القلب:** {sanitize_salla_text(notes['heart'])}")
+        if notes.get("base"): lines.append(f"* **القاعدة:** {sanitize_salla_text(notes['base'])}")
+    elif desc:
+        lines.append("\n### 📝 وصف العطر")
+        lines.append(sanitize_salla_text(desc))
+
+    lines.append("\n---\n*جميع عطورنا أصلية 100% ونضمن لك الجودة والتميز في كل طلب.*")
+    
+    return "\n".join(lines)
 
 def validate_export_product_dataframe(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    """
-    تحقق صارم قبل إرسال Make / تصدير: اسم صالح وسعر المنافس > 0 لكل صف.
-    يتوافق مع منطق send_missing_products / export_to_make_format لقسم المفقودات.
-    """
     issues: List[str] = []
     if df is None or df.empty:
         return False, ["لا توجد بيانات للتحقق أو التصدير."]
