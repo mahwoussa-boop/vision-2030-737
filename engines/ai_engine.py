@@ -1220,3 +1220,13 @@ def generate_salla_html_description(product_name: str, product_details: dict) ->
     html_desc += "</ul>"
     html_desc += "<p>وصف تفصيلي للمنتج هنا...</p>"
     return html_desc
+
+
+def generate_salla_brand_info(brand_name: str) -> str:
+    """
+    دالة وهمية لإنشاء معلومات عن الماركة لمنتجات سلة. تحتاج إلى تطوير لاحقاً.
+    """
+    # هذا مجرد مثال، يجب تطوير هذه الدالة لإنشاء معلومات ماركة فعلية
+    info = f"<h2>معلومات عن ماركة {brand_name}</h2>"
+    info += "<p>هنا ستجد معلومات مفصلة عن الماركة، تاريخها، وفلسفتها...</p>"
+    return info
