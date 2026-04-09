@@ -471,11 +471,11 @@ else:
     for i, surl in enumerate(stores_list):
         d  = _domain(surl)
         cp = _get_store_checkpoint(d)
-        st = cp.get("status", "pending")
+        current_status = cp.get("status", "pending")
 
         if filter_status != "الكل":
             wanted = status_map.get(filter_status, "")
-            if st != wanted:
+            if current_status != wanted:
                 continue
 
         render_competitor_card(surl, i, int(concurrency), max_products)
@@ -496,5 +496,4 @@ if state_data:
                 "اكتمل":         str(cp.get("finished_at", ""))[:16],
                 "خطأ":           str(cp.get("error", ""))[:40],
             })
-        import streamlit as _st
-        _st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
