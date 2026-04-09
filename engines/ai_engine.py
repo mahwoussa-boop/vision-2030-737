@@ -444,7 +444,7 @@ def _search_ddg(query, num_results=5):
     except: pass
     return []
 
-def call_ai(prompt, page="general"):
+def call_ai(prompt, page="general", json_mode=False):
     sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
     for fn, src in [
         (lambda: _call_gemini(prompt, sys), "Gemini"),
@@ -452,7 +452,14 @@ def call_ai(prompt, page="general"):
         (lambda: _call_cohere(prompt, sys), "Cohere")
     ]:
         r = fn()
-        if r: return {"success":True,"response":r,"source":src}
+        if r:
+            if json_mode:
+                data = _parse_json(r)
+                if data: return data
+                # إذا فشل التحليل كـ JSON، نعيد الاستجابة الأصلية في حقل response
+            return {"success":True,"response":r,"source":src}
+    
+    if json_mode: return {} # لضمان عدم تعطل الواجهة عند توقع dict
     return {"success":False,"response":"فشل الاتصال بجميع مزودي AI","source":"none"}
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
@@ -1257,3 +1264,71 @@ def get_catalog_status() -> dict:
                                       CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
         "missing_brands": missing_stat,
     }
+
+
+# ══ الدوال المفقودة للوحدة الخامسة ═══════════════════════════════════════════
+
+def extract_product(text: str) -> dict:
+    """
+    يستخرج بيانات المنتج (الاسم، الماركة، الحجم، التركيز، الجنس، السعر) من نص خام.
+    """
+    if not text: return {}
+    
+    prompt = f"""
+    استخرج بيانات عطر "مهووس" من النص التالي بدقة:
+    "{text}"
+    
+    أجب بصيغة JSON فقط:
+    {{
+      "name": "اسم المنتج بالإنجليزية (أو كما ورد)",
+      "brand": "اسم الماركة بالإنجليزية",
+      "size": "الحجم (مثلاً 100ml)",
+      "concentration": "التركيز (مثلاً EDP, EDT, Parfum)",
+      "gender": "الجنس (Men, Women, Unisex)",
+      "price": "السعر كرقم فقط (إن وجد، وإلا 0)"
+    }}
+    """
+    # نستخدم call_ai مع json_mode=True الذي قمنا بتفعيله
+    res = call_ai(prompt, page="general", json_mode=True)
+    
+    # تأمين القيم الافتراضية
+    defaults = {"name": "", "brand": "", "size": "", "concentration": "", "gender": "Unisex", "price": 0}
+    if isinstance(res, dict):
+        defaults.update(res)
+    return defaults
+
+
+def fetch_og_image_url(url: str) -> str:
+    """
+    يجلب رابط الصورة الرئيسية (Open Graph Image) من أي رابط متجر.
+    يستخدم requests و re لتجنب تعقيدات الكشط.
+    """
+    if not url or not url.startswith("http"): return ""
+    
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200: return ""
+        
+        # البحث عن <meta property="og:image" content="...">
+        match = re.search(r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', r.text)
+        if not match:
+            # محاولة البحث بترتيب مختلف للخصائص
+            match = re.search(r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']', r.text)
+            
+        if match:
+            img_url = match.group(1)
+            # تصحيح الروابط النسبية
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif img_url.startswith("/"):
+                from urllib.parse import urljoin
+                img_url = urljoin(url, img_url)
+            return img_url
+            
+    except Exception as e:
+        _log_err("fetch_og_image_url", f"خطأ في جلب صورة OG: {str(e)}")
+        
+    return ""
