@@ -73,56 +73,56 @@ def _norm_brand(s: str) -> str:
 
 
 def _load_store_brands() -> list[str]:
-    """تحميل الماركات الرسمية من ملفات الكتالوج كما هي."""
+    """تحميل الماركات الرسمية — يجرب عدة أسماء ملفات (مسافة / شرطة سفلية)."""
     brands: list[str] = []
-    salla_path = get_catalog_data_path(SALLA_BRANDS_FILE)
-    fallback_path = get_catalog_data_path(BRANDS_CSV_FILE)
-    try:
-        if salla_path and pd.io.common.file_exists(salla_path):
-            _df = pd.read_csv(salla_path, encoding="utf-8-sig")
-            if SALLA_BRANDS_COL in _df.columns:
-                brands = [str(x).strip() for x in _df[SALLA_BRANDS_COL].dropna().astype(str).tolist() if str(x).strip()]
-    except Exception:
-        brands = []
-    if brands:
-        return list(dict.fromkeys(brands))
-    try:
-        if fallback_path and pd.io.common.file_exists(fallback_path):
-            try:
-                _df = pd.read_csv(fallback_path, encoding="utf-8-sig")
-                col = "الاسم" if "الاسم" in _df.columns else _df.columns[0]
-                brands = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
-            except:
-                pass
-    except Exception:
-        brands = []
-    return list(dict.fromkeys(brands))
+    # الأولوية: ماركات_مهووس.csv (underscore) ثم ماركات مهووس.csv (space) ثم brands.csv
+    candidate_files = [
+        (SALLA_BRANDS_FILE.replace(" ", "_"), SALLA_BRANDS_COL),  # ماركات_مهووس.csv
+        (SALLA_BRANDS_FILE, SALLA_BRANDS_COL),                    # ماركات مهووس.csv
+        (BRANDS_CSV_FILE,   None),                                  # brands.csv
+    ]
+    for fname, col_name in candidate_files:
+        try:
+            path = get_catalog_data_path(fname)
+            if path and pd.io.common.file_exists(path):
+                _df = pd.read_csv(path, encoding="utf-8-sig")
+                if col_name:
+                    if col_name in _df.columns:
+                        brands = [str(x).strip() for x in _df[col_name].dropna().astype(str).tolist() if str(x).strip()]
+                else:
+                    col = "اسم الماركة" if "اسم الماركة" in _df.columns else ("الاسم" if "الاسم" in _df.columns else _df.columns[0])
+                    brands = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
+                if brands:
+                    return list(dict.fromkeys(brands))
+        except Exception:
+            continue
+    return []
 
 
 def _load_store_categories() -> list[str]:
+    """تحميل التصنيفات — يجرب عدة أسماء ملفات (مسافة / شرطة سفلية)."""
     cats: list[str] = []
-    salla_path = get_catalog_data_path(SALLA_CATEGORIES_FILE)
-    fallback_path = get_catalog_data_path(CATEGORIES_CSV_FILE)
-    try:
-        if salla_path and pd.io.common.file_exists(salla_path):
-            _df = pd.read_csv(salla_path, encoding="utf-8-sig")
-            if SALLA_CATEGORIES_COL in _df.columns:
-                cats = [str(x).strip() for x in _df[SALLA_CATEGORIES_COL].dropna().astype(str).tolist() if str(x).strip()]
-    except Exception:
-        cats = []
-    if cats:
-        return list(dict.fromkeys(cats))
-    try:
-        if fallback_path and pd.io.common.file_exists(fallback_path):
-            try:
-                _df = pd.read_csv(fallback_path, encoding="utf-8-sig")
-                col = "الاسم" if "الاسم" in _df.columns else _df.columns[0]
-                cats = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
-            except:
-                pass
-    except Exception:
-        cats = []
-    return list(dict.fromkeys(cats))
+    candidate_files = [
+        (SALLA_CATEGORIES_FILE.replace(" ", "_"), SALLA_CATEGORIES_COL),  # تصنيفات_مهووس.csv
+        (SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL),                    # تصنيفات مهووس.csv
+        (CATEGORIES_CSV_FILE,   None),                                     # categories.csv
+    ]
+    for fname, col_name in candidate_files:
+        try:
+            path = get_catalog_data_path(fname)
+            if path and pd.io.common.file_exists(path):
+                _df = pd.read_csv(path, encoding="utf-8-sig")
+                if col_name:
+                    if col_name in _df.columns:
+                        cats = [str(x).strip() for x in _df[col_name].dropna().astype(str).tolist() if str(x).strip()]
+                else:
+                    col = "التصنيفات" if "التصنيفات" in _df.columns else ("الاسم" if "الاسم" in _df.columns else _df.columns[0])
+                    cats = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
+                if cats:
+                    return list(dict.fromkeys(cats))
+        except Exception:
+            continue
+    return []
 
 
 def _brand_aliases(brand_label: str) -> set[str]:
@@ -188,11 +188,12 @@ def _resolve_category_to_store(cat_value: str, store_categories: list[str], gend
         return norm_map[ncv]
 
     gh = str(gender_hint or "").strip()
-    if gh == "نسائي":
+    # المطابقة تعمل مع "للنساء" و"نسائي" كلاهما
+    if gh in ("للنساء", "نسائي"):
         for c in store_categories:
             if "نسائي" in c:
                 return c
-    elif gh == "رجالي":
+    elif gh in ("للرجال", "رجالي"):
         for c in store_categories:
             if "رجالي" in c:
                 return c
@@ -349,9 +350,9 @@ def _infer_gender_text(r: dict) -> str:
         str(r.get("أسم المنتج", "")),
     ]).lower()
     if any(x in raw for x in ("نسائي", "نساء", "للنساء", "women", "female", "lady", "pour femme")):
-        return "نسائي"
+        return "للنساء"
     if any(x in raw for x in ("رجالي", "رجال", "للرجال", "men", "male", "homme", "pour homme")):
-        return "رجالي"
+        return "للرجال"
     if any(x in raw for x in ("للجنسين", "unisex", "الجنسين")):
         return "للجنسين"
     return ""
