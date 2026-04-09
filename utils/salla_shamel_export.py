@@ -25,6 +25,13 @@ from engines.prompts import (
 )
 from utils.data_paths import get_catalog_data_path
 from utils.helpers import safe_float
+from utils.data_sanitizer import (
+    standardize_terms,
+    sanitize_description_terms,
+    get_brand_arabic_name,
+    validate_product_data,
+    extract_size_ml,
+)
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ALT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u0600-\u06FF\s]")
@@ -211,13 +218,18 @@ def _resolve_category_to_store(cat_value: str, store_categories: list[str], gend
 
 
 def _concentration_ar(s: str) -> str:
+    """استخراج التركيز بالصيغة الموحّدة المعتمدة لمتجر مهووس."""
     t = str(s or "").lower()
-    if any(x in t for x in ("eau de parfum", "edp")):
-        return "أو دو بارفان"
+    if any(x in t for x in ("extrait",)):
+        return "إكسترا دو بارفيم"
+    if any(x in t for x in ("eau de parfum", "edp", "أو دو بارفان", "بارفيوم")):
+        return "أو دو بارفيوم"
     if any(x in t for x in ("eau de toilette", "edt")):
         return "أو دو تواليت"
+    if any(x in t for x in ("eau de cologne", "edc")):
+        return "أو دو كولون"
     if "parfum" in t:
-        return "بارفان"
+        return "بارفيم"
     return ""
 
 
@@ -410,10 +422,18 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         )
         if brand_raw in ("", "ماركة عالمية", "Unknown", "unknown"):
             brand_raw = ""
-        brand = _resolve_brand_to_store(brand_raw, _store_brands)
+        # مطابقة مرنة أولاً ثم المطابق الصارم احتياطاً
+        brand = get_brand_arabic_name(brand_raw, _store_brands) if brand_raw else ""
+        if not brand and brand_raw:
+            brand = _resolve_brand_to_store(brand_raw, _store_brands)
         
         pname = _build_export_title(raw_pname, brand, gender_inferred)
-        
+
+        # فحص الحجم المفقود — علامة ⚠️ للمراجعة اليدوية
+        _size_check = extract_size_ml(raw_pname)
+        if not _size_check and "مل" not in pname:
+            pname = "⚠️ " + pname
+
         # 2. رمز المنتج (SKU) - منع التكرار
         img = str(r.get("صورة_المنافس", r.get("image_url", ""))).strip()
         sku_raw = _real_sku(r)
@@ -456,6 +476,7 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             else:
                 # وصف HTML جاهز: نظّفه بدون حذف وسوم HTML
                 final_desc = raw_ai_desc.strip()
+            final_desc = sanitize_description_terms(final_desc)
         else:
             final_desc = desc_text  # fallback: HTML من format_mahwous_description
 
