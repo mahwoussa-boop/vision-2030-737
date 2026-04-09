@@ -97,7 +97,10 @@ def _process_product_pipeline(raw_data: dict, source_type: str = "manual") -> di
     # 4. الوصف الاحترافي
     if not clean.get("description") or len(str(clean["description"])) < 50:
         with st.spinner("✍️ نكتب وصفاً احترافياً..."):
-            desc = generate_mahwous_description(clean["arabic_name"], clean.get("brand", ""))
+            # دالة generate_mahwous_description تتوقع (product_name, price, ...)
+            # نمرر السعر إذا وجد، وإلا 0
+            price_val = clean.get("price", 0)
+            desc = generate_mahwous_description(clean["arabic_name"], price_val)
             clean["description"] = sanitize_full_description(desc)
 
     return clean
