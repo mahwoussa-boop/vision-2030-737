@@ -391,3 +391,231 @@ if __name__ == "__main__":
     ]:
         print(f"  → {build_arabic_product_title(**tc)}")
     print("\n✅ اكتملت الاختبارات")
+
+# الوحدة الرابعة — طبقة التنظيف الشاملة (Mahwous Full Sanitization Layer)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_URL_RE = re.compile(
+    r"https?://[^\s\"'<>،]+|www\.[^\s\"'<>،]+",
+    re.IGNORECASE,
+)
+
+_FILLER_PHRASES_AR = re.compile(
+    r"(?:"
+    r"تواصل\s+معنا|اتصل\s+بنا|للاستفسار|للطلب|"
+    r"يرجى\s+التواصل|اضغط\s+هنا|انقر\s+هنا|"
+    r"تابعونا\s+على|تابعنا\s+على|حسابنا\s+على|"
+    r"لمزيد\s+من\s+المعلومات|خدمة\s+العملاء|"
+    r"الشحن\s+مجاني|توصيل\s+سريع|ضمان\s+الأصالة"
+    r")",
+    re.IGNORECASE,
+)
+
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(https?://[^\)]+\)")
+_BARE_HASHTAG_RE  = re.compile(r"#\w+")
+
+
+def remove_links_and_noise(text: str) -> str:
+    """
+    يُزيل:
+    • روابط URL كاملة
+    • روابط Markdown [نص](url)
+    • هاشتاقات عشوائية
+    • عبارات الحشو التسويقي (تواصل معنا، اضغط هنا...)
+    """
+    if not text:
+        return text
+    t = _MARKDOWN_LINK_RE.sub(r"\1", text)   # [نص](url) → نص
+    t = _URL_RE.sub("", t)
+    t = _BARE_HASHTAG_RE.sub("", t)
+    t = _FILLER_PHRASES_AR.sub("", t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+def enforce_markdown_structure(text: str) -> str:
+    """
+    يضمن أن الوصف يستخدم Markdown صحيحاً:
+    • يُبقي العناوين (## / ###) سليمة
+    • يُحوّل الأسطر المفصولة بـ - / * / • إلى قوائم Markdown
+    • يُزيل الفقرات الفارغة المتكررة
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    out   = []
+    for ln in lines:
+        stripped = ln.strip()
+        # تحويل نقاط غير قياسية → Markdown list
+        if stripped and stripped[0] in ("•", "◦", "‣", "▪", "►"):
+            stripped = "- " + stripped[1:].strip()
+        out.append(stripped)
+    # إزالة أسطر فارغة متتالية أكثر من اثنتين
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(out))
+    return result.strip()
+
+
+def sanitize_full_description(
+    text: str,
+    apply_terms: bool = True,
+    apply_links: bool = True,
+    apply_markdown: bool = True,
+) -> str:
+    """
+    الدالة الرئيسية لطبقة التنظيف الشاملة (Mahwous Sanitization).
+
+    التسلسل:
+    1. إزالة الروابط والحشو  (remove_links_and_noise)
+    2. توحيد المصطلحات       (standardize_terms)
+    3. تنظيف HTML/Markdown   (sanitize_description_terms)
+    4. ضمان هيكل Markdown    (enforce_markdown_structure)
+
+    Args:
+        text:            النص الخام (HTML أو Markdown أو نص عادي)
+        apply_terms:     تطبيق توحيد المصطلحات (التركيز / الجنس)
+        apply_links:     حذف الروابط والحشو
+        apply_markdown:  ضمان هيكل Markdown
+
+    Returns:
+        نص نظيف جاهز للعرض في واجهة مهووس
+    """
+    if not text:
+        return text
+    t = str(text)
+    if apply_links:
+        t = remove_links_and_noise(t)
+    if apply_terms:
+        t = sanitize_description_terms(t)   # يتعامل مع HTML tags أيضاً
+    if apply_markdown:
+        t = enforce_markdown_structure(t)
+    return t
+
+
+def sanitize_new_product(product: dict) -> dict:
+    """
+    يُطبّق طبقة التنظيف الإجبارية على منتج جديد قبل حفظه.
+    مدخل: dict بالحقول المعتادة (name, description, brand, gender, concentration, size)
+    مخرج: نفس الـ dict مع الحقول المُنظَّفة + _sanitized=True
+
+    يُستدعى من magic_factory عند إنشاء منتج جديد.
+    """
+    clean = dict(product)
+
+    # الاسم — توحيد المصطلحات فقط (لا نحذف أجزاء الاسم)
+    if clean.get("name"):
+        clean["name"] = standardize_terms(str(clean["name"]))
+
+    # الوصف — تنظيف شامل
+    if clean.get("description"):
+        clean["description"] = sanitize_full_description(str(clean["description"]))
+
+    # الماركة — تطبيع
+    if clean.get("brand"):
+        clean["brand"] = str(clean["brand"]).strip()
+
+    # التركيز والجنس — توحيد
+    for key in ("concentration", "gender"):
+        if clean.get(key):
+            clean[key] = standardize_terms(str(clean[key]))
+
+    # الحجم — تطبيع
+    if clean.get("size"):
+        sz = str(clean["size"]).strip()
+        if re.match(r"^\d+$", sz):
+            sz += " مل"
+        clean["size"] = sz
+
+    clean["_sanitized"] = True
+    return clean
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# إدارة الماركات الجديدة — Auto Brand Generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _seo_url(text: str) -> str:
+    """يُولّد SEO URL من نص عربي/إنجليزي"""
+    t = str(text or "").strip().lower()
+    t = re.sub(r"[^\w\u0600-\u06FF\s-]", "", t)
+    t = re.sub(r"\s+", "-", t)
+    return t[:60].strip("-")
+
+
+def generate_brand_record(
+    brand_name_en: str,
+    brand_name_ar: str = "",
+    description_ar: str = "",
+    logo_url: str = "",
+) -> dict:
+    """
+    يُولّد سجل ماركة جديد بالهيكلة المعتمدة في brands.csv / سلة.
+
+    Args:
+        brand_name_en: الاسم الإنجليزي (مطلوب)
+        brand_name_ar: الاسم العربي (يُوّلد من AI إذا فارغ)
+        description_ar: وصف عربي (يُوّلد من AI إذا فارغ)
+        logo_url:      رابط الشعار
+
+    Returns:
+        dict يُحفظ مباشرةً في brands.csv
+        {
+          "اسم الماركة", "وصف مختصر عن الماركة",
+          "صورة شعار الماركة", "Page Title", "SEO Page URL", "Page Description"
+        }
+    """
+    en = brand_name_en.strip()
+    ar = brand_name_ar.strip() if brand_name_ar else ""
+
+    # اسم الماركة بصيغة: عربي | إنجليزي
+    label = f"{ar} | {en}" if ar else en
+
+    # SEO URL
+    seo_part = _seo_url(ar or en)
+    seo_url  = f"ماركة-{seo_part}" if ar else f"brand-{_seo_url(en)}"
+
+    # page title
+    page_title = (
+        f"{ar or en} | عطور فاخرة - مهووس للعطور"
+    )
+
+    # page description
+    if description_ar:
+        page_desc = description_ar[:160]
+    else:
+        page_desc = f"اكتشف عطور {ar or en} الأصيلة في مهووس — تشكيلة متنوعة بأسعار تنافسية."
+
+    return {
+        "اسم الماركة":               label,
+        "وصف مختصر عن الماركة":      description_ar or f"عطور {ar or en} الأصيلة.",
+        "صورة شعار الماركة":         logo_url,
+        "(إختياري) صورة البانر":     "",
+        "(Page Title) عنوان صفحة العلامة التجارية":   page_title,
+        "(SEO Page URL) رابط صفحة العلامة التجارية": seo_url,
+        "(Page Description) وصف صفحة العلامة التجارية": page_desc,
+    }
+
+
+def append_brand_to_csv(brand_record: dict, csv_path: str) -> bool:
+    """
+    يُضيف سجل ماركة جديد إلى brands.csv إذا لم يكن موجوداً.
+
+    Returns:
+        True إذا أُضيف، False إذا كان موجوداً مسبقاً
+    """
+    try:
+        df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    except Exception:
+        df = pd.DataFrame(columns=list(brand_record.keys()))
+
+    label = brand_record.get("اسم الماركة", "").strip()
+    # تحقق من التكرار
+    existing = df["اسم الماركة"].astype(str).str.strip().tolist() if "اسم الماركة" in df.columns else []
+    for ex in existing:
+        en_part = ex.split("|")[-1].strip().lower() if "|" in ex else ex.lower()
+        en_new  = label.split("|")[-1].strip().lower() if "|" in label else label.lower()
+        if en_new and en_new == en_part:
+            return False  # موجود مسبقاً
+
+    new_row = pd.DataFrame([brand_record])
+    df_out  = pd.concat([df, new_row], ignore_index=True)
+    df_out.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return True

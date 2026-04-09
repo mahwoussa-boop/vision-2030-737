@@ -1,16 +1,17 @@
 """
-utils/product_analyzer.py — وحدة التحليل الموضعي للمنتجات (الوحدة الثالثة)
-═══════════════════════════════════════════════════════════════════════════════
-✅ تحليل شامل للمنتج: سعر + تطابق + قسم صحيح + توصية
-✅ يُستدعى من زر [📊 تحليل المنتج] في بطاقة كل منتج
-✅ يفحص: الكتالوج + بيانات المنافسين + يصحح الأخطاء
-✅ نتيجة منظمة وقابلة للعرض مباشرة في Streamlit
+utils/product_analyzer.py — التحليل الموضعي الكامل مع أزرار الاقتراح الذكي (الوحدة الرابعة)
+══════════════════════════════════════════════════════════════════════════════════════════════
+✅ تحليل شامل: سعر + مطابقة + قسم صحيح + توصية
+✅ أزرار اقتراح ذكية قابلة للتنفيذ الفوري من الواجهة
+✅ ربط مباشر بـ DB عبر save_processed / save_hidden_product
+✅ طبقة التنظيف الشاملة (sanitize_full_description) مدمجة
 """
 from __future__ import annotations
 
-import json
+import uuid
 from datetime import datetime
 from typing import Optional
+
 import pandas as pd
 
 
@@ -27,40 +28,46 @@ def analyze_product_inline(
     match_pct: float,
     brand: str = "",
     section: str = "general",
+    product_id: str = "",
     results_df: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
-    يُجري تحليلاً شاملاً لمنتج بعينه عند الضغط على [📊 تحليل المنتج].
+    تحليل شامل لمنتج بعينه — يُستدعى من زر [📊 تحليل] في بطاقة المنتج.
 
     الخطوات:
-    1. يستدعي ai_deep_analysis للتحليل الذكي
-    2. يفحص هل المنتج في القسم الصحيح
-    3. يقترح السعر الأمثل
-    4. يرجع dict جاهزاً للعرض
+    1. ai_deep_analysis  → تحليل عميق بالسياق
+    2. verify_match      → هل المطابقة صحيحة؟ وما القسم الصحيح؟
+    3. suggest_price     → السعر الأمثل بالرقم
+    4. توليد أزرار الاقتراح بناءً على النتائج
 
-    Returns:
-        {
-            "success": bool,
-            "match_valid": bool,
-            "correct_section": str,
-            "suggested_price": float,
-            "analysis": str,
-            "price_verdict": str,
-            "recommendation": str,
-            "error": str | None
-        }
+    Returns dict:
+        success, match_valid, correct_section, suggested_price,
+        analysis, price_verdict, recommendation, confidence,
+        actions: List[dict]  ← الأزرار المقترحة
+        error
     """
-    result = {
-        "success": False,
-        "match_valid": None,
+    result: dict = {
+        "success":         False,
+        "match_valid":     None,
         "correct_section": "",
         "suggested_price": 0.0,
-        "analysis": "",
-        "price_verdict": "",
-        "recommendation": "",
-        "confidence": 0,
-        "error": None,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "analysis":        "",
+        "price_verdict":   "",
+        "recommendation":  "",
+        "confidence":      int(match_pct),
+        "section_mismatch": "",
+        "actions":         [],      # ← قائمة الأزرار المقترحة
+        "error":           None,
+        "timestamp":       datetime.now().strftime("%Y-%m-%d %H:%M"),
+        # metadata لاستخدام الأزرار
+        "_our_name":    our_name,
+        "_our_price":   our_price,
+        "_comp_name":   comp_name,
+        "_comp_price":  comp_price,
+        "_comp_source": comp_source,
+        "_product_id":  product_id,
+        "_section":     section,
+        "_brand":       brand,
     }
 
     try:
@@ -69,87 +76,254 @@ def analyze_product_inline(
         result["error"] = f"تعذّر تحميل AI: {e}"
         return result
 
-    # ── 1. التحليل العميق ───────────────────────────────────────────────
+    # ── 1. التحليل العميق ────────────────────────────────────────────────────
     try:
-        analysis_raw = ai_deep_analysis(
-            our_product=our_name,
-            our_price=our_price,
-            comp_product=comp_name,
-            comp_price=comp_price,
-            section=section,
-            brand=brand,
+        raw = ai_deep_analysis(
+            our_product=our_name, our_price=our_price,
+            comp_product=comp_name, comp_price=comp_price,
+            section=section, brand=brand,
         )
-        if isinstance(analysis_raw, dict):
-            result["analysis"]   = str(analysis_raw.get("response", analysis_raw.get("analysis", "")))
-            result["confidence"] = int(analysis_raw.get("confidence", match_pct))
+        if isinstance(raw, dict):
+            result["analysis"]   = str(raw.get("response", raw.get("analysis", "")))
+            result["confidence"] = int(raw.get("confidence", match_pct))
         else:
-            result["analysis"] = str(analysis_raw)
+            result["analysis"] = str(raw)
     except Exception as e:
         result["analysis"] = f"[تعذّر التحليل: {e}]"
 
-    # ── 2. التحقق من صحة المطابقة والقسم ───────────────────────────────
+    # ── 2. التحقق من صحة المطابقة والقسم ─────────────────────────────────────
     try:
-        verify_r = verify_match(our_name, comp_name, our_price, comp_price)
-        if verify_r.get("success"):
-            result["match_valid"]     = bool(verify_r.get("match", True))
-            result["correct_section"] = str(verify_r.get("correct_section", ""))
-            result["confidence"]      = int(verify_r.get("confidence", match_pct))
+        vr = verify_match(our_name, comp_name, our_price, comp_price)
+        if vr.get("success"):
+            result["match_valid"]     = bool(vr.get("match", True))
+            result["correct_section"] = str(vr.get("correct_section", ""))
+            result["confidence"]      = int(vr.get("confidence", match_pct))
     except Exception:
         pass
 
-    # ── 3. اقتراح السعر الأمثل ──────────────────────────────────────────
+    # ── 3. اقتراح السعر ──────────────────────────────────────────────────────
     try:
-        price_r = suggest_price(our_name, our_price, comp_price, section)
-        if isinstance(price_r, dict) and price_r.get("success"):
-            result["suggested_price"] = float(price_r.get("suggested_price", 0) or 0)
-            result["recommendation"]  = str(price_r.get("recommendation", ""))
-        elif isinstance(price_r, (int, float)):
-            result["suggested_price"] = float(price_r)
+        pr = suggest_price(our_name, comp_price)
+        if isinstance(pr, dict) and pr.get("success"):
+            result["suggested_price"] = float(pr.get("suggested_price", 0) or 0)
+            result["recommendation"]  = str(pr.get("recommendation", ""))
+        elif isinstance(pr, (int, float)):
+            result["suggested_price"] = float(pr)
     except Exception:
         pass
 
-    # ── 4. حكم السعر ────────────────────────────────────────────────────
+    # إذا لم نحصل على سعر مقترح → احسب تلقائياً
+    if not result["suggested_price"] and comp_price > 0:
+        result["suggested_price"] = round(comp_price - 1, 0)
+
+    # ── 4. حكم السعر ─────────────────────────────────────────────────────────
     if our_price > 0 and comp_price > 0:
         diff    = our_price - comp_price
         diff_pc = diff / comp_price * 100
         if diff > 5:
             result["price_verdict"] = (
-                f"🔴 سعرنا أعلى بـ {diff:.0f} ر.س ({diff_pc:.1f}%) — "
-                "ننصح بخفضه أو تبريره بجودة أعلى"
+                f"🔴 سعرنا أعلى بـ {diff:.0f} ر.س ({diff_pc:.1f}%)"
             )
         elif diff < -5:
             result["price_verdict"] = (
-                f"🟢 سعرنا أقل بـ {abs(diff):.0f} ر.س ({abs(diff_pc):.1f}%) — "
-                "فرصة لرفع هامش الربح"
+                f"🟢 سعرنا أقل بـ {abs(diff):.0f} ر.س ({abs(diff_pc):.1f}%) — فرصة رفع"
             )
         else:
-            result["price_verdict"] = (
-                f"✅ سعرنا تنافسي (فرق {diff:+.0f} ر.س)"
-            )
+            result["price_verdict"] = f"✅ سعر تنافسي (فرق {diff:+.0f} ر.س)"
 
-    # ── 5. فحص القسم الصحيح ─────────────────────────────────────────────
-    if result["correct_section"]:
-        section_map = {
-            "raise":    "🔴 سعر أعلى",
-            "lower":    "🟢 سعر أقل",
-            "approved": "✅ موافق عليها",
-            "missing":  "🔍 منتجات مفقودة",
-            "review":   "⚠️ تحت المراجعة",
-            "excluded": "⚪ مستبعد",
-        }
-        cur_ar  = section_map.get(section, section)
-        corr_ar = result["correct_section"]
-        if corr_ar and corr_ar != cur_ar:
-            result["section_mismatch"] = (
-                f"⚠️ المنتج في **{cur_ar}** لكن AI يرى أنه ينتمي لـ **{corr_ar}**"
-            )
-        else:
-            result["section_mismatch"] = ""
-    else:
-        result["section_mismatch"] = ""
+    # ── 5. تحذير القسم ───────────────────────────────────────────────────────
+    _section_labels = {
+        "raise":    "🔴 سعر أعلى",
+        "lower":    "🟢 سعر أقل",
+        "approved": "✅ موافق عليها",
+        "missing":  "🔍 منتجات مفقودة",
+        "review":   "⚠️ تحت المراجعة",
+        "excluded": "⚪ مستبعد",
+        "price_raise": "🔴 سعر أعلى",
+        "price_lower": "🟢 سعر أقل",
+        "general": "",
+    }
+    cur_ar  = _section_labels.get(section, section)
+    corr_ar = result["correct_section"]
+    if corr_ar and cur_ar and corr_ar != cur_ar:
+        result["section_mismatch"] = (
+            f"⚠️ المنتج في **{cur_ar}** لكن AI يرى أنه ينتمي لـ **{corr_ar}**"
+        )
+
+    # ── 6. توليد أزرار الاقتراح الذكية ──────────────────────────────────────
+    result["actions"] = _build_action_buttons(result)
 
     result["success"] = True
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  توليد أزرار الاقتراح
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_action_buttons(result: dict) -> list[dict]:
+    """
+    يُولّد قائمة أزرار اقتراح بناءً على نتيجة التحليل.
+    كل زر: {"key", "label", "action", "params", "style"}
+    """
+    actions = []
+    uid = str(uuid.uuid4())[:6]
+
+    our_name   = result["_our_name"]
+    our_price  = result["_our_price"]
+    comp_name  = result["_comp_name"]
+    comp_price = result["_comp_price"]
+    comp_src   = result["_comp_source"]
+    prod_id    = result["_product_id"]
+    section    = result["_section"]
+    sugg_price = result.get("suggested_price", 0) or (
+        round(comp_price - 1, 0) if comp_price > 0 else our_price
+    )
+
+    # — زر تحديث السعر المقترح —
+    if sugg_price > 0 and abs(sugg_price - our_price) > 1:
+        verb = "خفض" if sugg_price < our_price else "رفع"
+        actions.append({
+            "key":    f"act_price_{uid}",
+            "label":  f"🤖 {verb} السعر → {sugg_price:.0f} ر.س",
+            "action": "update_price",
+            "params": {
+                "product_name": our_name,
+                "product_id":   prod_id,
+                "competitor":   comp_src,
+                "old_price":    our_price,
+                "new_price":    sugg_price,
+                "notes":        f"[AI] {verb} السعر من {our_price:.0f} → {sugg_price:.0f}",
+            },
+            "style": "primary",
+        })
+
+    # — زر نقل للمنتجات المفقودة (إذا كانت المطابقة خاطئة) —
+    if result.get("match_valid") is False:
+        actions.append({
+            "key":    f"act_missing_{uid}",
+            "label":  "🤖 نقل → منتجات مفقودة",
+            "action": "move_to_missing",
+            "params": {
+                "product_name": our_name,
+                "product_id":   prod_id,
+                "competitor":   comp_src,
+                "old_price":    our_price,
+                "new_price":    comp_price,
+                "notes":        "[AI] مطابقة خاطئة — نُقل للمفقودين",
+            },
+            "style": "secondary",
+        })
+
+    # — زر موافقة (إذا كانت المطابقة صحيحة وفرق السعر ضئيل) —
+    if result.get("match_valid") is True and abs(our_price - comp_price) <= 10:
+        actions.append({
+            "key":    f"act_approve_{uid}",
+            "label":  "🤖 موافق — السعر تنافسي",
+            "action": "approve",
+            "params": {
+                "product_name": our_name,
+                "product_id":   prod_id,
+                "competitor":   comp_src,
+                "old_price":    our_price,
+                "new_price":    our_price,
+                "notes":        "[AI] موافقة تلقائية — السعر ضمن النطاق التنافسي",
+            },
+            "style": "primary",
+        })
+
+    # — زر نقل للقسم الصحيح —
+    if result.get("section_mismatch"):
+        correct = result.get("correct_section", "")
+        section_action_map = {
+            "🔴 سعر أعلى":        "move_to_raise",
+            "سعر اعلى":           "move_to_raise",
+            "🟢 سعر أقل":         "move_to_lower",
+            "سعر اقل":            "move_to_lower",
+            "🔍 منتجات مفقودة":  "move_to_missing",
+            "مفقود":              "move_to_missing",
+            "✅ موافق":           "approve",
+            "موافق":              "approve",
+        }
+        act = section_action_map.get(correct, "")
+        if act:
+            actions.append({
+                "key":    f"act_move_{uid}",
+                "label":  f"🤖 نقل → {correct}",
+                "action": act,
+                "params": {
+                    "product_name": our_name,
+                    "product_id":   prod_id,
+                    "competitor":   comp_src,
+                    "old_price":    our_price,
+                    "new_price":    sugg_price if "price" in act else our_price,
+                    "notes":        f"[AI] نُقل إلى {correct}",
+                },
+                "style": "secondary",
+            })
+
+    # — زر تجاهل (دائماً متاح) —
+    actions.append({
+        "key":    f"act_ignore_{uid}",
+        "label":  "⏸️ تجاهل التوصية",
+        "action": "ignore",
+        "params": {"product_name": our_name, "notes": "[AI] تجاهل التوصية"},
+        "style":  "tertiary",
+    })
+
+    return actions
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  تنفيذ إجراء الزر (مرتبط بـ DB)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def execute_action(action: str, params: dict) -> dict:
+    """
+    يُنفّذ إجراء الزر ويحفظه في قاعدة البيانات.
+
+    Args:
+        action: اسم الإجراء (update_price / approve / move_to_missing / ...)
+        params: معاملات الإجراء
+
+    Returns:
+        {"success": bool, "message": str}
+    """
+    try:
+        from utils.db_manager import save_processed, save_hidden_product
+    except ImportError as e:
+        return {"success": False, "message": f"تعذّر تحميل DB: {e}"}
+
+    pname   = str(params.get("product_name", ""))
+    pid     = str(params.get("product_id", ""))
+    comp    = str(params.get("competitor", ""))
+    old_p   = float(params.get("old_price", 0))
+    new_p   = float(params.get("new_price", 0))
+    notes   = str(params.get("notes", ""))
+
+    try:
+        if action == "ignore":
+            return {"success": True, "message": "تم تجاهل التوصية بنجاح"}
+
+        # تحويل اسم الإجراء إلى الحالة المناسبة في DB
+        status_map = {
+            "update_price":    "send_price",
+            "approve":         "approved",
+            "move_to_missing": "missing",
+            "move_to_raise":   "price_raise",
+            "move_to_lower":   "price_lower",
+        }
+        status = status_map.get(action, action)
+
+        # 1. حفظ في جدول المعالجة
+        save_processed(pname, pid, comp, status, old_p, new_p, notes)
+        # 2. إخفاء من الواجهة
+        save_hidden_product(pname, pid, comp)
+
+        return {"success": True, "message": f"تم تنفيذ الإجراء: {status}"}
+
+    except Exception as e:
+        return {"success": False, "message": f"خطأ في التنفيذ: {e}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,9 +332,7 @@ def analyze_product_inline(
 
 def render_analysis_result(result: dict, container=None) -> None:
     """
-    يعرض نتيجة analyze_product_inline() داخل Streamlit.
-    يُمرَّر container=st إذا أردت عرضه في مستوى الصفحة،
-    أو container=st.expander(...) لعرضه داخل مُوسّع.
+    يعرض نتيجة analyze_product_inline() داخل Streamlit مع أزرار الأكشن.
     """
     import streamlit as st
     c = container or st
@@ -188,7 +360,7 @@ def render_analysis_result(result: dict, container=None) -> None:
             f'<div style="background:#091929;border:1px solid #1e3a5f;'
             f'border-radius:8px;padding:12px 14px;font-size:.85rem;'
             f'line-height:1.7;white-space:pre-wrap">'
-            f'🤖 <b>تحليل AI:</b><br>{result["analysis"][:600]}</div>',
+            f'🤖 <b>تحليل AI:</b><br>{result["analysis"][:800]}</div>',
             unsafe_allow_html=True,
         )
 
@@ -197,10 +369,31 @@ def render_analysis_result(result: dict, container=None) -> None:
     if sp and sp > 0:
         c.success(f"💰 **السعر المقترح: {sp:,.0f} ر.س**")
         if result.get("recommendation"):
-            c.caption(result["recommendation"][:200])
+            c.caption(result["recommendation"][:300])
 
     # مصداقية المطابقة
     if result.get("match_valid") is False:
         c.error("🔵 AI: المطابقة خاطئة — يجب نقل المنتج للمنتجات المفقودة")
     elif result.get("match_valid") is True:
         c.success(f"✅ AI: مطابقة صحيحة ({result.get('confidence', 0)}%)")
+
+    # ── أزرار الاقتراح الذكية ───────────────────────────────────────────
+    if result.get("actions"):
+        st.markdown("---")
+        st.caption("🚀 إجراءات مقترحة:")
+        # توزيع الأزرار في أعمدة
+        cols = st.columns(len(result["actions"]))
+        for idx, act in enumerate(result["actions"]):
+            with cols[idx]:
+                if st.button(
+                    act["label"],
+                    key=act["key"],
+                    use_container_width=True,
+                    type="primary" if act["style"] == "primary" else "secondary",
+                ):
+                    res = execute_action(act["action"], act["params"])
+                    if res["success"]:
+                        st.success(res["message"])
+                        st.rerun()
+                    else:
+                        st.error(res["message"])
