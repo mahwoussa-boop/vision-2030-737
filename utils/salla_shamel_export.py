@@ -450,11 +450,14 @@ def _safe_alt_text(s: str) -> str:
 
 
 def _real_price(r: dict) -> str:
-    for k in ("سعر_المنافس", "سعر المنافس", "السعر", "سعر المنتج", "Price", "price", "PRICE"):
-        if k not in r: continue
-        p = safe_float(r.get(k), 0.0)
+    """جلب السعر من عدة مفاتيح محتملة مع تنظيف الفواصل."""
+    for k in ("سعر المنتج", "سعر_المنافس", "سعر المنافس", "السعر", "Price", "price", "PRICE"):
+        v = r.get(k)
+        if v is None or str(v).strip() in ("", "nan", "None"):
+            continue
+        p = safe_float(v, 0.0)
         if p > 0: return str(round(p, 2))
-    return ""
+    return "0"
 
 
 def _real_sku(r: dict) -> str:

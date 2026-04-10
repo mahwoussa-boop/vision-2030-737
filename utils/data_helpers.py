@@ -199,7 +199,9 @@ def safe_results_for_json(results_list):
     safe = []
     for r in results_list:
         row = {}
-        for k, v in (r.items() if isinstance(r, dict) else {}):
+        # دعم كل من dict و pandas Series
+        items = r.items() if hasattr(r, "items") else (r.to_dict().items() if hasattr(r, "to_dict") else [])
+        for k, v in items:
             if isinstance(v, list):
                 try:
                     row[k] = json.dumps(v, ensure_ascii=False, default=str)
@@ -207,8 +209,15 @@ def safe_results_for_json(results_list):
                     row[k] = str(v)
             else:
                 try:
-                    if v is not None and not isinstance(v, (list, dict)) and pd.isna(v):
-                        row[k] = "" if k in _MEDIA_KEYS_EMPTY_ON_NA else 0
+                    # التحقق من NaN بشكل آمن
+                    if v is not None and not isinstance(v, (list, dict, str)) and pd.isna(v):
+                        # الحفاظ على الحقول النصية فارغة والحقول الرقمية كـ None أو 0
+                        if k in _MEDIA_KEYS_EMPTY_ON_NA or k in ("المنتج", "الماركة", "اسم المنتج"):
+                            row[k] = ""
+                        elif "سعر" in str(k) or "diff" in str(k).lower():
+                            row[k] = 0.0
+                        else:
+                            row[k] = None # السماح بـ null في JSON للحفاظ على النوع
                         continue
                 except (TypeError, ValueError):
                     pass
@@ -219,17 +228,20 @@ def safe_results_for_json(results_list):
 
 def restore_results_from_json(results_list):
     """استعادة النتائج من JSON — يحول نصوص القوائم لقوائم فعلية."""
+    if not results_list: return []
     restored = []
     for r in results_list:
         row = dict(r) if isinstance(r, dict) else {}
-        for k in ["جميع_المنافسين", "جميع المنافسين"]:
-            v = row.get(k)
-            if isinstance(v, str):
+        # استعادة القوائم من نصوص JSON
+        for k, v in row.items():
+            if isinstance(v, str) and v.strip() and (v.startswith("[") or v.startswith("{")):
                 try:
                     row[k] = json.loads(v)
                 except Exception:
-                    row[k] = []
-            elif v is None:
+                    pass
+        # ضمان وجود مفاتيح المنافسين كقوائم حتى لو كانت مفقودة
+        for k in ["جميع_المنافسين", "جميع المنافسين"]:
+            if k not in row or row[k] is None:
                 row[k] = []
         normalize_result_media_keys(row)
         restored.append(row)

@@ -283,22 +283,42 @@ def try_cloudscraper(url: str) -> Optional[str]:
 #  6. سلسلة الـ Fallback الكاملة (مزامن — يُستدعى من executor)
 # ══════════════════════════════════════════════════════════════════════════
 def try_all_sync_fallbacks(url: str) -> Optional[str]:
-    """يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests بسيط."""
+    """يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests بسيط مع معالجة أفضل لـ Cloudflare."""
+    # المحاولة 1: curl_cffi مع انتحال شخصية Chrome (الأقوى حالياً)
     html = try_curl_cffi(url)
-    if html:
+    if html and not looks_like_bot_challenge(html):
         return html
 
-    html = try_cloudscraper(url)
-    if html:
-        return html
+    # المحاولة 2: cloudscraper (حل كلاسيكي لـ Cloudflare JS Challenge)
+    html_cs = try_cloudscraper(url)
+    if html_cs and not looks_like_bot_challenge(html_cs):
+        return html_cs
 
+    # المحاولة 3: requests مع رؤوس متصفح حقيقية (Fallback نهائي)
     try:
         import requests as _req
         headers = get_browser_headers(referer=f"https://{urlparse(url).netloc}/")
-        resp = _req.get(url, headers=headers, timeout=20, allow_redirects=True, verify=False)
-        if resp.status_code == 200:
-            return resp.text
+        # استخدام Session للحفاظ على الكوكيز في حال وجود تحويلات
+        with _req.Session() as session:
+            resp = session.get(url, headers=headers, timeout=25, allow_redirects=True, verify=False)
+            if resp.status_code == 200:
+                if not looks_like_bot_challenge(resp.text):
+                    return resp.text
+                # إذا كانت صفحة تحدي، نحتفظ بها لعلنا نستخرج منها Meta tags لاحقاً
+                return resp.text
     except Exception as exc:
         logger.debug("requests fallback %s: %s", url, exc)
 
-    return None
+    # إذا وصلنا هنا وفشلنا في الحصول على HTML نظيف، نرجع آخر محاولة حصلنا عليها (حتى لو كانت تحدي)
+    return html or html_cs or None
+
+def looks_like_bot_challenge(html: str) -> bool:
+    """التحقق من وجود علامات تحدي البوت (Cloudflare/DDoS)."""
+    if not html or len(html) < 500:
+        return True
+    snippets = [
+        "just a moment", "checking your browser", "cf-browser-verification",
+        "enable javascript", "ddos protection by", "attention required! | cloudflare"
+    ]
+    head = html[:15000].lower()
+    return any(s in head for s in snippets)

@@ -105,17 +105,17 @@ def _merge_raw_and_ai(
 
 
 def _bundle_to_export_row(b: Dict[str, Any]) -> Dict[str, Any]:
-    """صف واحد متوافق مع export_to_salla_shamel."""
+    """صف واحد متوافق مع export_to_salla_shamel مع توحيد مسميات الأعمدة."""
     imgs = b.get("images") or []
     img_str = ",".join(str(u).strip() for u in imgs if str(u).strip())
 
     gender = (b.get("gender_hint") or "").strip()
     if not gender:
-        g = _infer_gender_from_text(
+        gender = _infer_gender_from_text(
             f"{b.get('product_name','')} {b.get('description_html','')}"
         )
-        gender = g
 
+    # توحيد مسميات الأعمدة لتتوافق مع دالة التصدير
     return {
         "المنتج": b.get("product_name", ""),
         "الماركة": b.get("brand", ""),
@@ -128,10 +128,12 @@ def _bundle_to_export_row(b: Dict[str, Any]) -> Dict[str, Any]:
         "رمز المنتج sku": b.get("sku", ""),
         "الباركود": b.get("barcode", ""),
         "العنوان الترويجي": b.get("seo_title", ""),
+        "وصف SEO": b.get("seo_description", ""),
         "الجنس": gender,
         "الافتتاحية": b.get("top_notes", ""),
         "القلب": b.get("heart_notes", ""),
         "القاعدة": b.get("base_notes", ""),
+        "is_perfume": b.get("is_perfume", True)
     }
 
 

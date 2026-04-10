@@ -55,12 +55,12 @@ def _classify_rejected(name: str) -> bool:
     return any(w in nl for w in rejects)
 
 def apply_strict_pipeline_filters(
-    df: pd.DataFrame, name_col: str = "منتج_المنافس"
+    df: pd.DataFrame, name_col: str = "منتج_المنافس", min_ml: float = 2.0
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """فلاتر استبعاد المنتجات مع تسجيل الأسباب بدقة."""
     if df is None or df.empty:
         return df, {"dropped": 0}
 
-    # محاولة البحث عن عمود الاسم الصحيح
     actual_col = name_col
     if name_col not in df.columns:
         alt_cols = ["المنتج", "اسم المنتج", "Product", "Name", "أسم المنتج"]
@@ -76,23 +76,34 @@ def apply_strict_pipeline_filters(
         "dropped_small_ml": 0,
         "dropped_class_rejected": 0,
         "dropped_empty_name": 0,
+        "excluded_rows": []
     }
     keep_idx: List[Any] = []
 
     for idx, row in df.iterrows():
         name = str(row.get(actual_col, "")).strip()
+        
+        # 1. الأسماء الفارغة
         if not name or name.lower() in ("nan", "none", "<na>"):
             stats["dropped_empty_name"] += 1
             continue
+            
+        # 2. كلمات استبعاد العينات
         if _is_sample_strict(name):
             stats["dropped_sample_kw"] += 1
+            stats["excluded_rows"].append({"name": name, "reason": "كلمة عينة محظورة"})
             continue
+            
         if _classify_rejected(name):
             stats["dropped_class_rejected"] += 1
+            stats["excluded_rows"].append({"name": name, "reason": "تصنيف مستبعد (عينة/تقسيم)"})
             continue
+            
+        # 3. الأحجام الصغيرة جداً (أقل من 2 مل افتراضياً بدل 5 مل)
         ml = _extract_ml(name)
-        if 0 < ml < 5:
+        if 0 < ml < min_ml:
             stats["dropped_small_ml"] += 1
+            stats["excluded_rows"].append({"name": name, "reason": f"حجم صغير جداً ({ml} مل)"})
             continue
 
         keep_idx.append(idx)
