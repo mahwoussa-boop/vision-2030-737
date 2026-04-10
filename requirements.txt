@@ -7,3 +7,5 @@ plotly==6.6.0
 streamlit-autorefresh>=1.0.1
 aiohttp==3.13.3
 cloudscraper>=1.2.71
+
+streamlit-autorefresh>=0.0.1
