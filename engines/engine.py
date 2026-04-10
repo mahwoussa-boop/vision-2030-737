@@ -11,7 +11,8 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
   4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, os, hashlib, sqlite3, time, gc
+import re, io, json, os, hashlib, sqlite3, gc
+import functools as _functools
 from datetime import datetime
 import pandas as pd
 from utils.data_helpers import first_image_url_string, pid_from_row as _pid
@@ -72,10 +73,15 @@ except:
         "جيمي تشو","لاليك","بوليس","فيكتور رولف",
         "كلوي","بالنسياغا","ميو ميو",
     ]
-WORD_REPLACEMENTS = {}
-MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
-PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
-OPENROUTER_API_KEY = ""
+    WORD_REPLACEMENTS  = {}
+    MATCH_THRESHOLD    = 85
+    HIGH_CONFIDENCE    = 95
+    REVIEW_THRESHOLD   = 75
+    PRICE_TOLERANCE    = 5
+    TESTER_KEYWORDS    = ["tester", "تستر"]
+    SET_KEYWORDS       = ["set", "طقم", "مجموعة"]
+    GEMINI_API_KEYS    = []
+    OPENROUTER_API_KEY = ""
 
 # ─── مفاتيح Gemini: config أولاً (يدمج secrets.toml + env)؛ إن فارغ استخدم env فقط ───
 import os as _os
@@ -273,44 +279,83 @@ _SYN = {
 }
 
 # ─── v26.0: Fuzzy Spell Correction ────────────────
+# ✅ إصلاح #5: LRU cache لتجنب إعادة بناء قائمة الماركات مع كل استدعاء
+@_functools.lru_cache(maxsize=1)
+def _get_normalized_brands():
+    """يُحسب مرة واحدة فقط عند أول استدعاء"""
+    return [(b, b.lower()) for b in KNOWN_BRANDS]
+
+
 def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
     """تصحيح إملائي ذكي للماركات — يُستخدم عند فشل المطابقة المباشرة"""
-    if not text:
+    if not text or len(text) < 3:
         return ""
     from rapidfuzz import fuzz as _fz
     text_norm = text.lower().strip()
     best_brand = ""
     best_score = 0
-    for b in KNOWN_BRANDS:
-        s = _fz.ratio(text_norm, b.lower())
+    for b_orig, b_low in _get_normalized_brands():
+        s = _fz.ratio(text_norm, b_low)
         if s > best_score and s >= threshold:
             best_score = s
-            best_brand = b
+            best_brand = b_orig
+            if best_score >= 97:
+                break
     return best_brand
 
-# ─── SQLite Cache ───────────────────────────
+# ─── SQLite Cache — اتصال دائم مع thread safety ────────────────
+# ✅ إصلاح #6: اتصال دائم بدلاً من فتح/إغلاق لكل عملية
 _DB = get_data_db_path("match_cache_v21.db")
+_db_conn = None
+
+
+def _get_db_conn():
+    """يُعيد اتصالاً دائماً — يُنشئه عند أول استدعاء فقط"""
+    global _db_conn
+    if _db_conn is None:
+        try:
+            _db_conn = sqlite3.connect(_DB, check_same_thread=False)
+            _db_conn.execute(
+                "CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)"
+            )
+            _db_conn.execute("PRAGMA journal_mode=WAL")
+            _db_conn.commit()
+        except Exception:
+            _db_conn = None
+    return _db_conn
+
+
 def _init_db():
     try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
-        cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
-        cn.commit(); cn.close()
-    except: pass
+        _get_db_conn()
+    except Exception:
+        pass
+
 
 def _cget(k):
     try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
-        r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
-        cn.close(); return json.loads(r[0]) if r else None
-    except: return None
+        conn = _get_db_conn()
+        if conn is None:
+            return None
+        r = conn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
+        return json.loads(r[0]) if r else None
+    except Exception:
+        return None
+
 
 def _cset(k, v):
     try:
-        cn = sqlite3.connect(_DB, check_same_thread=False)
-        cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
-                   (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
-        cn.commit(); cn.close()
-    except: pass
+        conn = _get_db_conn()
+        if conn is None:
+            return
+        conn.execute(
+            "INSERT OR REPLACE INTO cache VALUES(?,?,?)",
+            (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat())
+        )
+        conn.commit()
+    except Exception:
+        pass
+
 
 _init_db()
 
@@ -825,16 +870,17 @@ def normalize(text):
     """تطبيع قياسي: يوحّد الحروف والمرادفات مع الحفاظ على كامل النص"""
     if not isinstance(text, str): return ""
     t = text.strip().lower()
-    # 1. توحيد الهمزات أولاً (قبل أي استبدال)
+    # ✅ إصلاح #4: المرادفات أولاً — يجب أن تسبق توحيد الهمزات
+    # (كانت مفاتيح _SYN بهمزات لا تُطابَق بعد توحيد الهمزات في الخطوة الأولى)
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
+    # 2. توحيد الهمزات بعد المرادفات (لمعالجة ما تبقى من نصوص)
     for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
                      ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
         t = t.replace(src, dst)
-    # 2. المرادفات المخصصة
+    # 3. المرادفات المخصصة (من config.py)
     for k, v in WORD_REPLACEMENTS.items():
         t = t.replace(k.lower(), v)
-    # 3. قاموس المرادفات الشامل
-    for k, v in _SYN.items():
-        t = t.replace(k, v)
     t = re.sub(r'[^\w\s\u0600-\u06FF.]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
 
@@ -848,13 +894,13 @@ def normalize_name(text):
     """
     if not isinstance(text, str): return ""
     t = text.strip().lower()
-    # 1. توحيد الهمزات أولاً
+    # ✅ إصلاح #4: المرادفات أولاً — يجب أن تسبق توحيد الهمزات
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
+    # 2. توحيد الهمزات بعد المرادفات
     for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
                      ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
         t = t.replace(src, dst)
-    # 2. قاموس المرادفات (ترجمة التهجئات البديلة)
-    for k, v in _SYN.items():
-        t = t.replace(k, v)
     # 3. حذف كلمات الضجيج
     t = _NOISE_RE.sub(' ', t)
     # 4. حذف الأرقام المتبقية + الرموز
@@ -886,14 +932,19 @@ def extract_brand(text):
         if normalize(b) in n or b.lower() in tl: return b
     # 2. v26.0: تصحيح إملائي ذكي (fallback)
     words = text.split()
+    # ✅ إصلاح #5: حد أقصى 12 مجموعة كلمات لتجنب O(N×W×B) التكرار المفرط
+    candidates_checked = 0
     for i in range(len(words)):
-        for length in [3, 2, 1]:  # محاولة مجموعات من 3، 2، 1 كلمة
+        for length in [3, 2, 1]:
             if i + length <= len(words):
                 candidate = " ".join(words[i:i+length])
-                if len(candidate) >= 4:  # تجنب الكلمات القصيرة جداً
+                if len(candidate) >= 4:
                     corrected = _fuzzy_correct_brand(candidate, threshold=85)
                     if corrected:
                         return corrected
+                    candidates_checked += 1
+                    if candidates_checked >= 12:
+                        return ""
     return ""
 
 def extract_type(text):
@@ -1632,17 +1683,19 @@ def _ai_batch(batch):
             raw = json.loads(clean[s:e]).get("results", [])
             out = []
             for j, it in enumerate(batch):
-                n = raw[j] if j < len(raw) else 1
+                # ✅ إصلاح #3: JSON مقتطع → 0 يُترجم لـ -1 (لا تطابق)
+                n = raw[j] if j < len(raw) else 0
                 try:
                     n = int(float(str(n)))
                 except Exception:
-                    n = 1
+                    n = 0
                 if 1 <= n <= len(it["candidates"]):
                     out.append(n - 1)
                 elif n == 0:
                     out.append(-1)
                 else:
-                    out.append(0)
+                    # ✅ إصلاح #3: رقم خارج النطاق → -1 لا index 0
+                    out.append(-1)
             return out if len(out) == len(batch) else None
         except Exception:
             return None
@@ -1664,18 +1717,8 @@ def _ai_batch(batch):
                     _cset(ck, out)
                     return out
             elif r.status_code == 429:
-                # rate limit → انتظر أطول ثم جرب نفس المفتاح مرة أخرى
-                time.sleep(3)
-                try:
-                    r2 = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
-                    if r2.status_code == 200:
-                        txt = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
-                        out = _parse(txt)
-                        if out:
-                            _cset(ck, out)
-                            return out
-                except Exception:
-                    pass
+                # ✅ إصلاح #2: Rate limit → تخطّ هذا المفتاح مباشرة (لا sleep في main thread)
+                continue
             # 403/400 → جرب المفتاح التالي فوراً
         except Exception:
             continue
@@ -1922,7 +1965,8 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                     idxs.append(-1)
         for j, it in enumerate(pending):
             try:
-                ci = idxs[j] if j < len(idxs) else 0
+                # ✅ إصلاح: idxs أقصر → -1 (لا تطابق) لا index 0
+                ci = idxs[j] if j < len(idxs) else -1
                 if ci < 0:
                     # AI غير متأكد → أعطِ أفضل مرشح كمراجعة
                     best_fallback = it["candidates"][0] if it["candidates"] else None
@@ -1943,11 +1987,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 # خطأ في منتج واحد → تخطيه وأكمل
                 continue
         pending.clear()
-        # تأخير صغير بين الباتشات لمنع rate limit
-        try:
-            time.sleep(0.5)
-        except Exception:
-            pass
+        # ✅ إصلاح #2: حذف time.sleep(0.5) — مخالف لقواعد Streamlit Main Thread
 
     def _cell_clean(r, col):
         if not col or col not in r.index:
