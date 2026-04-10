@@ -1,7 +1,11 @@
 """
 تصدير منتجات مفقودة بتنسيق CSV سلة الشامل المحدث.
 مطابق تماماً لنموذج "منتججديد.csv" المرفق.
-v29.0 - وضع المطابقة الصارمة (Strict Matching) لتجنب أخطاء الاستيراد.
+v29.1 - وضع المطابقة الصارمة (Strict Matching) لتجنب أخطاء الاستيراد.
+
+✅ إصلاح #1: UnboundLocalError في resolve_category_for_shamel (r غير مُعرَّف)
+✅ إصلاح #2: Double BOM — إزالة \\ufeff اليدوي + استخدام encode("utf-8-sig")
+✅ إصلاح #3: مسافة زائدة في عمود "النوع " أصبحت "النوع"
 """
 import html
 import io
@@ -65,7 +69,6 @@ def _markdown_to_salla_html(md_text: str) -> str:
             out.append(f"<p>{para}</p>")
     if in_ul: out.append("</ul>")
     return "\n".join(out)
-
 
 
 def _debug_log(hypothesis_id: str, location: str, message: str, data: dict | None = None, run_id: str = "pre-fix") -> None:
@@ -214,7 +217,7 @@ def _resolve_category_to_store(cat_value: str, store_categories: list[str], gend
         if matches:
             return norm_map[matches[0]]
 
-    return "" # إرجاع فارغ لمنع الرفض
+    return ""  # إرجاع فارغ لمنع الرفض
 
 
 def resolve_brand_for_shamel(brand_raw: str) -> str:
@@ -243,6 +246,9 @@ def resolve_category_for_shamel(
     """
     يطابق التصنيف مع «تصنيفات مهووس.csv» / categories.csv (نفس منطق التصدير).
     يدعم صيغة الـ AI «العطور > عطور رجالية» بمحاولة الجزء بعد > عند فشل المطابقة الكاملة.
+
+    ✅ إصلاح #1: تهيئة r = "" قبل الحلقة لمنع UnboundLocalError عند _cands فارغة
+    أو عند استدعاء الدالة بـ gender_hint="للجنسين" وقائمة تصنيفات فارغة.
     """
     store = _load_store_categories()
     if not store:
@@ -274,11 +280,14 @@ def resolve_category_for_shamel(
     else:
         _cands.append(cv)
 
+    # ✅ إصلاح #1: تهيئة r قبل الحلقة — يمنع UnboundLocalError إذا كانت _cands فارغة
+    r: str = ""
     for cand in _cands:
         r = _try(cand)
         if r:
             return r
 
+    # r مُعرَّف دائماً هنا (سلسلة فارغة في أسوأ الأحوال)
     if gh == "للجنسين" and not r:
         for c in store:
             if c.strip() == "عطور للجنسين":
@@ -356,8 +365,11 @@ def _build_export_title(raw_name: str, brand: str, gender: str) -> str:
     title = re.sub(r"\s+", " ", title)
     return title[:220]
 
+
+# ✅ إصلاح #3: إزالة المسافة الزائدة من "النوع " → "النوع"
+# القائمة مطابقة لقالب سلة الشامل الرسمي بدون مسافات زائدة
 SALLA_SHAMEL_COLUMNS = [
-    "النوع ",
+    "النوع",
     "أسم المنتج",
     "تصنيف المنتج",
     "صورة المنتج",
@@ -450,14 +462,11 @@ def _safe_alt_text(s: str) -> str:
 
 
 def _real_price(r: dict) -> str:
-    """جلب السعر من عدة مفاتيح محتملة مع تنظيف الفواصل."""
-    for k in ("سعر المنتج", "سعر_المنافس", "سعر المنافس", "السعر", "Price", "price", "PRICE"):
-        v = r.get(k)
-        if v is None or str(v).strip() in ("", "nan", "None"):
-            continue
-        p = safe_float(v, 0.0)
+    for k in ("سعر_المنافس", "سعر المنافس", "السعر", "سعر المنتج", "Price", "price", "PRICE"):
+        if k not in r: continue
+        p = safe_float(r.get(k), 0.0)
         if p > 0: return str(round(p, 2))
-    return "0"
+    return ""
 
 
 def _real_sku(r: dict) -> str:
@@ -471,26 +480,37 @@ def _real_sku(r: dict) -> str:
 
 
 def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool = True) -> bytes:
+    """
+    تصدير DataFrame المنتجات المفقودة إلى ملف CSV بتنسيق سلة الشامل.
+
+    ✅ إصلاح #2: إزالة BOM اليدوي ("\\ufeff") واستخدام encode("utf-8-sig") مباشرة.
+    encode("utf-8-sig") تضيف BOM واحداً صحيحاً (EF BB BF) في بداية الملف تلقائياً،
+    بينما الجمع بين "\\ufeff" + encode("utf-8") ينتج BOM مزدوجاً يكسر الاستيراد.
+
+    ✅ إصلاح #3: مفتاح "النوع" بدون مسافة زائدة في row_csv.
+    """
     ncols = len(SALLA_SHAMEL_COLUMNS)
 
     if missing_df is None or missing_df.empty:
         out = io.StringIO(newline="")
         w = csv.writer(out)
-        w.writerow(["﻿بيانات المنتج"] + [""] * (ncols - 1))
+        # ✅ إصلاح #2: بدون "\ufeff" يدوي في النص — encode("utf-8-sig") ستضيفه تلقائياً
+        w.writerow(["بيانات المنتج"] + [""] * (ncols - 1))
         w.writerow(SALLA_SHAMEL_COLUMNS)
-        return ("\ufeff" + out.getvalue()).encode("utf-8")
+        # ✅ إصلاح #2: encode("utf-8-sig") بدلاً من ("\ufeff" + ...).encode("utf-8")
+        return out.getvalue().encode("utf-8-sig")
 
     rows_out = []
     _store_brands = _load_store_brands()
     _store_categories = _load_store_categories()
-    
+
     _seen_skus: set[str] = set()
     for _, row in missing_df.iterrows():
         r = row.to_dict()
         raw_pname = _plain_missing_product_name(r)
         gender_inferred = _infer_gender_text(r)
         comp_price = _real_price(r)
-        
+
         # 1. الماركة - مطابقة صارمة
         brand_raw = sanitize_salla_text(
             str(r.get("الماركة_الرسمية", "") or r.get("الماركة", "")).strip()
@@ -501,7 +521,7 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         brand = get_brand_arabic_name(brand_raw, _store_brands) if brand_raw else ""
         if not brand and brand_raw:
             brand = _resolve_brand_to_store(brand_raw, _store_brands)
-        
+
         pname = _build_export_title(raw_pname, brand, gender_inferred)
 
         # فحص الحجم المفقود — علامة ⚠️ للمراجعة اليدوية
@@ -517,7 +537,7 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         if _sku_invalid:
             sku = f"MS-{uuid.uuid4().hex[:10].upper()}"
         _seen_skus.add(sku)
-        
+
         # 3. الوصف
         product_data = {
             "name": pname,
@@ -530,16 +550,16 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             }
         }
         desc_text = format_mahwous_description(product_data)
-        
+
         # 4. التصنيف - مطابقة صارمة
         category_raw = sanitize_salla_text(
             str(r.get("التصنيف_الرسمي", "") or r.get("تصنيف المنتج", "")).strip()
         )
         if not category_raw:
             category_raw = auto_infer_category(pname, str(r.get("الجنس", "")))
-            
+
         category = _resolve_category_to_store(category_raw, _store_categories, gender_inferred)
-        
+
         alt_txt = _safe_alt_text(f"صورة {pname}")
 
         # ── الوصف: لا نستخدم sanitize_salla_text لأنها تحذف وسوم HTML ──
@@ -562,8 +582,9 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             barcode_out = str(r.get("barcode", "") or "").strip()
         gtin_out = barcode_out if barcode_out.isdigit() and len(barcode_out) >= 8 else ""
 
+        # ✅ إصلاح #3: المفتاح "النوع" بدون مسافة زائدة ليطابق SALLA_SHAMEL_COLUMNS
         row_csv = {
-            "النوع ": "منتج",
+            "النوع": "منتج",
             "أسم المنتج": pname,
             "تصنيف المنتج": category,
             "صورة المنتج": img,
@@ -599,9 +620,11 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
 
     buf = io.StringIO(newline="")
     writer = csv.writer(buf)
-    writer.writerow(["﻿بيانات المنتج"] + [""] * (ncols - 1))
+    # ✅ إصلاح #2: بدون "\ufeff" يدوي — encode("utf-8-sig") ستضيف BOM صحيحاً تلقائياً
+    writer.writerow(["بيانات المنتج"] + [""] * (ncols - 1))
     writer.writerow(SALLA_SHAMEL_COLUMNS)
     for line in rows_out:
         writer.writerow(line)
-    
-    return ("\ufeff" + buf.getvalue()).encode("utf-8")
+
+    # ✅ إصلاح #2: encode("utf-8-sig") بدلاً من ("\ufeff" + buf.getvalue()).encode("utf-8")
+    return buf.getvalue().encode("utf-8-sig")
