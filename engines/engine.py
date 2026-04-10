@@ -228,7 +228,6 @@ _SYN = {
     "سيلفر":"silver","سيلفير":"silver",
     "نايت":"night","نايث":"night",
     "داي":"day","دي":"day",
-    "او":"",  # إزالة حروف الربط الزائدة
     # ── v26.0: مرادفات إضافية لزيادة الدقة ──
     # أحجام بديلة
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
@@ -1057,7 +1056,7 @@ def _price(row):
     return 0.0
 
 def _fcol(df, cands):
-    """بحث مرن عن العمود — يدعم الهمزات والبحث الجزئي"""
+    """بحث مرن عن العمود — يعيد None إذا لم يجد تطابقاً."""
     cols = list(df.columns)
     # بحث 1: تطابق تام
     for c in cands:
@@ -1074,7 +1073,7 @@ def _fcol(df, cands):
         for col in cols:
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
-    return cols[0] if cols else ""
+    return None
 
 
 def _fcol_optional(df, cands):
