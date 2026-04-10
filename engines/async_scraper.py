@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
@@ -24,6 +25,11 @@ from urllib.parse import urlparse
 
 import aiohttp
 import pandas as pd
+
+# ─── قفل مزامنة مشترك لحماية ملفات الحالة من Race Conditions ────────────────
+_STATE_WRITE_LOCK    = threading.Lock()
+_PROGRESS_WRITE_LOCK = threading.Lock()
+_LIVE_WRITE_LOCK     = threading.Lock()
 
 # ─── إعداد السجل ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -75,8 +81,9 @@ class Progress:
 
     def save(self, path: str = PROGRESS_FILE) -> None:
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+            with _PROGRESS_WRITE_LOCK:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(asdict(self), f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"تعذّر حفظ التقدم: {e}")
 
@@ -134,8 +141,9 @@ class ScraperState:
     def save(self) -> None:
         try:
             out = {k: asdict(v) for k, v in self._data.items()}
-            with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, indent=2)
+            with _STATE_WRITE_LOCK:
+                with open(self._path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"تعذّر حفظ الحالة: {e}")
 
@@ -200,6 +208,24 @@ class ScraperState:
 
 def _domain(url: str) -> str:
     return urlparse(url).netloc.replace("www.", "")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  كتابة/قراءة ملف التقدم الحي per-store (يُستخدم من الواجهة في الوقت الفعلي)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _live_progress_path(domain: str) -> str:
+    return os.path.join(_DATA_DIR, f"_sc_live_{domain}.json")
+
+
+def _write_live_progress(domain: str, data: dict) -> None:
+    """يكتب ملف تقدم حي خاص بالمتجر — يُقرأ من واجهة Streamlit."""
+    try:
+        with _LIVE_WRITE_LOCK:
+            with open(_live_progress_path(domain), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def extract_product(data: dict, store_url: str) -> dict | None:
@@ -271,6 +297,8 @@ async def fetch_product(
     """
     يجلب صفحة/API منتج ويُعيد dict موحّد أو None.
     الترتيب: Shopify JSON → JSON-LD → og:meta
+    عند الفشل (403/Cloudflare) يستخدم سلسلة الـ fallback:
+      curl_cffi (TLS fingerprint) → cloudscraper → requests
     """
     async with semaphore:
         # ── Shopify-style .json ──
@@ -293,17 +321,30 @@ async def fetch_product(
             from scrapers.anti_ban import get_browser_headers
             hdrs = get_browser_headers(store_url)
         except Exception:
-            hdrs = {"User-Agent": "Mozilla/5.0 Chrome/120"}
+            hdrs = {"User-Agent": "Mozilla/5.0 Chrome/134"}
 
+        html: str | None = None
+
+        # محاولة aiohttp عادية
         try:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=18),
                 headers=hdrs, ssl=False, allow_redirects=True,
             ) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text(errors="replace")
+                if resp.status == 200:
+                    html = await resp.text(errors="replace")
+                elif resp.status in (403, 429, 503):
+                    # الصفحة محمية — جرّب سلسلة الـ fallback المزامنة
+                    logger.debug("HTTP %d — جرب curl_cffi: %s", resp.status, url)
+                    html = await asyncio.get_event_loop().run_in_executor(
+                        None, _sync_fetch_fallback, url
+                    )
         except Exception:
+            html = await asyncio.get_event_loop().run_in_executor(
+                None, _sync_fetch_fallback, url
+            )
+
+        if not html:
             return None
 
         import re
@@ -354,6 +395,21 @@ async def fetch_product(
             )
 
         return None
+
+
+def _sync_fetch_fallback(url: str) -> str | None:
+    """
+    سلسلة الـ fallback المزامنة لتخطي الحماية:
+    1. curl_cffi  → TLS Impersonation (أقوى ضد Cloudflare)
+    2. cloudscraper → JS Challenge bypass
+    3. requests   → طلب عادي بـ headers محاكية
+    """
+    try:
+        from scrapers.anti_ban import try_all_sync_fallbacks
+        return try_all_sync_fallbacks(url)
+    except Exception:
+        pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -474,6 +530,14 @@ async def scrape_one_store(
                         (safe - progress.fetch_exceptions) / safe * 100 if safe else 0
                     )
                     progress.save()
+                    # كتابة ملف التقدم الحي للواجهة
+                    _write_live_progress(domain, {
+                        "urls_done":  done_count,
+                        "urls_total": total,
+                        "rows_saved": len(rows),
+                        "pct":        min(100, int(done_count / max(total,1) * 100)),
+                        "updated_at": datetime.now().isoformat()[:19],
+                    })
 
                 # ── حفظ نقطة استئناف ──
                 if done_count % checkpoint_every == 0:
