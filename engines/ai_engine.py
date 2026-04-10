@@ -1268,6 +1268,81 @@ def get_catalog_status() -> dict:
 
 # ══ الدوال المفقودة للوحدة الخامسة ═══════════════════════════════════════════
 
+# ══ مصنع المنتجات — نظام JSON + وصف HTML صارم لسلة / SEO ═══════════════════
+MAGIC_FACTORY_SALLA_SYSTEM = """أنت خبير محتوى تجارة إلكترونية وعطور لمتجر «مهووس» (mahwous.com) في السعودية.
+مهمتك: تحويل بيانات منتج مكشوطة (نص خام) إلى مخرجات **JSON صالحة فقط** — بدون ```json``` وبدون أي شرح قبل أو بعد كائن JSON.
+
+## إخراج JSON — المفاتيح الإلزامية (لا تحذف مفتاحاً)
+يجب أن يحتوي JSON على هذه المفاتيح بالضبط:
+cleaned_title, description_html, brand, category, seo_title, seo_description,
+top_notes, heart_notes, base_notes, gender_hint, is_perfume
+
+## 1) cleaned_title
+- اسم منتج نظيف للعنوان: عربي و/أو إنجليزي، بدون عبارات مزعجة: تخفيض، خصم، الأكثر مبيعاً، أصلي، عرض، شحن مجاني، لفترة محدودة.
+
+## 2) category — إلزامي وليس فارغاً أبداً لمنتجات العطور
+استنتج التصنيف من المدخلات (الجنس، الاسم، المنافس). استخدم **حرفياً** أحد الأشكال التالية فقط (مع الفاصل > والمسافات كما هي):
+- "العطور > عطور رجالية"
+- "العطور > عطور نسائية"
+- "العطور > عطور للجنسين"
+
+إذا كانت المدخلات لا تشير لعطر رغم أنها منتج تجميل/عناية، استخدم تصنيفاً منطقياً تحت «العناية» أو «التجميل» بصيغة مشابهة (قسم رئيسي > قسم فرعي). إن كان المنتج عطراً **لا تترك category فارغاً**.
+
+## 3) brand
+- اسم الماركة كما يُعرض للعميل (يمكن عربي | إنجليزي إن كان ذلك منطقياً من المدخلات).
+- لا تخترع ماركة إن لم تظهر في المدخلات؛ استخدم أقرب استنتاج معقول من اسم المنتج فقط إن وُجدت إشارة واضحة.
+
+## 4) gender_hint
+واحد من: "للرجال" | "للنساء" | "للجنسين" | "" (فارغ فقط إن تعذر الاستنتاج تماماً).
+
+## 5) is_perfume
+true إن كان المنتج عطراً (EDP/EDT/Parfum/Cologne… أو سياق واضح)، وإلا false.
+
+## 6) top_notes, heart_notes, base_notes
+نص عربي موجز (أو مفصول بفواصل) مستخرج من المدخلات؛ إن لم تُذكر مكونات، اكتب "غير مذكور في المصدر" أو استنتجاً حذراً من العائلة العطرية المعروفة للاسم **دون اختلاق تفاصيل كيميائية دقيقة**.
+
+## 7) seo_title و seo_description
+- seo_title: ≤ 60 حرفاً (عربي)، يضم ماركة + اسم عطر/منتج + كلمات بحثية طبيعية.
+- seo_description: ≤ 155 حرفاً، يشجع النقر ويذكر الأصالة والفئة.
+
+## 8) description_html — **الجزء الأهم**: HTML فقط، طويل، تسويقي، متوافق SEO
+قواعد صارمة:
+- **ممنوع** Markdown. **ممنوع** استخدام # للعناوين.
+- وسوم مسموحة فقط: h2, h3, p, ul, ol, li, strong, em, br, a.
+- التزم **حرفياً** بالترتيب والعناوين النصية التالية (يمكنك إثراء النص داخل الفقرات والقوائم، لكن لا تحذف قسماً ولا تغيّر مستوى العناوين):
+
+(أ) ابدأ بسطر واحد: <h2>اسم العطر أو المنتج بالصيغة الجذابة</h2> (استخدم الاسم من cleaned_title أو المدخلات).
+
+(ب) فقرة افتتاحية واحدة على الأقل: <p>…</p> تسويقية، وتذكر **اسم الماركة** و**اسم العطر/المنتج** داخل <strong>…</strong>.
+
+(ج) <h3>تفاصيل المنتج</h3> ثم <ul><li>…</li></ul> ويجب أن تتضمن القائمة بنوداً واضحة للـ: الماركة، اسم المنتج، الجنس، العائلة العطرية (أو نوع المنتج)، الحجم، التركيز (EDP/EDT/إلخ). استخدم «غير محدد في المصدر» للبند الناقص.
+
+(د) <h3>رحلة العطر — الهرم العطري</h3> ثم فقرة أو قائمة توضح **القمة** و**القلب** و**القاعدة** (للمنتجات غير العطور: حوّل القسم إلى «مكونات الرائحة / الطابع العطري» بذات البنية إن كان معطوراً، أو «مميزات المنتج» بثلاث فقرات فرعية داخل h3 واحد ثم ul).
+
+(هـ) <h3>لماذا تختار هذا العطر؟</h3> ثم <ul> بنقاط تسويقية (ثبات، فوحان، تميز، مناسبة للمناسبات…) — لا تبالغ بأرقام وهمية؛ إن ذكرت أرقاماً فاجعلها نطاقات معقولة (مثلاً 6–10 ساعات) مع صيغة احترافية.
+
+(و) <h3>متى وأين ترتديه؟</h3> ثم <p>…</p> (فصول، أوقات، مناسبات).
+
+(ز) <h3>لمسة خبير من متجر مهووس</h3> ثم <p>…</p> يتضمن: تقييم **الفوحان من 10** و**الثبات من 10** (رقمان صريحان مثل 7/10)، و**نصيحة استخدام** (نقاط النبض، عدد البخات).
+
+(ح) <h3>الأسئلة الشائعة</h3> ثم <ul> تحتوي **3 عناصر li** على الأقل؛ كل li يجب أن يكون سؤالاً ثم إجابة مختصرة داخل نفس العنصر (مثال: <li><strong>السؤال؟</strong> الإجابة…</li>).
+
+(ط) <h3>اكتشف أكثر من مهووس</h3> ثم فقرة فيها **روابط حقيقية** بوسم <a>:
+- رابط التصنيف حسب جنس المنتج (استخدم أحد هذه الروابط حسب الاستنتاج):
+  • عطور رجالية: href="https://mahwous.com/categories/mens-perfumes"
+  • عطور نسائية: href="https://mahwous.com/categories/womens-perfumes"
+  • عطور للجنسين: href="https://mahwous.com/categories/unisex-perfumes"
+- رابط الماركة: href="https://mahwous.com/brands/BRAND_SLUG" حيث BRAND_SLUG هو **الاسم اللاتيني للماركة** بصيغة slug: أحرف صغيرة إنجليزية، مسافات → شرطة -، إزالة الرموز الخاصة (مثال: Dior → dior، Yves Saint Laurent → yves-saint-laurent). نص الرابط <a> يكون اسم الماركة المعروض للعميل.
+
+## الطول والجودة
+- الوصف الإجمالي في description_html يجب أن يكون **طويلاً وغنى** (استهدف ما يعادل 400–900 كلمة من النص الظاهر للمستخدم داخل HTML)، بدون حشو كلمات مفتاحية مكررة بشكل آلي.
+
+## JSON technique
+- حقل description_html يجب أن يكون **سلسلة JSON واحدة**؛ استبدل الأسطر الجديدة داخل HTML بـ \\n أو اكتب HTML في سطر متصل مع وسوم صحيحة.
+- لا تضع علامات اقتباس غير مهرّبة داخل description_html تكسر JSON؛ استخدم \\" للاقتباس الداخلي إن لزم.
+"""
+
+
 def enhance_competitor_product_for_salla(
     scraped_summary: str,
     url: str = "",
@@ -1275,7 +1350,7 @@ def enhance_competitor_product_for_salla(
 ) -> dict:
     """
     يحسّن بيانات منتج مكشوط من متجر منافس لتصدير سلة (شامل):
-    تنظيف العنوان، وصف HTML تسويقي، ماركة، تصنيف، SEO، وهرم عطري عند الانطباق.
+    تنظيف العنوان، وصف HTML تسويقي بقالب صارم، ماركة، تصنيف سلة، SEO، وهرم عطري.
 
     يُعيد dict بمفاتيح:
     cleaned_title, description_html, brand, category, seo_title, seo_description,
@@ -1298,45 +1373,41 @@ def enhance_competitor_product_for_salla(
     if not blob and not (meta_fallback or "").strip():
         return defaults
 
-    sys_magic = (
-        "أنت خبير تحويل بيانات منتجات التجارة الإلكترونية إلى تنسيق متجر سلة (السعودية). "
-        "أجب بـ JSON صالح فقط بدون ``` وبدون أي نص قبل أو بعد الأقواس.\n\n"
-        "القواعد:\n"
-        "- cleaned_title: اسم منتج نظيف (عربي أو مختلط) بدون عبارات تسويق مزعجة مثل: "
-        "تخفيض، خصم، الأكثر مبيعاً، أصلي 100٪، عرض محدود، حصرية، شحن مجاني.\n"
-        "- description_html: وصف تسويقي احترافي طويل بصيغة HTML فقط "
-        "(وسوم مسموحة: p, h2, h3, ul, ol, li, strong, em, br). لا تستخدم Markdown.\n"
-        "  إذا كان المنتج عطراً أو يُذكر في المدخلات كعطر، أدرج قسماً واضحاً للهرم العطري: "
-        "القمة (Top)، القلب (Heart)، القاعدة (Base) مع نقاط أو فقرات.\n"
-        "  إذا لم يكن عطراً، ركّز على المميزات والاستخدام وفق البيانات المتاحة فقط.\n"
-        "- brand: الماركة كما يجب أن تظهر للتاجر (لا تخترع ماركة إن لم تظهر في المدخلات).\n"
-        "- category: تصنيف مقترح بصيغة مثل «العطور > عطور رجالية» أو «العناية > العناية بالبشرة».\n"
-        "- seo_title: عنوان SEO ≤ 60 حرفاً.\n"
-        "- seo_description: وصف SEO ≤ 155 حرفاً.\n"
-        "- top_notes, heart_notes, base_notes: نص عربي أو سلسلة مفصولة بفواصل؛ فارغ \"\" إن لم ينطبق.\n"
-        "- gender_hint: واحد من: للرجال | للنساء | للجنسين | فارغ.\n"
-        "- is_perfume: true إن كان المنتج عطراً، وإلا false.\n"
-        "لا تختلق مواصفات تقنية (باركود، SKU) غير واردة في المدخلات."
-    )
-
     prompt = (
-        f"رابط الصفحة: {url}\n\n"
-        f"بيانات مستخرجة من الصفحة:\n{blob[:7000]}\n\n"
+        f"رابط الصفحة الأصلية للمنافس (للسياق فقط): {url}\n\n"
+        f"=== بيانات مستخرجة من الكشط ===\n{blob[:7000]}\n"
     )
     if (meta_fallback or "").strip():
-        prompt += f"معلومات إضافية من وسوم meta / JSON-LD:\n{meta_fallback[:2500]}\n"
+        prompt += f"\n=== وسوم meta / JSON-LD إضافية ===\n{meta_fallback[:2500]}\n"
 
-    prompt += (
-        "\nأجب بـ JSON بالمفاتيح التالية فقط:\n"
-        '{"cleaned_title":"","description_html":"","brand":"","category":"","seo_title":"",'
-        '"seo_description":"","top_notes":"","heart_notes":"","base_notes":"",'
-        '"gender_hint":"","is_perfume":false}'
-    )
+    prompt += """
+=== المطلوب ===
+أعد كتابة المنتج لمتجر مهووس وسلة: JSON واحد فقط يلتزم بجميع قواعد النظام (MAGIC_FACTORY).
+تأكد من:
+1) ملء "category" بأحد مسارات العطور الثلاثة عند كون المنتج عطراً.
+2) أن "description_html" يلتزم **حرفياً** بترتيب العناوين h2 ثم h3 المحددة وبمحتوى تسويقي طويل.
+3) تضمين روابط mahwous.com للتصنيف وللماركة (slug لاتيني) في القسم الأخير.
+
+أجب بكائن JSON فقط بهذا الشكل (المفاتيح كما هي):
+{
+  "cleaned_title": "",
+  "description_html": "",
+  "brand": "",
+  "category": "",
+  "seo_title": "",
+  "seo_description": "",
+  "top_notes": "",
+  "heart_notes": "",
+  "base_notes": "",
+  "gender_hint": "",
+  "is_perfume": true
+}
+"""
 
     raw = (
-        _call_gemini(prompt, sys_magic, temperature=0.25, max_tokens=8192)
-        or _call_openrouter(prompt, sys_magic)
-        or _call_cohere(prompt, sys_magic)
+        _call_gemini(prompt, MAGIC_FACTORY_SALLA_SYSTEM, temperature=0.3, max_tokens=8192)
+        or _call_openrouter(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
+        or _call_cohere(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
     )
     if not raw:
         return defaults
@@ -1353,6 +1424,33 @@ def enhance_competitor_product_for_salla(
                 out[k] = bool(v)
             else:
                 out[k] = str(v).strip() if v is not None else ""
+
+    # مطابقة صارمة مع «ماركات مهووس» / «brands.csv» و«تصنيفات مهووس» (منطق التصدير)
+    from utils.salla_shamel_export import (
+        resolve_brand_for_shamel,
+        resolve_category_for_shamel,
+    )
+
+    _rb = resolve_brand_for_shamel(out["brand"])
+    if _rb:
+        out["brand"] = _rb
+
+    _rc = resolve_category_for_shamel(
+        out["category"],
+        gender_hint=out["gender_hint"],
+        product_name_fallback=out["cleaned_title"],
+    )
+    if _rc:
+        out["category"] = _rc
+    elif out["is_perfume"] and not out["category"].strip():
+        _inferred = auto_infer_category(out["cleaned_title"], out["gender_hint"])
+        _rc2 = resolve_category_for_shamel(
+            _inferred,
+            gender_hint=out["gender_hint"],
+            product_name_fallback=out["cleaned_title"],
+        )
+        out["category"] = _rc2 or _inferred
+
     return out
 
 
