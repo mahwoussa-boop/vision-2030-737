@@ -1270,65 +1270,95 @@ def get_catalog_status() -> dict:
 
 def extract_product(text: str) -> dict:
     """
-    يستخرج بيانات المنتج (الاسم، الماركة، الحجم، التركيز، الجنس، السعر) من نص خام.
+    يستخرج بيانات العطر (اسم، ماركة، حجم، تركيز، جنس، سعر) من نص خام.
+    يستخدم _parse_json مباشرةً — لا يعتمد على json_mode.
+    مضمون العودة بـ dict حتى عند الفشل.
     """
-    if not text: return {}
-    
-    prompt = f"""
-    استخرج بيانات عطر "مهووس" من النص التالي بدقة:
-    "{text}"
-    
-    أجب بصيغة JSON فقط:
-    {{
-      "name": "اسم المنتج بالإنجليزية (أو كما ورد)",
-      "brand": "اسم الماركة بالإنجليزية",
-      "size": "الحجم (مثلاً 100ml)",
-      "concentration": "التركيز (مثلاً EDP, EDT, Parfum)",
-      "gender": "الجنس (Men, Women, Unisex)",
-      "price": "السعر كرقم فقط (إن وجد، وإلا 0)"
-    }}
-    """
-    # نستخدم call_ai مع json_mode=True الذي قمنا بتفعيله
-    res = call_ai(prompt, page="general", json_mode=True)
-    
-    # تأمين القيم الافتراضية
-    defaults = {"name": "", "brand": "", "size": "", "concentration": "", "gender": "Unisex", "price": 0}
-    if isinstance(res, dict):
-        defaults.update(res)
+    defaults = {
+        "name": str(text).strip()[:120] if text else "",
+        "brand": "", "size": "", "concentration": "",
+        "gender": "", "price": 0,
+    }
+    if not text or not str(text).strip():
+        return defaults
+
+    prompt = (
+        'استخرج بيانات العطر من النص التالي بدقة وأجب بـ JSON صالح فقط بدون أي نص آخر:\n'
+        f'النص: "{str(text).strip()[:500]}"\n\n'
+        'الصيغة المطلوبة:\n'
+        '{"name":"اسم المنتج","brand":"الماركة بالإنجليزية",'
+        '"size":"الحجم مثل 100ml","concentration":"EDP أو EDT أو Parfum",'
+        '"gender":"Men أو Women أو Unisex","price":0}'
+    )
+
+    sys_prompt = PAGE_PROMPTS.get("general", "")
+    raw = (
+        _call_gemini(prompt, sys_prompt, temperature=0.1)
+        or _call_openrouter(prompt, sys_prompt)
+        or _call_cohere(prompt, sys_prompt)
+    )
+
+    if raw:
+        parsed = _parse_json(raw)
+        if isinstance(parsed, dict) and parsed.get("name"):
+            defaults.update(parsed)
+            try:
+                defaults["price"] = float(str(defaults.get("price", 0)).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                defaults["price"] = 0.0
+            return defaults
+
     return defaults
 
 
 def fetch_og_image_url(url: str) -> str:
     """
-    يجلب رابط الصورة الرئيسية (Open Graph Image) من أي رابط متجر.
-    يستخدم requests و re لتجنب تعقيدات الكشط.
+    يجلب رابط صورة Open Graph (og:image) من أي صفحة ويب.
+    يستخدم requests + re فقط — بدون مكتبات كشط معقدة.
+    يدعم الترتيبين (property أولاً أو content أولاً) والروابط النسبية.
     """
-    if not url or not url.startswith("http"): return ""
-    
+    if not url or not str(url).strip().startswith("http"):
+        return ""
+
+    _headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ar,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200: return ""
-        
-        # البحث عن <meta property="og:image" content="...">
-        match = re.search(r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', r.text)
-        if not match:
-            # محاولة البحث بترتيب مختلف للخصائص
-            match = re.search(r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']', r.text)
-            
-        if match:
-            img_url = match.group(1)
-            # تصحيح الروابط النسبية
-            if img_url.startswith("//"):
-                img_url = "https:" + img_url
-            elif img_url.startswith("/"):
-                from urllib.parse import urljoin
-                img_url = urljoin(url, img_url)
-            return img_url
-            
-    except Exception as e:
-        _log_err("fetch_og_image_url", f"خطأ في جلب صورة OG: {str(e)}")
-        
+        r = requests.get(url.strip(), headers=_headers, timeout=12,
+                         allow_redirects=True, verify=False)
+        if r.status_code != 200:
+            return ""
+        html = r.text
+
+        # الأنماط الشائعة (ترتيب الخصائص يختلف بين المنصات)
+        _patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        ]
+        for pat in _patterns:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                img = m.group(1).strip()
+                if img.startswith("//"):
+                    return "https:" + img
+                if img.startswith("/"):
+                    from urllib.parse import urljoin
+                    return urljoin(url, img)
+                if img.startswith("http"):
+                    return img
+
+    except Exception as _e:
+        try:
+            _log_err("fetch_og_image_url",
+                     f"فشل جلب OG image من {url[:60]}: {str(_e)[:80]}")
+        except Exception:
+            pass
+
     return ""
