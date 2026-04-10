@@ -1919,6 +1919,10 @@ if page == "📊 لوحة التحكم":
             job_id = None
             comp_names = ""
             with st.spinner("⏳ جاري قراءة الملفات وتحديث الكتالوج..."):
+                try:
+                    our_file.seek(0)
+                except Exception:
+                    pass
                 our_df, err = read_file(our_file)
                 if err:
                     st.error(f"❌ {err}")
@@ -1939,6 +1943,10 @@ if page == "📊 لوحة التحكم":
                     else:
                         # ── وضع الرفع اليدوي ─────────────────────────────
                         for _ci, cf in enumerate(comp_files):
+                            try:
+                                cf.seek(0)
+                            except Exception:
+                                pass
                             cdf, cerr = read_file(cf)
                             if cerr:
                                 st.warning(f"⚠️ {cf.name}: {cerr}")
