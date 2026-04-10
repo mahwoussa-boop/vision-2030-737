@@ -10,13 +10,64 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
-import requests, json, re, time, traceback
+import requests, json, re, time, traceback, random
+from urllib.parse import urljoin
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
 _CO  = "https://api.cohere.ai/v1/generate"
+
+
+def _build_resilient_session(total_retries: int = 0, pool_connections: int = 4, pool_maxsize: int = 10) -> requests.Session:
+    """
+    Session مشتركة مع Connection Pooling وRetry محدود وآمن.
+    نُبقي retries التلقائية معطلة افتراضياً لأن منطق إعادة المحاولة
+    يُدار يدوياً داخل الدوال حتى لا تتكرر طلبات POST دون قصد.
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        redirect=0,
+        backoff_factor=0,
+        status_forcelist=[],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_GEMINI_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=6)
+_OPENROUTER_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=4)
+_COHERE_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=4)
+_OG_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=8)
+
+_OG_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+]
+
+_OG_PATTERNS = [
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+]
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
 _LAST_ERRORS: list = []
@@ -277,36 +328,42 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
         if not key:
             continue
         try:
-            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
+            r = _GEMINI_SESSION.post(f"{_GU}?key={key}", json=payload, timeout=(5, 45))
             if r.status_code == 200:
                 data = r.json()
                 if data.get("candidates"):
                     parts = data["candidates"][0]["content"]["parts"]
                     return "".join(p.get("text","") for p in parts)
-                else:
-                    # blocked / safety filter
-                    reason = data.get("promptFeedback",{}).get("blockReason","")
-                    _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
+                reason = data.get("promptFeedback", {}).get("blockReason", "")
+                _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
             elif r.status_code == 429:
-                # ✅ إصلاح: Rate limit → تخطّ المفتاح مباشرة (لا sleep في main thread)
                 _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — تخطي للمفتاح التالي")
                 continue
             elif r.status_code == 403:
                 _log_err("Gemini", f"مفتاح {i+1}: IP محظور أو مفتاح غير مصرح (403)")
+                continue
+            elif r.status_code in (400, 401):
+                _log_err("Gemini", f"مفتاح {i+1}: خطأ دائم {r.status_code} — إيقاف المحاولة لهذا المفتاح")
+                break
             elif r.status_code == 404:
                 _log_err("Gemini", f"مفتاح {i+1}: نموذج غير متاح {_GM} (404)")
+                continue
             else:
                 try:
                     msg = r.json().get("error",{}).get("message","")
                 except Exception:
                     msg = r.text[:100]
                 _log_err("Gemini", f"مفتاح {i+1}: {r.status_code} — {msg[:80]}")
+                continue
+        except requests.exceptions.Timeout:
+            _log_err("Gemini", f"مفتاح {i+1}: Timeout")
+            continue
         except requests.exceptions.ConnectionError as e:
             _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
-        except requests.exceptions.Timeout:
-            _log_err("Gemini", f"مفتاح {i+1}: Timeout (45s)")
+            continue
         except Exception as e:
             _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
+            continue
     return None
 
 def _call_openrouter(prompt, system=""):
@@ -330,7 +387,7 @@ def _call_openrouter(prompt, system=""):
 
     for model in FREE_MODELS:
         try:
-            r = requests.post(_OR, json={
+            r = _OPENROUTER_SESSION.post(_OR, json={
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.3,
@@ -339,14 +396,13 @@ def _call_openrouter(prompt, system=""):
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://mahwous.com",
                 "X-Title": "Mahwous"
-            }, timeout=45)
+            }, timeout=(5, 45))
 
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"]
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
-                # ✅ إصلاح: Rate limit → تخطّ النموذج مباشرة (لا sleep في main thread)
                 _log_err("OpenRouter", f"{model}: Rate Limit (429) — تخطي للنموذج التالي")
                 continue
             elif r.status_code == 402:
@@ -354,7 +410,7 @@ def _call_openrouter(prompt, system=""):
                 continue
             elif r.status_code == 401:
                 _log_err("OpenRouter", "مفتاح غير صحيح (401)")
-                return None  # لا فائدة من تجربة نماذج أخرى
+                return None
             else:
                 try:
                     msg = r.json().get("error", {}).get("message", "")
@@ -365,9 +421,9 @@ def _call_openrouter(prompt, system=""):
 
         except requests.exceptions.ConnectionError as e:
             _log_err("OpenRouter", f"لا اتصال — {str(e)[:80]}")
-            return None  # إذا لا اتصال، لا فائدة من تجربة نماذج أخرى
+            return None
         except requests.exceptions.Timeout:
-            _log_err("OpenRouter", f"{model}: Timeout (45s)")
+            _log_err("OpenRouter", f"{model}: Timeout")
             continue
         except Exception as e:
             _log_err("OpenRouter", f"{model}: {str(e)[:80]}")
@@ -388,29 +444,30 @@ def _call_cohere(prompt, system=""):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        r = requests.post(
+        r = _COHERE_SESSION.post(
             "https://api.cohere.com/v2/chat",
             json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
             headers={"Authorization": f"Bearer {COHERE_API_KEY}",
                      "Content-Type": "application/json"},
-            timeout=30
+            timeout=(5, 30)
         )
         if r.status_code == 200:
             data = r.json()
             return data.get("message", {}).get("content", [{}])[0].get("text", "")
         elif r.status_code == 401:
             _log_err("Cohere", "مفتاح غير صحيح (401) — تجاوز Cohere")
-            return None  # ← لا يوقف العمل، يمرر للـ fallback التالي
+            return None
         elif r.status_code in (402, 403):
             _log_err("Cohere", f"غير مصرح ({r.status_code}) — تجاوز")
             return None
         elif r.status_code == 429:
-            # ✅ إصلاح: Rate limit → تخطّ مباشرة (لا sleep في main thread)
             _log_err("Cohere", "Rate Limit (429) — تخطي Cohere")
             return None
         else:
-            try:   msg = r.json().get("message", "")
-            except Exception: msg = r.text[:100]
+            try:
+                msg = r.json().get("message", "")
+            except Exception:
+                msg = r.text[:100]
             _log_err("Cohere", f"{r.status_code} — {msg[:80]}")
     except Exception as e:
         _log_err("Cohere", f"Fallback صامت — {str(e)[:60]}")
@@ -1509,51 +1566,71 @@ def extract_product(text: str) -> dict:
 def fetch_og_image_url(url: str) -> str:
     """
     يجلب رابط صورة Open Graph (og:image) من أي صفحة ويب.
-    يستخدم requests + re فقط — بدون مكتبات كشط معقدة.
-    يدعم الترتيبين (property أولاً أو content أولاً) والروابط النسبية.
+    يستخدم Session مشتركة مع تناوب User-Agent وتقليل الطلبات المكلفة.
+    يدعم og:image و twitter:image والروابط النسبية.
     """
     if not url or not str(url).strip().startswith("http"):
         return ""
 
+    target_url = url.strip()
     _headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": random.choice(_OG_USER_AGENTS),
         "Accept-Language": "ar,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
     }
 
-    try:
-        r = requests.get(url.strip(), headers=_headers, timeout=12,
-                         allow_redirects=True, verify=False)
-        if r.status_code != 200:
-            return ""
-        html = r.text
-
-        # الأنماط الشائعة (ترتيب الخصائص يختلف بين المنصات)
-        _patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-        ]
-        for pat in _patterns:
-            m = re.search(pat, html, re.IGNORECASE)
-            if m:
-                img = m.group(1).strip()
-                if img.startswith("//"):
-                    return "https:" + img
-                if img.startswith("/"):
-                    from urllib.parse import urljoin
-                    return urljoin(url, img)
-                if img.startswith("http"):
-                    return img
-
-    except Exception as _e:
+    for attempt in range(2):
+        verify_ssl = (attempt == 0)
         try:
-            _log_err("fetch_og_image_url",
-                     f"فشل جلب OG image من {url[:60]}: {str(_e)[:80]}")
-        except Exception:
-            pass
+            r = _OG_SESSION.get(
+                target_url,
+                headers=_headers,
+                timeout=12,
+                allow_redirects=True,
+                verify=verify_ssl,
+            )
+            if r.status_code == 403:
+                _log_err("fetch_og_image_url", f"محظور (403) من {target_url[:60]}")
+                return ""
+            if r.status_code == 429:
+                _log_err("fetch_og_image_url", f"Rate Limit (429) من {target_url[:60]}")
+                return ""
+            if r.status_code != 200:
+                _log_err("fetch_og_image_url", f"HTTP {r.status_code} من {target_url[:60]}")
+                return ""
+
+            html = r.text
+            for pat in _OG_PATTERNS:
+                m = re.search(pat, html, re.IGNORECASE)
+                if m:
+                    img = m.group(1).strip()
+                    if img.startswith("//"):
+                        return "https:" + img
+                    if img.startswith("/"):
+                        return urljoin(target_url, img)
+                    if img.startswith("http"):
+                        return img
+            return ""
+        except requests.exceptions.SSLError:
+            if attempt == 0:
+                continue
+            _log_err("fetch_og_image_url", f"SSL Error نهائي من {target_url[:60]}")
+            return ""
+        except requests.exceptions.Timeout:
+            _log_err("fetch_og_image_url", f"Timeout (12s) من {target_url[:60]}")
+            return ""
+        except requests.exceptions.ConnectionError as e:
+            _log_err("fetch_og_image_url", f"Connection Error من {target_url[:60]}: {str(e)[:60]}")
+            return ""
+        except Exception as _e:
+            _log_err("fetch_og_image_url", f"فشل جلب OG image من {target_url[:60]}: {str(_e)[:80]}")
+            return ""
 
     return ""
