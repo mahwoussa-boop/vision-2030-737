@@ -1879,7 +1879,7 @@ if page == "📊 لوحة التحكم":
             with st.expander("📋 تعرف تلقائي على أعمدة ملف المتجر", expanded=False):
                 _render_column_mapping_expander(_odf, "dash_map_our")
     if comp_files:
-        for _ci, cf in enumerate(comp_files):
+        for cf in comp_files:
             try:
                 cf.seek(0)
             except Exception:
@@ -1890,8 +1890,9 @@ if page == "📊 لوحة التحكم":
             except Exception:
                 pass
             if not _ce and _cdf is not None:
+                safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', cf.name)[:40]
                 with st.expander(f"📋 تعرف تلقائي — {cf.name}", expanded=False):
-                    _render_column_mapping_expander(_cdf, f"dash_map_comp_{_ci}")
+                    _render_column_mapping_expander(_cdf, f"dash_map_comp_{safe_key}")
 
     col_opt1, col_opt2 = st.columns(2)
     with col_opt1:
@@ -1919,7 +1920,7 @@ if page == "📊 لوحة التحكم":
             job_id = None
             comp_names = ""
             with st.spinner("⏳ جاري قراءة الملفات وتحديث الكتالوج..."):
-                our_df, err = read_file(our_file)
+                try:\n                    our_file.seek(0)\n                except Exception:\n                    pass\n                our_df, err = read_file(our_file)
                 if err:
                     st.error(f"❌ {err}")
                 else:
@@ -1938,13 +1939,18 @@ if page == "📊 لوحة التحكم":
                             st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
                     else:
                         # ── وضع الرفع اليدوي ─────────────────────────────
-                        for _ci, cf in enumerate(comp_files):
+                        for cf in comp_files:
+                            try:
+                                cf.seek(0)
+                            except Exception:
+                                pass
                             cdf, cerr = read_file(cf)
                             if cerr:
                                 st.warning(f"⚠️ {cf.name}: {cerr}")
                             else:
+                                safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', cf.name)[:40]
                                 cdf = apply_user_column_map(
-                                    cdf, **_effective_column_map(cdf, f"dash_map_comp_{_ci}")
+                                    cdf, **_effective_column_map(cdf, f"dash_map_comp_{safe_key}")
                                 )
                                 comp_dfs[cf.name] = cdf
 
