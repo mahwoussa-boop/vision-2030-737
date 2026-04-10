@@ -1579,16 +1579,15 @@ with st.sidebar:
                     st_autorefresh(interval=4000, key="progress_refresh")
                 except ImportError:
                     # fallback: rerun عادي إذا لم تكن المكتبة موجودة
-                   except ImportError:
-                # ✅ إصلاح: بدون time.sleep() في Main Thread — يجمّد الـ UI ويخالف القاعدة #2
-                # المستخدم يرى الشريط ويضغط تحديث يدوي، أو يثبّت streamlit-autorefresh
-                st.info(
-                    "💡 للتحديث التلقائي: `pip install streamlit-autorefresh`  \n"
-                    "أو اضغط الزر أدناه لتحديث الحالة يدوياً.",
-                    icon="ℹ️",
-                )
-                if st.button("🔄 تحديث الحالة", key="manual_progress_refresh"):
-                    st.rerun()
+                    # ✅ إصلاح: بدون time.sleep() في Main Thread — يجمّد الـ UI ويخالف القاعدة #2
+                    # المستخدم يرى الشريط ويضغط تحديث يدوي، أو يثبّت streamlit-autorefresh
+                    st.info(
+                        "💡 للتحديث التلقائي: `pip install streamlit-autorefresh`  \n"
+                        "أو اضغط الزر أدناه لتحديث الحالة يدوياً.",
+                        icon="ℹ️",
+                    )
+                    if st.button("🔄 تحديث الحالة", key="manual_progress_refresh"):
+                        st.rerun()
                 # اكتمل — حمّل النتائج تلقائياً مع استعادة القوائم
                 if job.get("results"):
                     _restored = restore_results_from_json(job["results"])
@@ -3152,6 +3151,11 @@ elif page == "🕷️ كشط المنافسين":
         _COMPETITORS_FILE = _os_scraper.path.join(_DATA_SC, "competitors_list.json")
 
         import json as _json_sc
+        import tempfile
+        try:
+            import fcntl as _fcntl_sc
+        except ImportError:
+            _fcntl_sc = None
 
         def _load_stores() -> list:
             try:
@@ -3160,16 +3164,61 @@ elif page == "🕷️ كشط المنافسين":
                 return []
 
         def _save_stores(lst: list) -> None:
+            """
+            حفظ آمن لقائمة المنافسين عبر ملف مؤقت ثم استبدال ذري.
+            هذا يمنع إتلاف الملف الأصلي إذا انقطع التنفيذ أثناء الكتابة.
+            """
             _os_scraper.makedirs(_DATA_SC, exist_ok=True)
-            open(_COMPETITORS_FILE, "w", encoding="utf-8").write(
-                _json_sc.dumps(lst, ensure_ascii=False, indent=2)
-            )
+            content = _json_sc.dumps(lst, ensure_ascii=False, indent=2)
+            dir_path = _os_scraper.path.dirname(_os_scraper.path.abspath(_COMPETITORS_FILE))
+
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp", prefix="stores_")
+                try:
+                    with _os_scraper.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                        fh.flush()
+                        _os_scraper.fsync(fh.fileno())
+                    _os_scraper.replace(tmp_path, _COMPETITORS_FILE)
+                except Exception:
+                    try:
+                        _os_scraper.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as e:
+                try:
+                    with open(_COMPETITORS_FILE, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                except Exception as e2:
+                    raise RuntimeError(f"فشل حفظ قائمة المتاجر: {e} | fallback: {e2}") from e2
 
         def _load_progress() -> dict:
+            """
+            قراءة آمنة لملف التقدم لتقليل احتمال Partial Read أثناء كتابة الكاشط.
+            تستخدم shared lock عند توفره، وتعود بقيمة افتراضية آمنة عند تلف مؤقت للـ JSON.
+            """
+            _EMPTY = {"running": False}
+            if not _os_scraper.path.exists(_PROGRESS_FILE):
+                return _EMPTY
             try:
-                return _json_sc.loads(open(_PROGRESS_FILE, encoding="utf-8").read())
+                with open(_PROGRESS_FILE, "r", encoding="utf-8") as fh:
+                    if _fcntl_sc is not None:
+                        try:
+                            _fcntl_sc.flock(fh, _fcntl_sc.LOCK_SH | _fcntl_sc.LOCK_NB)
+                        except OSError:
+                            pass
+                    raw = fh.read()
+                    if not raw or not raw.strip():
+                        return _EMPTY
+                    data = _json_sc.loads(raw)
+                    return data if isinstance(data, dict) else _EMPTY
+            except _json_sc.JSONDecodeError:
+                return _EMPTY
+            except OSError:
+                return _EMPTY
             except Exception:
-                return {"running": False}
+                return _EMPTY
 
         # ══ Callbacks ══════════════════════════════════════════════════════════
         def _cb_add_store():
@@ -3196,12 +3245,42 @@ elif page == "🕷️ كشط المنافسين":
                 st.session_state["_sc_msg"] = ("success", f"تم حذف: {removed}")
 
         def _start_scraper_bg():
+            """
+            تشغيل الكاشط في الخلفية بأمان:
+            - يمنع التشغيل المكرر إذا كانت عملية سابقة ما زالت تعمل
+            - يسجل stderr في ملف منفصل للتشخيص
+            - يحفظ PID للعملية الحالية للتحقق لاحقاً
+            """
             if not _os_scraper.path.exists(_SCRAPER_SCRIPT):
                 st.session_state["_sc_err"] = f"ملف الكاشط غير موجود: {_SCRAPER_SCRIPT}"
                 return
+
             _os_scraper.makedirs(_DATA_SC, exist_ok=True)
+            _PID_FILE = _os_scraper.path.join(_DATA_SC, "scraper.pid")
+            _LOG_FILE = _os_scraper.path.join(_DATA_SC, "scraper_stderr.log")
+
+            if _os_scraper.path.exists(_PID_FILE):
+                try:
+                    with open(_PID_FILE, "r", encoding="utf-8") as pf:
+                        old_pid = int((pf.read() or "").strip())
+                    _os_scraper.kill(old_pid, 0)
+                    st.session_state["_sc_err"] = (
+                        f"الكاشط يعمل بالفعل (PID: {old_pid}) — انتظر انتهاءه أو أوقفه أولاً"
+                    )
+                    return
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    st.session_state["_sc_err"] = (
+                        "تعذر التحقق من العملية السابقة بسبب الصلاحيات — أوقفها يدوياً ثم أعد المحاولة"
+                    )
+                    return
+                except Exception:
+                    pass
+
             try:
-                subprocess.Popen(
+                log_fh = open(_LOG_FILE, "w", encoding="utf-8")
+                proc = subprocess.Popen(
                     [
                         _sys_sc.executable, _SCRAPER_SCRIPT,
                         "--max-products", str(
@@ -3211,12 +3290,19 @@ elif page == "🕷️ كشط المنافسين":
                         "--concurrency", str(int(st.session_state.get("sc_concurrency", 8))),
                     ],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=log_fh,
                     start_new_session=True,
                 )
+                with open(_PID_FILE, "w", encoding="utf-8") as pf:
+                    pf.write(str(proc.pid))
                 st.session_state["_sc_started"] = True
+                st.session_state["_sc_pid"] = proc.pid
+            except FileNotFoundError:
+                st.session_state["_sc_err"] = f"Python interpreter غير موجود: {_sys_sc.executable}"
+            except PermissionError:
+                st.session_state["_sc_err"] = "رُفض الإذن لتشغيل عملية فرعية"
             except Exception as _exc:
-                st.session_state["_sc_err"] = str(_exc)
+                st.session_state["_sc_err"] = f"فشل تشغيل الكاشط: {str(_exc)[:120]}"
 
         # ══ عرض رسائل الـ Callbacks ═══════════════════════════════════════════
         if _sc_msg := st.session_state.pop("_sc_msg", None):
