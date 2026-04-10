@@ -1356,12 +1356,10 @@ def enhance_competitor_product_for_salla(
     scraped_summary: str,
     url: str = "",
     meta_fallback: str = "",
-    max_retries: int = 3,
 ) -> dict:
     """
     يحسّن بيانات منتج مكشوط من متجر منافس لتصدير سلة (شامل):
     تنظيف العنوان، وصف HTML تسويقي بقالب صارم، ماركة، تصنيف سلة، SEO، وهرم عطري.
-    يتضمن آلية Retry ذكية مع Exponential Backoff.
 
     يُعيد dict بمفاتيح:
     cleaned_title, description_html, brand, category, seo_title, seo_description,
@@ -1415,27 +1413,11 @@ def enhance_competitor_product_for_salla(
 }
 """
 
-    # آلية Retry مع Exponential Backoff
-    raw = None
-    for attempt in range(max_retries):
-        try:
-            wait_time = (2 ** attempt) if attempt > 0 else 0  # 0s, 2s, 4s
-            if wait_time > 0:
-                time.sleep(wait_time)
-            
-            raw = (
-                _call_gemini(prompt, MAGIC_FACTORY_SALLA_SYSTEM, temperature=0.3, max_tokens=8192)
-                or _call_openrouter(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
-                or _call_cohere(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
-            )
-            if raw:
-                break
-        except Exception as e:
-            _log_err("enhance_competitor_product_for_salla", f"محاولة {attempt+1}/{max_retries}: {str(e)[:100]}")
-            if attempt == max_retries - 1:
-                _log_err("enhance_competitor_product_for_salla", f"فشل بعد {max_retries} محاولات")
-                return defaults
-    
+    raw = (
+        _call_gemini(prompt, MAGIC_FACTORY_SALLA_SYSTEM, temperature=0.3, max_tokens=8192)
+        or _call_openrouter(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
+        or _call_cohere(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
+    )
     if not raw:
         return defaults
 
