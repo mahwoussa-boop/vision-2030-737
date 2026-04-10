@@ -73,11 +73,29 @@ def _process_product_pipeline(raw_data: dict, source_type: str = "manual") -> di
             # ماركة جديدة تماماً! لنولّد سجلها
             with st.spinner(f"✨ نولّد سجل الماركة: {brand_raw}..."):
                 # محاولة استخراج الاسم العربي والوصف بالـ AI
-                prompt = f"أعطني الاسم العربي والوصف التسويقي لماركة العطور العالمية: {brand_raw}. الرد JSON فقط: {{'ar': '...', 'desc': '...'}}"
-                ai_res = call_ai(prompt, json_mode=True)
-                ar_name = ai_res.get("ar", brand_raw)
-                ar_desc = ai_res.get("desc", f"عطور {brand_raw} الأصلية.")
-                
+                # ✅ prompt بـ JSON صالح + parsing يدوي بدون json_mode
+                _brand_prompt = (
+                    f'أعطني معلومات ماركة عطور "{brand_raw}" بالعربية. '
+                    'أجب بـ JSON صالح فقط بدون أي نص آخر:\n'
+                    '{"ar":"الاسم العربي المعتمد","desc":"وصف 30-50 كلمة عن الماركة"}'
+                )
+                _raw_res = call_ai(_brand_prompt, "general")
+
+                # استخراج JSON من الاستجابة — يعمل مع أي نسخة من call_ai
+                ai_res = {}
+                if isinstance(_raw_res, dict):
+                    _txt = _raw_res.get("response", "")
+                    if _txt:
+                        try:
+                            _c = re.sub(r"```json|```", "", _txt).strip()
+                            _s = _c.find("{"); _e = _c.rfind("}") + 1
+                            if _s >= 0 and _e > _s:
+                                ai_res = json.loads(_c[_s:_e])
+                        except (ValueError, TypeError):
+                            ai_res = {}
+
+                ar_name = str(ai_res.get("ar", "") or brand_raw).strip()
+                ar_desc  = str(ai_res.get("desc", "") or f"عطور {brand_raw} الأصيلة.").strip()
                 brand_rec = generate_brand_record(brand_raw, ar_name, ar_desc)
                 append_brand_to_csv(brand_rec, "data/brands.csv")
                 clean["brand"] = brand_rec["اسم الماركة"]
