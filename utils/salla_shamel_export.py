@@ -480,6 +480,13 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
         else:
             final_desc = desc_text  # fallback: HTML من format_mahwous_description
 
+        promo = sanitize_salla_text(str(r.get("العنوان الترويجي", "") or "").strip())
+
+        barcode_out = str(r.get("الباركود", "") or "").strip()
+        if not barcode_out:
+            barcode_out = str(r.get("barcode", "") or "").strip()
+        gtin_out = barcode_out if barcode_out.isdigit() and len(barcode_out) >= 8 else ""
+
         row_csv = {
             "النوع ": "منتج",
             "أسم المنتج": pname,
@@ -501,12 +508,12 @@ def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool
             "الوزن": "0.2",
             "وحدة الوزن": "kg",
             "الماركة": brand,
-            "العنوان الترويجي": "",
+            "العنوان الترويجي": promo,
             "تثبيت المنتج": "",
-            "الباركود": "",
+            "الباركود": barcode_out,
             "السعرات الحرارية": "",
             "MPN": "",
-            "GTIN": "",
+            "GTIN": gtin_out,
             "خاضع للضريبة ؟": "نعم",
             "سبب عدم الخضوع للضريبة": "",
             "[1] الاسم": "", "[1] النوع": "", "[1] القيمة": "", "[1] الصورة / اللون": "",
