@@ -1268,6 +1268,94 @@ def get_catalog_status() -> dict:
 
 # ══ الدوال المفقودة للوحدة الخامسة ═══════════════════════════════════════════
 
+def enhance_competitor_product_for_salla(
+    scraped_summary: str,
+    url: str = "",
+    meta_fallback: str = "",
+) -> dict:
+    """
+    يحسّن بيانات منتج مكشوط من متجر منافس لتصدير سلة (شامل):
+    تنظيف العنوان، وصف HTML تسويقي، ماركة، تصنيف، SEO، وهرم عطري عند الانطباق.
+
+    يُعيد dict بمفاتيح:
+    cleaned_title, description_html, brand, category, seo_title, seo_description,
+    top_notes, heart_notes, base_notes, gender_hint, is_perfume
+    """
+    defaults = {
+        "cleaned_title": "",
+        "description_html": "",
+        "brand": "",
+        "category": "",
+        "seo_title": "",
+        "seo_description": "",
+        "top_notes": "",
+        "heart_notes": "",
+        "base_notes": "",
+        "gender_hint": "",
+        "is_perfume": False,
+    }
+    blob = (scraped_summary or "").strip()
+    if not blob and not (meta_fallback or "").strip():
+        return defaults
+
+    sys_magic = (
+        "أنت خبير تحويل بيانات منتجات التجارة الإلكترونية إلى تنسيق متجر سلة (السعودية). "
+        "أجب بـ JSON صالح فقط بدون ``` وبدون أي نص قبل أو بعد الأقواس.\n\n"
+        "القواعد:\n"
+        "- cleaned_title: اسم منتج نظيف (عربي أو مختلط) بدون عبارات تسويق مزعجة مثل: "
+        "تخفيض، خصم، الأكثر مبيعاً، أصلي 100٪، عرض محدود، حصرية، شحن مجاني.\n"
+        "- description_html: وصف تسويقي احترافي طويل بصيغة HTML فقط "
+        "(وسوم مسموحة: p, h2, h3, ul, ol, li, strong, em, br). لا تستخدم Markdown.\n"
+        "  إذا كان المنتج عطراً أو يُذكر في المدخلات كعطر، أدرج قسماً واضحاً للهرم العطري: "
+        "القمة (Top)، القلب (Heart)، القاعدة (Base) مع نقاط أو فقرات.\n"
+        "  إذا لم يكن عطراً، ركّز على المميزات والاستخدام وفق البيانات المتاحة فقط.\n"
+        "- brand: الماركة كما يجب أن تظهر للتاجر (لا تخترع ماركة إن لم تظهر في المدخلات).\n"
+        "- category: تصنيف مقترح بصيغة مثل «العطور > عطور رجالية» أو «العناية > العناية بالبشرة».\n"
+        "- seo_title: عنوان SEO ≤ 60 حرفاً.\n"
+        "- seo_description: وصف SEO ≤ 155 حرفاً.\n"
+        "- top_notes, heart_notes, base_notes: نص عربي أو سلسلة مفصولة بفواصل؛ فارغ \"\" إن لم ينطبق.\n"
+        "- gender_hint: واحد من: للرجال | للنساء | للجنسين | فارغ.\n"
+        "- is_perfume: true إن كان المنتج عطراً، وإلا false.\n"
+        "لا تختلق مواصفات تقنية (باركود، SKU) غير واردة في المدخلات."
+    )
+
+    prompt = (
+        f"رابط الصفحة: {url}\n\n"
+        f"بيانات مستخرجة من الصفحة:\n{blob[:7000]}\n\n"
+    )
+    if (meta_fallback or "").strip():
+        prompt += f"معلومات إضافية من وسوم meta / JSON-LD:\n{meta_fallback[:2500]}\n"
+
+    prompt += (
+        "\nأجب بـ JSON بالمفاتيح التالية فقط:\n"
+        '{"cleaned_title":"","description_html":"","brand":"","category":"","seo_title":"",'
+        '"seo_description":"","top_notes":"","heart_notes":"","base_notes":"",'
+        '"gender_hint":"","is_perfume":false}'
+    )
+
+    raw = (
+        _call_gemini(prompt, sys_magic, temperature=0.25, max_tokens=8192)
+        or _call_openrouter(prompt, sys_magic)
+        or _call_cohere(prompt, sys_magic)
+    )
+    if not raw:
+        return defaults
+
+    data = _parse_json(raw)
+    if not isinstance(data, dict):
+        return defaults
+
+    out = {**defaults}
+    for k in out:
+        if k in data:
+            v = data[k]
+            if k == "is_perfume":
+                out[k] = bool(v)
+            else:
+                out[k] = str(v).strip() if v is not None else ""
+    return out
+
+
 def extract_product(text: str) -> dict:
     """
     يستخرج بيانات العطر (اسم، ماركة، حجم، تركيز، جنس، سعر) من نص خام.
