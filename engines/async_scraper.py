@@ -64,6 +64,7 @@ CSV_COLS = [
 class Progress:
     """تقدم الكشط الكلي — يُكتب دورياً إلى PROGRESS_FILE"""
     running: bool = False
+    health_init: bool = False
     started_at: str = ""
     finished_at: str = ""
     stores_total: int = 0
@@ -78,6 +79,7 @@ class Progress:
     store_urls_total: int = 0
     last_error: str = ""
     stores_results: Dict[str, int] = field(default_factory=dict)
+    stores_http_errors: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
     def save(self, path: str = PROGRESS_FILE) -> None:
         try:
@@ -293,6 +295,7 @@ async def fetch_product(
     url: str,
     store_url: str,
     semaphore: asyncio.Semaphore,
+    http_status_counters: Dict[str, int] | None = None,
 ) -> dict | None:
     """
     يجلب صفحة/API منتج ويُعيد dict موحّد أو None.
@@ -313,6 +316,10 @@ async def fetch_product(
                     row  = extract_product(prod, store_url)
                     if row:
                         return row
+                elif resp.status in (403, 429) and http_status_counters is not None:
+                    http_status_counters[str(resp.status)] = (
+                        http_status_counters.get(str(resp.status), 0) + 1
+                    )
         except Exception:
             pass
 
@@ -334,6 +341,10 @@ async def fetch_product(
                 if resp.status == 200:
                     html = await resp.text(errors="replace")
                 elif resp.status in (403, 429, 503):
+                    if resp.status in (403, 429) and http_status_counters is not None:
+                        http_status_counters[str(resp.status)] = (
+                            http_status_counters.get(str(resp.status), 0) + 1
+                        )
                     # الصفحة محمية — جرّب سلسلة الـ fallback المزامنة
                     logger.debug("HTTP %d — جرب curl_cffi: %s", resp.status, url)
                     html = await asyncio.get_event_loop().run_in_executor(
@@ -474,7 +485,7 @@ async def scrape_one_store(
         logger.info(f"🗺️ {domain} — يحلل Sitemap…")
         try:
             entries = await asyncio.wait_for(
-                resolve_store_product_urls(session, store_url), timeout=120
+                resolve_store_product_urls(session, store_url), timeout=300
             )
         except asyncio.TimeoutError:
             state.mark_error(domain, "sitemap_timeout")
@@ -509,11 +520,18 @@ async def scrape_one_store(
         rows: List[dict]  = []
         done_count        = resume_idx
         checkpoint_every  = max(50, min(200, total // 10 + 1))
+        store_http_status = {"403": 0, "429": 0}
 
         async def _fetch_one(url: str) -> None:
             nonlocal done_count
             try:
-                row = await fetch_product(session, url, store_url, semaphore)
+                row = await fetch_product(
+                    session,
+                    url,
+                    store_url,
+                    semaphore,
+                    http_status_counters=store_http_status,
+                )
                 if row:
                     rows.append(row)
             except Exception as e:
@@ -552,12 +570,18 @@ async def scrape_one_store(
                     )
 
         # دُفعات لتجنب تشبع الذاكرة
-        BATCH = 300
+        BATCH = 50
         for start in range(0, len(pending_urls), BATCH):
             batch = pending_urls[start: start + BATCH]
             await asyncio.gather(*[_fetch_one(u) for u in batch])
+            await asyncio.sleep(1)
 
     state.mark_done(domain, len(rows))
+    progress.stores_http_errors[domain] = {
+        "403": int(store_http_status.get("403", 0)),
+        "429": int(store_http_status.get("429", 0)),
+    }
+    progress.save()
     logger.info(f"✅ {domain} — {len(rows)} منتج")
     return rows
 
