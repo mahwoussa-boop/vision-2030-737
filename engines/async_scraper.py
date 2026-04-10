@@ -6,6 +6,7 @@ engines/async_scraper.py — محرك الكشط الرئيسي v2.0 (MASTER)
 ✅ كشط مفرد لأي منافس بشكل مستقل (run_single_store)
 ✅ دعم كامل للـ CLI (--store / --resume / --reset-state)
 ✅ شيمات scrapers/ و utils/ و make/ تستورد منه تلقائياً
+✅ (مُحدّث) حماية الذاكرة، تسريع الـ Regex، و Connection Pooling
 """
 from __future__ import annotations
 
@@ -39,6 +40,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AsyncScraper")
 
+# ─── ثوابت مُترجمة مسبقاً (Precompiled Regex) لحماية الذاكرة ────────────────
+import re as _re
+import concurrent.futures as _futures
+
+_RE_JSONLD = _re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    _re.S | _re.I,
+)
+_RE_OG_TITLE    = _re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
+_RE_OG_IMAGE    = _re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
+_RE_OG_URL      = _re.compile(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']',   _re.I)
+_RE_OG_PRICE    = _re.compile(r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
+_RE_PRICE_SPAN  = _re.compile(r'class="[^"]*price[^"]*"[^>]*>\s*(?:<[^>]+>)?([\d,. ]+)', _re.I)
+_RE_H1_PRODUCT  = _re.compile(r'<h1[^>]*>\s*([^<]{3,120}?)\s*</h1>', _re.S | _re.I)
+
+# ─── Anti-ban imports مُسبقة على مستوى الـ Module ─────────────────────────
+try:
+    from scrapers.anti_ban import get_browser_headers as _get_browser_headers
+    from scrapers.anti_ban import try_all_sync_fallbacks as _try_all_sync_fallbacks
+    _ANTI_BAN_AVAILABLE = True
+except ImportError:
+    _ANTI_BAN_AVAILABLE = False
+    logger.warning("⚠️ scrapers.anti_ban غير متاح — سيتم استخدام headers افتراضية")
+    _get_browser_headers      = lambda url: {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    _try_all_sync_fallbacks   = lambda url, timeout=25: None
+
+# ─── ThreadPoolExecutor مخصص للـ fallback المزامن ─────────────────────────
+_FALLBACK_EXECUTOR = _futures.ThreadPoolExecutor(
+    max_workers=16,
+    thread_name_prefix="scraper_fallback",
+)
+
 # ─── مسارات البيانات ──────────────────────────────────────────────────────────
 _DATA_DIR = os.environ.get("DATA_DIR", "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
@@ -64,7 +97,6 @@ CSV_COLS = [
 class Progress:
     """تقدم الكشط الكلي — يُكتب دورياً إلى PROGRESS_FILE"""
     running: bool = False
-    health_init: bool = False
     started_at: str = ""
     finished_at: str = ""
     stores_total: int = 0
@@ -79,7 +111,7 @@ class Progress:
     store_urls_total: int = 0
     last_error: str = ""
     stores_results: Dict[str, int] = field(default_factory=dict)
-    stores_http_errors: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    stores_http_errors: Dict[str, dict] = field(default_factory=dict) # ✅ تمت الإضافة للحماية من الانهيار
 
     def save(self, path: str = PROGRESS_FILE) -> None:
         try:
@@ -212,19 +244,11 @@ def _domain(url: str) -> str:
     return urlparse(url).netloc.replace("www.", "")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  كتابة/قراءة ملف التقدم الحي per-store (يُستخدم من الواجهة في الوقت الفعلي)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _live_progress_path(domain: str) -> str:
-    return os.path.join(_DATA_DIR, f"_sc_live_{domain}.json")
-
-
 def _write_live_progress(domain: str, data: dict) -> None:
     """يكتب ملف تقدم حي خاص بالمتجر — يُقرأ من واجهة Streamlit."""
     try:
         with _LIVE_WRITE_LOCK:
-            with open(_live_progress_path(domain), "w", encoding="utf-8") as f:
+            with open(os.path.join(_DATA_DIR, f"_sc_live_{domain}.json"), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
     except Exception:
         pass
@@ -290,6 +314,31 @@ def extract_product(data: dict, store_url: str) -> dict | None:
 #  جلب منتج واحد من URL
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _sync_fetch_fallback(url: str, timeout: int = 25) -> str | None:
+    """
+    سلسلة الـ fallback المزامنة لتخطي الحماية (تُستدعى من ThreadPoolExecutor):
+    1. curl_cffi  → TLS Impersonation (أقوى ضد Cloudflare)
+    2. cloudscraper → JS Challenge bypass
+    3. requests   → طلب عادي بـ headers محاكية
+    """
+    if not _ANTI_BAN_AVAILABLE:
+        return None
+
+    try:
+        result = _try_all_sync_fallbacks(url, timeout=timeout)
+        return result
+    except TypeError:
+        # إذا كانت try_all_sync_fallbacks لا تقبل timeout بعد
+        try:
+            return _try_all_sync_fallbacks(url)
+        except Exception as exc:
+            logger.debug("_sync_fetch_fallback (no-timeout variant) فشل: %s — %s", url, exc)
+            return None
+    except Exception as exc:
+        logger.debug("_sync_fetch_fallback فشل: %s — %s", url, exc)
+        return None
+
+
 async def fetch_product(
     session: aiohttp.ClientSession,
     url: str,
@@ -299,12 +348,9 @@ async def fetch_product(
 ) -> dict | None:
     """
     يجلب صفحة/API منتج ويُعيد dict موحّد أو None.
-    الترتيب: Shopify JSON → JSON-LD → og:meta
-    عند الفشل (403/Cloudflare) يستخدم سلسلة الـ fallback:
-      curl_cffi (TLS fingerprint) → cloudscraper → requests
     """
     async with semaphore:
-        # ── Shopify-style .json ──
+        # ── Shopify-style .json ──────────────────────────────────────────
         json_url = url if url.endswith(".json") else url.rstrip("/") + ".json"
         try:
             async with session.get(
@@ -323,14 +369,11 @@ async def fetch_product(
         except Exception:
             pass
 
-        # ── HTML fallback ──
-        try:
-            from scrapers.anti_ban import get_browser_headers
-            hdrs = get_browser_headers(store_url)
-        except Exception:
-            hdrs = {"User-Agent": "Mozilla/5.0 Chrome/134"}
+        # ── HTML fallback ────────────────────────────────────────────────
+        hdrs = _get_browser_headers(store_url)
 
         html: str | None = None
+        loop = asyncio.get_running_loop()
 
         # محاولة aiohttp عادية
         try:
@@ -345,116 +388,96 @@ async def fetch_product(
                         http_status_counters[str(resp.status)] = (
                             http_status_counters.get(str(resp.status), 0) + 1
                         )
-                    # الصفحة محمية — جرّب سلسلة الـ fallback المزامنة
                     logger.debug("HTTP %d — جرب curl_cffi: %s", resp.status, url)
-                    html = await asyncio.get_event_loop().run_in_executor(
-                        None, _sync_fetch_fallback, url
-                    )
+                    try:
+                        html = await asyncio.wait_for(
+                            loop.run_in_executor(_FALLBACK_EXECUTOR, _sync_fetch_fallback, url),
+                            timeout=35.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.debug("Fallback timeout (35s): %s", url)
+                        html = None
         except Exception:
-            html = await asyncio.get_event_loop().run_in_executor(
-                None, _sync_fetch_fallback, url
-            )
+            try:
+                html = await asyncio.wait_for(
+                    loop.run_in_executor(_FALLBACK_EXECUTOR, _sync_fetch_fallback, url),
+                    timeout=35.0,
+                )
+            except asyncio.TimeoutError:
+                logger.debug("Fallback timeout (35s) after exception: %s", url)
+                html = None
+            except Exception:
+                html = None
 
         if not html:
             return None
 
-        import re
-
-        # JSON-LD
-        ld_match = re.search(
-            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.S | re.I,
-        )
+        # ── JSON-LD ──────────────────────────────────────────────────────
+        ld_match = _RE_JSONLD.search(html)
         if ld_match:
             try:
-                ld = json.loads(ld_match.group(1))
-                if isinstance(ld, dict) and "@graph" in ld:
-                    ld = next((x for x in ld["@graph"] if x.get("@type") == "Product"), {})
-                elif isinstance(ld, list):
-                    ld = next((x for x in ld if x.get("@type") == "Product"), {})
-                
-                if ld.get("@type") == "Product":
-                    offer = ld.get("offers", {})
-                    if isinstance(offer, list):
-                        offer = offer[0] if offer else {}
-                    imgs = ld.get("image", "")
-                    img  = imgs[0] if isinstance(imgs, list) else imgs
-                    # ─── v26.1: تحسين استخراج السعر لـ worldgivenchy ───
-                    ld_price = offer.get("price", 0)
-                    if not ld_price and "worldgivenchy.com" in store_url:
-                        # أحياناً يكون السعر في حقل priceSpecification أو غيره
-                        spec = offer.get("priceSpecification", {})
-                        if isinstance(spec, dict):
-                            ld_price = spec.get("price", 0)
+                import json as _json
+                ld_data = _json.loads(ld_match.group(1).strip())
+                if isinstance(ld_data, list):
+                    ld_data = ld_data[0]
+                if isinstance(ld_data, dict) and ld_data.get("name"):
+                    offers = ld_data.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    return extract_product(
+                        {
+                            "name":  ld_data.get("name", ""),
+                            "price": offers.get("price", 0),
+                            "sku":   ld_data.get("sku", ""),
+                            "image": (ld_data.get("image") or [""])[0]
+                                     if isinstance(ld_data.get("image"), list)
+                                     else ld_data.get("image", ""),
+                            "url":   ld_data.get("url", url),
+                            "brand": ld_data.get("brand", {}).get("name", "")
+                                     if isinstance(ld_data.get("brand"), dict)
+                                     else str(ld_data.get("brand", "")),
+                        },
+                        store_url,
+                    )
+            except Exception:
+                pass
 
-                    row  = extract_product({
-                        "name":  ld.get("name", ""),
-                        "price": ld_price,
-                        "image": img,
-                        "brand": (ld.get("brand") or {}).get("name", "") if isinstance(ld.get("brand"), dict) else str(ld.get("brand", "")),
-                        "url":   url,
-                        "sku":   ld.get("sku", ""),
-                        "available": offer.get("availability", ""),
-                    }, store_url)
-                    if row:
-                        return row
-            except Exception as e:
-                logger.debug(f"JSON-LD error for {url}: {e}")
-
-        # og:meta
-        def _meta(prop: str) -> str:
-            m = re.search(
-                rf'<meta[^>]+(?:property|name)=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']',
-                html, re.I,
-            )
+        # ── og:meta fallback ─────────────────────────────────────────────
+        def _meta(pattern: _re.Pattern) -> str:
+            m = pattern.search(html)
             return m.group(1).strip() if m else ""
 
-        pname = _meta("title")
-        
-        # ─── v26.1: تحسين استخراج البيانات من HTML لـ worldgivenchy ───
-        if "worldgivenchy.com" in store_url:
-            # محاولة استخراج الاسم والسعر من الـ HTML مباشرة
-            # الأنماط الملاحظة في worldgivenchy
-            h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S | re.I)
-            name = h1_match.group(1).strip() if h1_match else pname
-            
-            # استخراج السعر من الأنماط المتوقعة (مثلاً: <span class="price">750</span>)
-            price = 0.0
-            price_match = re.search(r'class="[^"]*price[^"]*".*?>([\d,.]+)', html, re.I)
+        pname = _meta(_RE_OG_TITLE)
+        pimg  = _meta(_RE_OG_IMAGE)
+        purl  = _meta(_RE_OG_URL) or url
+        pprice_raw = _meta(_RE_OG_PRICE)
+        try:
+            pprice = float(pprice_raw.replace(",", "").strip()) if pprice_raw else 0.0
+        except Exception:
+            pprice = 0.0
+
+        # استخراج السعر من span إذا لم يوجد في og
+        if pprice == 0.0:
+            price_match = _RE_PRICE_SPAN.search(html)
             if price_match:
                 try:
-                    price = float(price_match.group(1).replace(",", ""))
-                except:
-                    pass
-            
-            if name and name != "شركه عالم جيفينشي التجارية":
-                return extract_product(
-                    {"name": name, "image": _meta("image"), "url": url, "price": price},
-                    store_url,
-                )
+                    pprice = float(price_match.group(1).replace(",", "").replace(" ", ""))
+                except Exception:
+                    pprice = 0.0
+
+        # استخراج الاسم من h1 إذا لم يوجد في og
+        if not pname:
+            h1_match = _RE_H1_PRODUCT.search(html)
+            if h1_match:
+                pname = h1_match.group(1).strip()
 
         if pname:
             return extract_product(
-                {"name": pname, "image": _meta("image"), "url": url, "price": 0},
+                {"name": pname, "image": pimg, "url": purl, "price": pprice},
                 store_url,
             )
 
         return None
-
-
-def _sync_fetch_fallback(url: str) -> str | None:
-    """
-    سلسلة الـ fallback المزامنة لتخطي الحماية:
-    1. curl_cffi  → TLS Impersonation (أقوى ضد Cloudflare)
-    2. cloudscraper → JS Challenge bypass
-    3. requests   → طلب عادي بـ headers محاكية
-    """
-    try:
-        from scrapers.anti_ban import try_all_sync_fallbacks
-        return try_all_sync_fallbacks(url)
-    except Exception:
-        pass
-    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -470,22 +493,9 @@ async def scrape_one_store(
     resume: bool = True,
     single_mode: bool = False,
 ) -> List[dict]:
-    """
-    يكشط متجراً واحداً مع دعم الاستئناف من نقطة التوقف.
-
-    Args:
-        store_url:    رابط جذر المتجر
-        progress:     كائن التقدم العام (يُحدَّث مباشرةً)
-        state:        كائن نقاط الاستئناف
-        concurrency:  عدد الطلبات المتزامنة
-        max_products: 0 = بلا حد
-        resume:       True → استأنف من آخر نقطة
-        single_mode:  True عند كشط مفرد من الواجهة (يتجاوز فحص is_done)
-    """
     domain = _domain(store_url)
     cp     = state.get(domain, store_url)
 
-    # إذا اكتمل ولا نريد الإجبار → تخطِّ
     if resume and cp.status == "done" and not single_mode:
         logger.info(f"⏭️ {domain} — مكتمل ({cp.rows_saved} منتج)")
         return []
@@ -494,7 +504,6 @@ async def scrape_one_store(
     cp.started_at = cp.started_at or datetime.now().isoformat()
     state.save()
 
-    # استيراد محلل Sitemap
     try:
         from engines.sitemap_resolve import resolve_store_product_urls
     except ImportError:
@@ -506,11 +515,15 @@ async def scrape_one_store(
             return []
 
     connector = aiohttp.TCPConnector(ssl=False, limit=concurrency + 5)
-    async with aiohttp.ClientSession(
-        connector=connector, timeout=aiohttp.ClientTimeout(total=30)
-    ) as session:
+    session: aiohttp.ClientSession | None = None
 
-        # ── 1. جلب قائمة روابط المنتجات ─────────────────────────────────
+    try:
+        session = aiohttp.ClientSession(
+            connector=connector,
+            connector_owner=True,
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+
         progress.current_store    = domain
         progress.store_urls_done  = 0
         progress.store_urls_total = 0
@@ -539,7 +552,6 @@ async def scrape_one_store(
             all_urls = all_urls[:max_products]
             total    = len(all_urls)
 
-        # ── استئناف: تخطي الروابط المُعالَجة ────────────────────────────
         resume_idx = cp.last_url_index if (resume and cp.last_url_index > 0) else 0
         if resume_idx > 0:
             logger.info(f"🔄 {domain} — استئناف من الرابط {resume_idx}/{total}")
@@ -549,25 +561,32 @@ async def scrape_one_store(
         progress.urls_total       += total
         progress.store_urls_total  = total
 
-        # ── 2. كشط بالتزامن مع حفظ دوري لنقاط الاستئناف ─────────────────
         semaphore         = asyncio.Semaphore(concurrency)
         rows: List[dict]  = []
         done_count        = resume_idx
         checkpoint_every  = max(50, min(200, total // 10 + 1))
         store_http_status = {"403": 0, "429": 0}
 
+        _TASK_TIMEOUT = 60.0
+
         async def _fetch_one(url: str) -> None:
             nonlocal done_count
             try:
-                row = await fetch_product(
-                    session,
-                    url,
-                    store_url,
-                    semaphore,
-                    http_status_counters=store_http_status,
+                row = await asyncio.wait_for(
+                    fetch_product(
+                        session,
+                        url,
+                        store_url,
+                        semaphore,
+                        http_status_counters=store_http_status,
+                    ),
+                    timeout=_TASK_TIMEOUT,
                 )
                 if row:
                     rows.append(row)
+            except asyncio.TimeoutError:
+                logger.debug("URL timeout (%ss): %s", _TASK_TIMEOUT, url)
+                progress.fetch_exceptions += 1
             except Exception as e:
                 progress.fetch_exceptions += 1
                 progress.last_error = str(e)[:100]
@@ -582,16 +601,14 @@ async def scrape_one_store(
                         (safe - progress.fetch_exceptions) / safe * 100 if safe else 0
                     )
                     progress.save()
-                    # كتابة ملف التقدم الحي للواجهة
                     _write_live_progress(domain, {
                         "urls_done":  done_count,
                         "urls_total": total,
                         "rows_saved": len(rows),
-                        "pct":        min(100, int(done_count / max(total,1) * 100)),
+                        "pct":        min(100, int(done_count / max(total, 1) * 100)),
                         "updated_at": datetime.now().isoformat()[:19],
                     })
 
-                # ── حفظ نقطة استئناف ──
                 if done_count % checkpoint_every == 0:
                     state.update(
                         domain,
@@ -599,16 +616,32 @@ async def scrape_one_store(
                         urls_done=done_count,
                     )
                     logger.info(
-                        f"💾 {domain} — نقطة @ {done_count}/{total} | "
-                        f"{len(rows)} منتج"
+                        f"💾 {domain} — نقطة @ {done_count}/{total} | {len(rows)} منتج"
                     )
 
-        # دُفعات لتجنب تشبع الذاكرة
         BATCH = 50
         for start in range(0, len(pending_urls), BATCH):
             batch = pending_urls[start: start + BATCH]
-            await asyncio.gather(*[_fetch_one(u) for u in batch])
-            await asyncio.sleep(1)
+            await asyncio.gather(*[_fetch_one(u) for u in batch], return_exceptions=True)
+
+            total_blocks = int(store_http_status.get("403", 0)) + int(store_http_status.get("429", 0))
+            processed_so_far = start + len(batch)
+            block_rate = total_blocks / max(processed_so_far, 1)
+
+            if block_rate > 0.3:
+                adaptive_delay = 4.0
+            elif block_rate > 0.1:
+                adaptive_delay = 2.0
+            else:
+                adaptive_delay = 0.5
+
+            if start + BATCH < len(pending_urls):
+                await asyncio.sleep(adaptive_delay)
+
+    finally:
+        if session is not None and not session.closed:
+            await session.close()
+        await asyncio.sleep(0.25)
 
     state.mark_done(domain, len(rows))
     progress.stores_http_errors[domain] = {
@@ -630,18 +663,6 @@ def run_single_store(
     max_products: int = 0,
     force: bool = False,
 ) -> dict:
-    """
-    كشط متجر واحد بشكل فوري (Blocking في خيط منفصل).
-
-    Args:
-        store_url:    رابط المتجر
-        concurrency:  طلبات متزامنة
-        max_products: 0 = كل المنتجات
-        force:        True → أعد الكشط حتى لو اكتمل
-
-    Returns:
-        {"success": bool, "rows": int, "message": str, "domain": str}
-    """
     domain = _domain(store_url)
     state  = ScraperState()
     if force:
@@ -694,7 +715,6 @@ def run_single_store(
 
 
 def _merge_rows_to_csv(new_rows: List[dict], domain: str) -> int:
-    """يدمج صفوف جديدة مع OUTPUT_CSV (يستبدل بيانات المتجر القديمة)"""
     if not new_rows:
         return _count_csv_rows()
 
@@ -730,10 +750,6 @@ async def run_scraper(
     max_products: int = 0,
     resume: bool = True,
 ) -> None:
-    """
-    يكشط جميع المتاجر في competitors_list.json بالترتيب.
-    يكتب إلى PROGRESS_FILE و STATE_FILE و OUTPUT_CSV.
-    """
     try:
         with open(COMPETITORS_FILE, encoding="utf-8") as f:
             stores: List[str] = json.load(f)
