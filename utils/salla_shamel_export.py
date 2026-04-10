@@ -217,6 +217,78 @@ def _resolve_category_to_store(cat_value: str, store_categories: list[str], gend
     return "" # إرجاع فارغ لمنع الرفض
 
 
+def resolve_brand_for_shamel(brand_raw: str) -> str:
+    """
+    يطابق اسم الماركة القادم من الـ AI أو الكشط مع الاسم الرسمي في
+    «ماركات مهووس.csv» أو «brands.csv» (نفس منطق التصدير).
+    يُرجع سلسلة فارغة إن لم يُعثر على ملف أو على مطابقة.
+    """
+    bv = sanitize_salla_text(str(brand_raw or "").strip())
+    if not bv or bv.lower() in ("ماركة عالمية", "unknown", "nan"):
+        return ""
+    store = _load_store_brands()
+    if not store:
+        return ""
+    brand = get_brand_arabic_name(bv, store) if bv else ""
+    if not brand and bv:
+        brand = _resolve_brand_to_store(bv, store)
+    return brand or ""
+
+
+def resolve_category_for_shamel(
+    category_raw: str,
+    gender_hint: str = "",
+    product_name_fallback: str = "",
+) -> str:
+    """
+    يطابق التصنيف مع «تصنيفات مهووس.csv» / categories.csv (نفس منطق التصدير).
+    يدعم صيغة الـ AI «العطور > عطور رجالية» بمحاولة الجزء بعد > عند فشل المطابقة الكاملة.
+    """
+    store = _load_store_categories()
+    if not store:
+        return ""
+
+    gh = str(gender_hint or "").strip()
+
+    cv = sanitize_salla_text(str(category_raw or "").strip())
+    if not cv and product_name_fallback:
+        cv = sanitize_salla_text(auto_infer_category(product_name_fallback, gh))
+
+    def _try(x: str) -> str:
+        x = sanitize_salla_text(str(x or "").strip())
+        if not x:
+            return ""
+        return _resolve_category_to_store(x, store, gh) or ""
+
+    # الجزء الأخصّ أولاً: «العطور > عطور رجالية» → جرّب «عطور رجالية» ثم «العطور» ثم النص كاملاً
+    _cands: list[str] = []
+    if ">" in cv:
+        parts = [
+            sanitize_salla_text(p.strip())
+            for p in cv.split(">")
+            if sanitize_salla_text(p.strip())
+        ]
+        for p in reversed(parts):
+            _cands.append(p)
+        _cands.append(cv)
+    else:
+        _cands.append(cv)
+
+    for cand in _cands:
+        r = _try(cand)
+        if r:
+            return r
+
+    if gh == "للجنسين" and not r:
+        for c in store:
+            if c.strip() == "عطور للجنسين":
+                return c
+        if "العطور" in store:
+            return "العطور"
+
+    return ""
+
+
 def _concentration_ar(s: str) -> str:
     """استخراج التركيز بالصيغة الموحّدة المعتمدة لمتجر مهووس."""
     t = str(s or "").lower()
