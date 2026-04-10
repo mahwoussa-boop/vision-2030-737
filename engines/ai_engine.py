@@ -288,8 +288,8 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
                     reason = data.get("promptFeedback",{}).get("blockReason","")
                     _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
             elif r.status_code == 429:
-                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                # ✅ إصلاح: Rate limit → تخطّ المفتاح مباشرة (لا sleep في main thread)
+                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — تخطي للمفتاح التالي")
                 continue
             elif r.status_code == 403:
                 _log_err("Gemini", f"مفتاح {i+1}: IP محظور أو مفتاح غير مصرح (403)")
@@ -346,8 +346,8 @@ def _call_openrouter(prompt, system=""):
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
-                _log_err("OpenRouter", f"{model}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                # ✅ إصلاح: Rate limit → تخطّ النموذج مباشرة (لا sleep في main thread)
+                _log_err("OpenRouter", f"{model}: Rate Limit (429) — تخطي للنموذج التالي")
                 continue
             elif r.status_code == 402:
                 _log_err("OpenRouter", f"{model}: رصيد منتهٍ (402) — جرب النموذج التالي")
@@ -405,8 +405,8 @@ def _call_cohere(prompt, system=""):
             _log_err("Cohere", f"غير مصرح ({r.status_code}) — تجاوز")
             return None
         elif r.status_code == 429:
-            _log_err("Cohere", "Rate Limit (429) — انتظار 2 ثانية")
-            time.sleep(2)
+            # ✅ إصلاح: Rate limit → تخطّ مباشرة (لا sleep في main thread)
+            _log_err("Cohere", "Rate Limit (429) — تخطي Cohere")
             return None
         else:
             try:   msg = r.json().get("message", "")
@@ -489,7 +489,8 @@ def gemini_chat(message, history=None, system_extra=""):
                     return {"success":True,"response":text,
                             "source":"Gemini Flash" + (" + بحث ويب" if needs_web else "")}
             elif r.status_code == 429:
-                time.sleep(1); continue
+                # ✅ إصلاح: لا sleep في main thread
+                continue
         except: continue
     r = _call_openrouter(message, sys)
     if r: return {"success":True,"response":r,"source":"OpenRouter"}
@@ -854,8 +855,16 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
         return {"success":True, **data}
-    match = "true" in txt.lower() or "نعم" in txt
-    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
+    # ✅ إصلاح: لا نحكم بالتطابق من وجود كلمة "نعم"/"true" عشوائية في نص فاشل
+    # (كان يُعيد false-positive عند أي هلوسة من النموذج)
+    return {
+        "success": True,
+        "match": False,
+        "confidence": 0,
+        "reason": f"فشل تحليل JSON من الـ AI — النص الخام: {txt[:200]}",
+        "correct_section": "تحت المراجعة",
+        "suggested_price": 0,
+    }
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
 def reclassify_review_items(items):
