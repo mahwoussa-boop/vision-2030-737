@@ -1,4 +1,4 @@
-from utils.normalizer import normalize_product_name\n"""
+"""
 engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
 ═══════════════════════════════════════════════════════
 🚀 تطبيع مسبق (Pre-normalize) → vectorized cdist → Gemini للغموض فقط
@@ -228,7 +228,7 @@ _SYN = {
     "سيلفر":"silver","سيلفير":"silver",
     "نايت":"night","نايث":"night",
     "داي":"day","دي":"day",
-    # إزالة حروف الربط الزائدة
+    "او":"",  # إزالة حروف الربط الزائدة
     # ── v26.0: مرادفات إضافية لزيادة الدقة ──
     # أحجام بديلة
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
@@ -818,14 +818,50 @@ _NOISE_RE = re.compile(
     r'eau\s*de|pour\s*homme|pour\s*femme|for\s*men|for\s*women|unisex|'
     r'edp|edt|edc)\b'
     r'|\b\d+(?:\.\d+)?\s*(?:ml|مل|ملي|oz)\b'   # أحجام: 100ml, 50مل
-    # r'|\b(100|200|50|75|150|125|250|300|30|80)\b',  # Fixed B8
+    r'|\b(100|200|50|75|150|125|250|300|30|80)\b',  # أرقام أحجام منفردة
     re.UNICODE | re.IGNORECASE
 )
 
-# استخدام المحرك الموحد من ملف normalizer
-normalize = lambda t: normalize_product_name(t, aggressive=False)
-normalize_name = lambda t: normalize_product_name(t, aggressive=True)
-# تم مسح الدوال القديمة لمنع التعارض
+def normalize(text):
+    """تطبيع قياسي: يوحّد الحروف والمرادفات مع الحفاظ على كامل النص"""
+    if not isinstance(text, str): return ""
+    t = text.strip().lower()
+    # 1. توحيد الهمزات أولاً (قبل أي استبدال)
+    for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
+                     ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
+        t = t.replace(src, dst)
+    # 2. المرادفات المخصصة
+    for k, v in WORD_REPLACEMENTS.items():
+        t = t.replace(k.lower(), v)
+    # 3. قاموس المرادفات الشامل
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
+    t = re.sub(r'[^\w\s\u0600-\u06FF.]', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def normalize_name(text):
+    """
+    الدالة الموحدة للمطابقة — تُستخدم حصراً لمقارنة الأسماء.
+    تحذف: عطر/بارفيوم/بيرفيوم/تستر/مل/edp/edt/للجنسين/100/50/...
+    توحّد: أ/إ/آ→ا  ة/ه→ه  ى→ي
+    المثال: 'عطر ايسينشيال بيرفيوم فيج انفيوجن 100مل' → 'essential فيج infusion'
+    """
+    if not isinstance(text, str): return ""
+    t = text.strip().lower()
+    # 1. توحيد الهمزات أولاً
+    for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
+                     ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
+        t = t.replace(src, dst)
+    # 2. قاموس المرادفات (ترجمة التهجئات البديلة)
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
+    # 3. حذف كلمات الضجيج
+    t = _NOISE_RE.sub(' ', t)
+    # 4. حذف الأرقام المتبقية + الرموز
+    t = re.sub(r'\b\d+\b', ' ', t)
+    t = re.sub(r'[^\w\s\u0600-\u06FF]', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
 
 
 # alias للتوافق مع الكود القديم
@@ -1038,7 +1074,7 @@ def _fcol(df, cands):
         for col in cols:
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
-    return None
+    return cols[0] if cols else ""
 
 
 def _fcol_optional(df, cands):
@@ -1185,7 +1221,7 @@ def _find_product_name_column(df):
             if col != url_c:
                 return col
 
-    return None
+    return cols[0] if cols else ""
 
 
 def _name_col_for_analysis(df):
