@@ -1579,9 +1579,16 @@ with st.sidebar:
                     st_autorefresh(interval=4000, key="progress_refresh")
                 except ImportError:
                     # fallback: rerun عادي إذا لم تكن المكتبة موجودة
-                    time.sleep(4)
+                   except ImportError:
+                # ✅ إصلاح: بدون time.sleep() في Main Thread — يجمّد الـ UI ويخالف القاعدة #2
+                # المستخدم يرى الشريط ويضغط تحديث يدوي، أو يثبّت streamlit-autorefresh
+                st.info(
+                    "💡 للتحديث التلقائي: `pip install streamlit-autorefresh`  \n"
+                    "أو اضغط الزر أدناه لتحديث الحالة يدوياً.",
+                    icon="ℹ️",
+                )
+                if st.button("🔄 تحديث الحالة", key="manual_progress_refresh"):
                     st.rerun()
-            elif job["status"] == "done" and st.session_state.job_running:
                 # اكتمل — حمّل النتائج تلقائياً مع استعادة القوائم
                 if job.get("results"):
                     _restored = restore_results_from_json(job["results"])
