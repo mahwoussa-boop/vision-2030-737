@@ -38,7 +38,7 @@ def get_db():
 
 
 def init_db():
-    conn = get_db()
+    with get_db() as conn:
     c = conn.cursor()
 
     # أحداث عامة
@@ -115,18 +115,18 @@ def init_db():
     )""")
 
     conn.commit()
-    conn.close()
+    # conn.close()
 
 
 # ─── أحداث ────────────────────────────────
 def log_event(page, event_type, details="", product_name="", action=""):
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             "INSERT INTO events (timestamp,page,event_type,details,product_name,action_taken) VALUES (?,?,?,?,?,?)",
             (_ts(), page, event_type, details, product_name, action)
         )
-        conn.commit(); conn.close()
+        conn.commit(); # conn.close()
     except: pass
 
 
@@ -134,7 +134,7 @@ def log_event(page, event_type, details="", product_name="", action=""):
 def log_decision(product_name, old_status, new_status, reason="",
                  our_price=0, comp_price=0, diff=0, competitor=""):
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             """INSERT INTO decisions
                (timestamp,product_name,our_price,comp_price,diff,competitor,
@@ -143,13 +143,13 @@ def log_decision(product_name, old_status, new_status, reason="",
             (_ts(), product_name, our_price, comp_price, diff,
              competitor, old_status, new_status, reason)
         )
-        conn.commit(); conn.close()
+        conn.commit(); # conn.close()
     except: pass
 
 
 def get_decisions(product_name=None, status=None, limit=100):
     try:
-        conn = get_db()
+        with get_db() as conn:
         if product_name:
             rows = conn.execute(
                 "SELECT * FROM decisions WHERE product_name LIKE ? ORDER BY id DESC LIMIT ?",
@@ -164,7 +164,7 @@ def get_decisions(product_name=None, status=None, limit=100):
             rows = conn.execute(
                 "SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except: return []
 
@@ -178,7 +178,7 @@ def upsert_price_history(product_name, competitor, price,
     إذا كان أمس → يضيف سجلاً جديداً لتتبع التغيير.
     يرجع True إذا تغير السعر عن آخر تسجيل.
     """
-    conn = get_db()
+    with get_db() as conn:
     today = _date()
 
     # آخر سعر مسجل لهذا المنتج/المنافس
@@ -225,13 +225,13 @@ def upsert_price_history(product_name, competitor, price,
              diff, match_score, decision, product_id)
         )
 
-    conn.commit(); conn.close()
+    conn.commit(); # conn.close()
     return price_changed
 
 
 def get_price_history(product_name, competitor="", limit=30):
     try:
-        conn = get_db()
+        with get_db() as conn:
         if competitor:
             rows = conn.execute(
                 """SELECT * FROM price_history
@@ -245,7 +245,7 @@ def get_price_history(product_name, competitor="", limit=30):
                    ORDER BY date DESC LIMIT ?""",
                 (product_name, limit)
             ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except: return []
 
@@ -253,7 +253,7 @@ def get_price_history(product_name, competitor="", limit=30):
 def get_price_changes(days=7):
     """منتجات تغير سعرها خلال X يوم"""
     try:
-        conn = get_db()
+        with get_db() as conn:
         rows = conn.execute(
             """SELECT p1.product_name, p1.competitor,
                       p1.price as new_price, p2.price as old_price,
@@ -270,7 +270,7 @@ def get_price_changes(days=7):
                LIMIT 100""",
             (f"-{days} days",)
         ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except: return []
 
@@ -300,11 +300,11 @@ def save_job_progress(job_id, total, processed, results, status="running",
 
 def get_job_progress(job_id):
     try:
-        conn = get_db()
+        with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM job_progress WHERE job_id=?", (job_id,)
         ).fetchone()
-        conn.close()
+        # conn.close()
         if row:
             d = dict(row)
             try: d["results"] = json.loads(d.get("results_json", "[]"))
@@ -320,11 +320,11 @@ def get_job_progress(job_id):
 
 def get_last_job():
     try:
-        conn = get_db()
+        with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM job_progress ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        conn.close()
+        # conn.close()
         if row:
             d = dict(row)
             try: d["results"] = json.loads(d.get("results_json", "[]"))
@@ -341,31 +341,31 @@ def get_last_job():
 # ─── سجل التحليلات ─────────────────────────
 def log_analysis(our_file, comp_file, total, matched, missing, summary=""):
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             """INSERT INTO analysis_history
                (timestamp,our_file,comp_file,total_products,matched,missing,summary)
                VALUES (?,?,?,?,?,?,?)""",
             (_ts(), our_file, comp_file, total, matched, missing, summary)
         )
-        conn.commit(); conn.close()
+        conn.commit(); # conn.close()
     except: pass
 
 
 def get_analysis_history(limit=20):
     try:
-        conn = get_db()
+        with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM analysis_history ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except: return []
 
 
 def get_events(page=None, limit=50):
     try:
-        conn = get_db()
+        with get_db() as conn:
         if page:
             rows = conn.execute(
                 "SELECT * FROM events WHERE page=? ORDER BY id DESC LIMIT ?",
@@ -375,7 +375,7 @@ def get_events(page=None, limit=50):
             rows = conn.execute(
                 "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except: return []
 
@@ -384,7 +384,7 @@ def get_events(page=None, limit=50):
 def save_hidden_product(product_key: str, product_name: str = "", action: str = "hidden"):
     """يحفظ منتجاً مخفياً في قاعدة البيانات بشكل دائم"""
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO hidden_products
                (timestamp, product_key, product_name, action)
@@ -392,16 +392,16 @@ def save_hidden_product(product_key: str, product_name: str = "", action: str = 
             (_ts(), product_key, product_name, action)
         )
         conn.commit()
-        conn.close()
+        # conn.close()
     except:
         pass
 
 def get_hidden_product_keys() -> set:
     """يُرجع مجموعة كل مفاتيح المنتجات المخفية من قاعدة البيانات"""
     try:
-        conn = get_db()
+        with get_db() as conn:
         rows = conn.execute("SELECT product_key FROM hidden_products").fetchall()
-        conn.close()
+        # conn.close()
         return {r["product_key"] for r in rows}
     except:
         return set()
@@ -458,49 +458,47 @@ def init_db_v26(conn=None):
 
     c_conn.commit()
     if not conn:
-        c_conn.close()
+        c_# conn.close()
 
 
 def upsert_our_catalog(our_df, name_col="اسم المنتج", id_col="رقم المنتج", price_col="السعر"):
     """يُحدِّث كتالوج متجرنا عند كل رفع جديد — بدون تكرار"""
     import re
-    conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
     rows_updated = 0
     rows_inserted = 0
 
-    for _, row in our_df.iterrows():
-        name = str(row.get(name_col, "")).strip()
-        if not name:
-            continue
-        norm = re.sub(r'\s+', ' ', name.lower().strip())
-        pid  = str(row.get(id_col, "")).strip().rstrip(".0")
-        try:
-            price = float(str(row.get(price_col, 0)).replace(",", ""))
-        except Exception:
-            price = 0.0
+    with get_db() as conn:
+        for _, row in our_df.iterrows():
+            name = str(row.get(name_col, "")).strip()
+            if not name:
+                continue
+            norm = re.sub(r'\s+', ' ', name.lower().strip())
+            pid  = str(row.get(id_col, "")).strip().rstrip(".0")
+            try:
+                price = float(str(row.get(price_col, 0)).replace(",", ""))
+            except Exception:
+                price = 0.0
 
-        existing = conn.execute(
-            "SELECT id, price FROM our_catalog WHERE product_id=? OR norm_name=?",
-            (pid, norm)
-        ).fetchone()
+            existing = conn.execute(
+                "SELECT id, price FROM our_catalog WHERE product_id=? OR norm_name=?",
+                (pid, norm)
+            ).fetchone()
 
-        if existing:
-            conn.execute(
-                "UPDATE our_catalog SET price=?, last_seen=?, norm_name=? WHERE id=?",
-                (price, today, norm, existing[0])
-            )
-            rows_updated += 1
-        else:
-            conn.execute(
-                """INSERT INTO our_catalog (product_id, product_name, norm_name, price, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?)""",
-                (pid, name, norm, price, today, today)
-            )
-            rows_inserted += 1
-
-    conn.commit()
-    conn.close()
+            if existing:
+                conn.execute(
+                    "UPDATE our_catalog SET price=?, last_seen=?, norm_name=? WHERE id=?",
+                    (price, today, norm, existing[0])
+                )
+                rows_updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO our_catalog (product_id, product_name, norm_name, price, first_seen, last_seen)
+                       VALUES (?,?,?,?,?,?)""",
+                    (pid, name, norm, price, today, today)
+                )
+                rows_inserted += 1
+        conn.commit()
     return {"updated": rows_updated, "inserted": rows_inserted}
 
 
@@ -588,7 +586,7 @@ def _resolve_comp_name_price_columns(cdf):
 def upsert_comp_catalog(comp_dfs: dict):
     """يُحدِّث كتالوج المنافسين عند كل رفع جديد — بدون تكرار"""
     import re
-    conn = get_db()
+    with get_db() as conn:
     today = datetime.now().strftime("%Y-%m-%d")
     total_new = 0
     rows_updated = 0
@@ -663,7 +661,7 @@ def upsert_comp_catalog(comp_dfs: dict):
                 total_new += 1
 
     conn.commit()
-    conn.close()
+    # conn.close()
     return {"new_products": total_new, "updated": rows_updated}
 
 
@@ -690,14 +688,14 @@ def save_processed(product_key: str, product_name: str, competitor: str,
 
 def get_processed(limit=200) -> list:
     """يُعيد قائمة المنتجات المعالجة"""
-    conn = get_db()
+    with get_db() as conn:
     rows = conn.execute(
         """SELECT timestamp, product_key, product_name, competitor,
                   action, old_price, new_price, product_id, notes
            FROM processed_products ORDER BY timestamp DESC LIMIT ?""",
         (limit,)
     ).fetchall()
-    conn.close()
+    # conn.close()
     keys = ["timestamp","product_key","product_name","competitor",
             "action","old_price","new_price","product_id","notes"]
     return [dict(zip(keys, r)) for r in rows]
@@ -705,19 +703,19 @@ def get_processed(limit=200) -> list:
 
 def undo_processed(product_key: str) -> bool:
     """تراجع: إزالة المنتج من قائمة المعالجة"""
-    conn = get_db()
+    with get_db() as conn:
     conn.execute("DELETE FROM processed_products WHERE product_key=?", (product_key,))
     conn.execute("DELETE FROM hidden_products WHERE product_key=?", (product_key,))
     conn.commit()
-    conn.close()
+    # conn.close()
     return True
 
 
 def get_processed_keys() -> set:
     """مفاتيح المنتجات المعالجة لاستبعادها من القوائم"""
-    conn = get_db()
+    with get_db() as conn:
     rows = conn.execute("SELECT product_key FROM processed_products").fetchall()
-    conn.close()
+    # conn.close()
     return {r[0] for r in rows}
 
 
@@ -731,7 +729,7 @@ def migrate_db_v26():
     آمن للتشغيل المتكرر (idempotent).
     """
     try:
-        conn = get_db()
+        with get_db() as conn:
         cur = conn.cursor()
 
         # ── 1. جدول سجل الأتمتة ──
@@ -825,10 +823,10 @@ def migrate_db_v26():
                        VALUES ('v26.1', 'إضافة جداول competitors و competitor_aliases + resolve_competitor')""")
 
         conn.commit()
-        conn.close()
+        # conn.close()
     except Exception as e:
         _logger.error("Migration v26 error: %s", e)
-        try: conn.close()
+        try: # conn.close()
         except: pass
 
 
@@ -851,13 +849,13 @@ def resolve_competitor(name: str) -> str:
         return name
     clean = name.strip()
     try:
-        conn = get_db()
+        with get_db() as conn:
         row = conn.execute(
             "SELECT canonical_name FROM competitor_aliases "
             "WHERE alias = ? COLLATE NOCASE",
             (clean,)
         ).fetchone()
-        conn.close()
+        # conn.close()
         if row:
             return str(row["canonical_name"]).strip()
     except Exception as exc:
@@ -881,7 +879,7 @@ def add_competitor_alias(alias: str, canonical_name: str) -> bool:
     if not alias or not canonical_name:
         return False
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO competitor_aliases
                (alias, canonical_name, added_at)
@@ -889,7 +887,7 @@ def add_competitor_alias(alias: str, canonical_name: str) -> bool:
             (alias, canonical_name)
         )
         conn.commit()
-        conn.close()
+        # conn.close()
         return True
     except Exception as exc:
         _logger.error("add_competitor_alias error: %s", exc)
@@ -899,12 +897,12 @@ def add_competitor_alias(alias: str, canonical_name: str) -> bool:
 def get_all_aliases() -> list:
     """يُرجع كل الأسماء البديلة المسجلة مرتبة حسب الاسم الرسمي."""
     try:
-        conn = get_db()
+        with get_db() as conn:
         rows = conn.execute(
             "SELECT alias, canonical_name, added_at "
             "FROM competitor_aliases ORDER BY canonical_name"
         ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -919,14 +917,14 @@ def register_competitor(name: str, domain: str = "", notes: str = "") -> bool:
     if not name:
         return False
     try:
-        conn = get_db()
+        with get_db() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO competitors (name, domain, notes)
                VALUES (?, ?, ?)""",
             (name, domain.strip(), notes.strip())
         )
         conn.commit()
-        conn.close()
+        # conn.close()
         return True
     except Exception as exc:
         _logger.error("register_competitor error: %s", exc)
@@ -936,12 +934,12 @@ def register_competitor(name: str, domain: str = "", notes: str = "") -> bool:
 def get_all_competitors() -> list:
     """يُرجع كل المنافسين المسجلين في جدول competitors."""
     try:
-        conn = get_db()
+        with get_db() as conn:
         rows = conn.execute(
             "SELECT id, name, domain, is_active, added_at, notes "
             "FROM competitors ORDER BY name"
         ).fetchall()
-        conn.close()
+        # conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
