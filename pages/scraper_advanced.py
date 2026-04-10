@@ -18,12 +18,12 @@ from urllib.parse import urlparse
 import pandas as pd
 import streamlit as st
 
-# ── إعداد الصفحة ──────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="كاشط مهووس — تحكم متقدم",
-    page_icon="🕷️",
-    layout="wide",
-)
+if __name__ == "__main__":
+    st.set_page_config(
+        page_title="كاشط مهووس — تحكم متقدم",
+        page_icon="🕷️",
+        layout="wide",
+    )
 
 # ── CSS مخصص ──────────────────────────────────────────────────────────────
 st.markdown("""
@@ -349,151 +349,157 @@ def _mark_cp_skipped(domain: str, store_url: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  الصفحة الرئيسية
+#  دالة الدمج الرئيسية — يُستدعى منها app.py عند الدمج
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.title("🕷️ كاشط المنافسين — تحكم متقدم")
-st.caption("كشط مستقل لكل منافس مع استئناف ذكي من نقطة التوقف")
+def show():
+    """نقطة الدخول الرئيسية — يُستدعى من app.py لعرض الكشط المتقدم."""
+    st.title("🕷️ كاشط المنافسين — تحكم متقدم")
+    st.caption("كشط مستقل لكل منافس مع استئناف ذكي من نقطة التوقف")
 
-# — رسائل النظام —
-if msg := st.session_state.pop("_sc_msg", None):
-    getattr(st, msg[0])(msg[1])
+    # — رسائل النظام —
+    if msg := st.session_state.pop("_sc_msg", None):
+        getattr(st, msg[0])(msg[1])
 
-# ── إعدادات عامة (Sidebar) ────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("⚙️ إعدادات الكشط")
-    concurrency = st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="adv_concurrency")
-    all_flag    = st.checkbox("جميع المنتجات (بلا سقف)", value=True, key="adv_all")
-    max_prod    = st.number_input(
-        "أقصى منتجات / متجر", 0, 50000,
-        0 if all_flag else 1000, step=500,
-        disabled=all_flag, key="adv_max",
-    )
-    max_products = 0 if all_flag else max_prod
+    # ── إعدادات عامة (Sidebar) ────────────────────────────────────────────────
+    with st.sidebar:
+        st.subheader("⚙️ إعدادات الكشط")
+        concurrency = st.number_input("طلبات متزامنة", 2, 30, 8, step=1, key="adv_concurrency")
+        all_flag    = st.checkbox("جميع المنتجات (بلا سقف)", value=True, key="adv_all")
+        max_prod    = st.number_input(
+            "أقصى منتجات / متجر", 0, 50000,
+            0 if all_flag else 1000, step=500,
+            disabled=all_flag, key="adv_max",
+        )
+        max_products = 0 if all_flag else max_prod
 
-    st.divider()
-    st.subheader("🔄 استئناف ذكي")
-    state_data = _load_state()
-    done_count = sum(1 for c in state_data.values() if c.get("status") == "done")
-    err_count  = sum(1 for c in state_data.values() if c.get("status") == "error")
-    st.metric("✅ مكتمل", done_count)
-    st.metric("❌ أخطاء", err_count)
-    st.metric("📋 متاجر مسجلة", len(state_data))
+        st.divider()
+        st.subheader("🔄 استئناف ذكي")
+        state_data = _load_state()
+        done_count = sum(1 for c in state_data.values() if c.get("status") == "done")
+        err_count  = sum(1 for c in state_data.values() if c.get("status") == "error")
+        st.metric("✅ مكتمل", done_count)
+        st.metric("❌ أخطاء", err_count)
+        st.metric("📋 متاجر مسجلة", len(state_data))
 
-    if st.button("🗑️ مسح كل نقاط الاستئناف", use_container_width=True):
+        if st.button("🗑️ مسح كل نقاط الاستئناف", use_container_width=True):
+            try:
+                open(_STATE_FILE, "w", encoding="utf-8").write("{}")
+                st.session_state["_sc_msg"] = ("success", "تم مسح نقاط الاستئناف")
+            except Exception as e:
+                st.session_state["_sc_msg"] = ("error", str(e))
+            st.rerun()
+
+        st.divider()
+
+        # تشغيل الكل
+        prog_now   = _load_progress()
+        is_running = bool(prog_now.get("running", False))
+        if st.button(
+            "⏳ الكشط يعمل…" if is_running else "🚀 كشط جميع المتاجر",
+            disabled=is_running,
+            type="primary",
+            use_container_width=True,
+            key="adv_run_all",
+        ):
+            try:
+                subprocess.Popen(
+                    [sys.executable, _SCRAPER_SCRIPT,
+                     "--max-products", str(max_products),
+                     "--concurrency", str(int(concurrency))],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                st.session_state["_sc_msg"] = ("success", "🚀 الكشط الكلي بدأ في الخلفية")
+            except Exception as e:
+                st.session_state["_sc_msg"] = ("error", str(e))
+            st.rerun()
+
+    # ── لوحة المراقبة العامة ─────────────────────────────────────────────────
+    prog = _load_progress()
+    if prog.get("running"):
         try:
-            open(_STATE_FILE, "w", encoding="utf-8").write("{}")
-            st.session_state["_sc_msg"] = ("success", "تم مسح نقاط الاستئناف")
-        except Exception as e:
-            st.session_state["_sc_msg"] = ("error", str(e))
-        st.rerun()
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=3000, key="adv_autorefresh")
+        except ImportError:
+            pass
+        st.info(
+            f"🔄 **الكشط الكلي يعمل** — "
+            f"{prog.get('current_store','…')} | "
+            f"متاجر: {prog.get('stores_done',0)}/{prog.get('stores_total',1)}"
+        )
+
+    # ── إضافة متجر جديد ──────────────────────────────────────────────────────
+    st.subheader("➕ إضافة متجر منافس")
+    c1, c2 = st.columns([5, 1])
+    new_url = c1.text_input("رابط المتجر", placeholder="https://example.com",
+                             label_visibility="collapsed", key="adv_new_url")
+    if c2.button("➕ إضافة", use_container_width=True, key="adv_add_store"):
+        url = (new_url or "").strip()
+        if url:
+            if not url.startswith("http"):
+                url = "https://" + url
+            stores = _load_stores()
+            if url not in stores:
+                stores.append(url)
+                _save_stores(stores)
+                st.session_state["_sc_msg"] = ("success", f"✅ أُضيف: {url}")
+            else:
+                st.session_state["_sc_msg"] = ("warning", "الرابط موجود مسبقاً")
+            st.rerun()
 
     st.divider()
 
-    # تشغيل الكل
-    prog_now   = _load_progress()
-    is_running = bool(prog_now.get("running", False))
-    if st.button(
-        "⏳ الكشط يعمل…" if is_running else "🚀 كشط جميع المتاجر",
-        disabled=is_running,
-        type="primary",
-        use_container_width=True,
-        key="adv_run_all",
-    ):
-        try:
-            subprocess.Popen(
-                [sys.executable, _SCRAPER_SCRIPT,
-                 "--max-products", str(max_products),
-                 "--concurrency", str(int(concurrency))],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            st.session_state["_sc_msg"] = ("success", "🚀 الكشط الكلي بدأ في الخلفية")
-        except Exception as e:
-            st.session_state["_sc_msg"] = ("error", str(e))
-        st.rerun()
+    # ── قائمة المنافسين مع أزرار التحكم الفردية ─────────────────────────────
+    stores_list = _load_stores()
 
-# ── لوحة المراقبة العامة ─────────────────────────────────────────────────
-prog = _load_progress()
-if prog.get("running"):
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=3000, key="adv_autorefresh")
-    except ImportError:
-        pass
-    st.info(
-        f"🔄 **الكشط الكلي يعمل** — "
-        f"{prog.get('current_store','…')} | "
-        f"متاجر: {prog.get('stores_done',0)}/{prog.get('stores_total',1)}"
-    )
+    if not stores_list:
+        st.info("لا توجد متاجر — أضف رابطاً للبدء")
+    else:
+        st.subheader(f"🏪 {len(stores_list)} متجر مستهدف")
 
-# ── إضافة متجر جديد ──────────────────────────────────────────────────────
-st.subheader("➕ إضافة متجر منافس")
-c1, c2 = st.columns([5, 1])
-new_url = c1.text_input("رابط المتجر", placeholder="https://example.com",
-                         label_visibility="collapsed", key="adv_new_url")
-if c2.button("➕ إضافة", use_container_width=True, key="adv_add_store"):
-    url = (new_url or "").strip()
-    if url:
-        if not url.startswith("http"):
-            url = "https://" + url
-        stores = _load_stores()
-        if url not in stores:
-            stores.append(url)
-            _save_stores(stores)
-            st.session_state["_sc_msg"] = ("success", f"✅ أُضيف: {url}")
-        else:
-            st.session_state["_sc_msg"] = ("warning", "الرابط موجود مسبقاً")
-        st.rerun()
+        # فلتر سريع
+        filter_status = st.selectbox(
+            "فلتر الحالة",
+            ["الكل", "✅ مكتمل", "❌ خطأ", "⏳ جاري", "⏸️ معلق"],
+            key="adv_filter_status",
+        )
+        status_map = {
+            "✅ مكتمل": "done", "❌ خطأ": "error",
+            "⏳ جاري": "running", "⏸️ معلق": "pending"
+        }
 
-st.divider()
+        for i, surl in enumerate(stores_list):
+            d  = _domain(surl)
+            cp = _get_store_checkpoint(d)
+            current_status = cp.get("status", "pending")
 
-# ── قائمة المنافسين مع أزرار التحكم الفردية ─────────────────────────────
-stores_list = _load_stores()
+            if filter_status != "الكل":
+                wanted = status_map.get(filter_status, "")
+                if current_status != wanted:
+                    continue
 
-if not stores_list:
-    st.info("لا توجد متاجر — أضف رابطاً للبدء")
-else:
-    st.subheader(f"🏪 {len(stores_list)} متجر مستهدف")
+            render_competitor_card(surl, i, int(concurrency), max_products)
 
-    # فلتر سريع
-    filter_status = st.selectbox(
-        "فلتر الحالة",
-        ["الكل", "✅ مكتمل", "❌ خطأ", "⏳ جاري", "⏸️ معلق"],
-        key="adv_filter_status",
-    )
-    status_map = {
-        "✅ مكتمل": "done", "❌ خطأ": "error",
-        "⏳ جاري": "running", "⏸️ معلق": "pending"
-    }
+    # ── لوحة ملخص Checkpoints ────────────────────────────────────────────────
+    if state_data:
+        st.divider()
+        with st.expander("📋 تفاصيل نقاط الاستئناف (scraper_state.json)", expanded=False):
+            rows = []
+            for d, cp in state_data.items():
+                rows.append({
+                    "المتجر":        d,
+                    "الحالة":        cp.get("status", "pending"),
+                    "منتجات":        cp.get("rows_saved", 0),
+                    "روابط (تمت)":   cp.get("urls_done", 0),
+                    "روابط (كلي)":   cp.get("urls_total", 0),
+                    "آخر نقطة":      str(cp.get("last_checkpoint_at", ""))[:16],
+                    "اكتمل":         str(cp.get("finished_at", ""))[:16],
+                    "خطأ":           str(cp.get("error", ""))[:40],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    for i, surl in enumerate(stores_list):
-        d  = _domain(surl)
-        cp = _get_store_checkpoint(d)
-        current_status = cp.get("status", "pending")
 
-        if filter_status != "الكل":
-            wanted = status_map.get(filter_status, "")
-            if current_status != wanted:
-                continue
-
-        render_competitor_card(surl, i, int(concurrency), max_products)
-
-# ── لوحة ملخص Checkpoints ────────────────────────────────────────────────
-if state_data:
-    st.divider()
-    with st.expander("📋 تفاصيل نقاط الاستئناف (scraper_state.json)", expanded=False):
-        rows = []
-        for d, cp in state_data.items():
-            rows.append({
-                "المتجر":        d,
-                "الحالة":        cp.get("status", "pending"),
-                "منتجات":        cp.get("rows_saved", 0),
-                "روابط (تمت)":   cp.get("urls_done", 0),
-                "روابط (كلي)":   cp.get("urls_total", 0),
-                "آخر نقطة":      str(cp.get("last_checkpoint_at", ""))[:16],
-                "اكتمل":         str(cp.get("finished_at", ""))[:16],
-                "خطأ":           str(cp.get("error", ""))[:40],
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+if __name__ == "__main__":
+    show()
