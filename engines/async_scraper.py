@@ -368,17 +368,28 @@ async def fetch_product(
         if ld_match:
             try:
                 ld = json.loads(ld_match.group(1))
-                if isinstance(ld, list):
+                if isinstance(ld, dict) and "@graph" in ld:
+                    ld = next((x for x in ld["@graph"] if x.get("@type") == "Product"), {})
+                elif isinstance(ld, list):
                     ld = next((x for x in ld if x.get("@type") == "Product"), {})
+                
                 if ld.get("@type") == "Product":
                     offer = ld.get("offers", {})
                     if isinstance(offer, list):
                         offer = offer[0] if offer else {}
                     imgs = ld.get("image", "")
                     img  = imgs[0] if isinstance(imgs, list) else imgs
+                    # ─── v26.1: تحسين استخراج السعر لـ worldgivenchy ───
+                    ld_price = offer.get("price", 0)
+                    if not ld_price and "worldgivenchy.com" in store_url:
+                        # أحياناً يكون السعر في حقل priceSpecification أو غيره
+                        spec = offer.get("priceSpecification", {})
+                        if isinstance(spec, dict):
+                            ld_price = spec.get("price", 0)
+
                     row  = extract_product({
                         "name":  ld.get("name", ""),
-                        "price": offer.get("price", 0),
+                        "price": ld_price,
                         "image": img,
                         "brand": (ld.get("brand") or {}).get("name", "") if isinstance(ld.get("brand"), dict) else str(ld.get("brand", "")),
                         "url":   url,
@@ -387,8 +398,8 @@ async def fetch_product(
                     }, store_url)
                     if row:
                         return row
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"JSON-LD error for {url}: {e}")
 
         # og:meta
         def _meta(prop: str) -> str:
@@ -399,6 +410,29 @@ async def fetch_product(
             return m.group(1).strip() if m else ""
 
         pname = _meta("title")
+        
+        # ─── v26.1: تحسين استخراج البيانات من HTML لـ worldgivenchy ───
+        if "worldgivenchy.com" in store_url:
+            # محاولة استخراج الاسم والسعر من الـ HTML مباشرة
+            # الأنماط الملاحظة في worldgivenchy
+            h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S | re.I)
+            name = h1_match.group(1).strip() if h1_match else pname
+            
+            # استخراج السعر من الأنماط المتوقعة (مثلاً: <span class="price">750</span>)
+            price = 0.0
+            price_match = re.search(r'class="[^"]*price[^"]*".*?>([\d,.]+)', html, re.I)
+            if price_match:
+                try:
+                    price = float(price_match.group(1).replace(",", ""))
+                except:
+                    pass
+            
+            if name and name != "شركه عالم جيفينشي التجارية":
+                return extract_product(
+                    {"name": name, "image": _meta("image"), "url": url, "price": price},
+                    store_url,
+                )
+
         if pname:
             return extract_product(
                 {"name": pname, "image": _meta("image"), "url": url, "price": 0},

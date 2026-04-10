@@ -286,23 +286,53 @@ def _filter_product_entries(entries: List[SitemapEntry], base: str) -> List[Site
     """يُبقي فقط صفحات المنتجات ويُزيل CDN/blog/static."""
     salla = _is_salla(base)
     product_entries: List[SitemapEntry] = []
+    
+    # ─── v26.1: تحسين لـ worldgivenchy والمواقع متعددة اللغات ───
+    import urllib.parse
+    is_worldgivenchy = "worldgivenchy.com" in base.lower()
+    seen_slugs = set()
 
     for e in entries:
         try:
             p = urlparse(e.url)
         except Exception:
             continue
+        
+        # فك تشفير الرابط للتعامل مع الحروف العربية في الفلترة
+        url_decoded = urllib.parse.unquote(e.url).lower()
+        url_lower = e.url.lower()
         host = (p.netloc or "").lower()
+        
         if "cdn." in host:
             continue
         if _EXCLUDE_URL_RE.search(e.url):
             continue
+            
+        # ─── فلاتر خاصة بـ worldgivenchy ───
+        if is_worldgivenchy:
+            # تجاهل النسخة الإنجليزية لتجنب التكرار (نفضل العربي)
+            if "/en/" in url_lower:
+                continue
+            # تجاهل صفحات التصنيفات والروابط العامة التي تتبع نمط /p/
+            bad_keywords = [
+                "/tester", "/الاسئلة-الشائعة", "/brands", "/category",
+                "/التوصيل-والاستلام", "/خدمة-التوصيل", "/خدمة-تغليف", "/لماذا-تختار",
+                "/سياسة-الاستبدال", "/اتصل-بنا", "/من-نحن", "/الخصوصية",
+                "/الدفع-والشحن", "/المتجر", "/brands", "/all", "/faq",
+                "/تجهيز-الطلبات", "/اربح-معنا", "شركه-عالم-جيفينشي-التجارية"
+            ]
+            if any(x in url_decoded for x in bad_keywords):
+                continue
 
         if salla:
             if _is_salla_product(e.url):
                 product_entries.append(e)
         elif _is_product_url(e.url):
-            product_entries.append(e)
+            # منع تكرار نفس المنتج بلغات مختلفة عبر فحص الـ slug الأخير
+            slug = p.path.rstrip('/').split('/')[-1]
+            if slug and slug not in seen_slugs:
+                product_entries.append(e)
+                seen_slugs.add(slug)
 
     return product_entries
 
