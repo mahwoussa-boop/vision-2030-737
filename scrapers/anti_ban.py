@@ -1,17 +1,9 @@
 """
-scrapers/anti_ban.py — ترسانة ضد الحظر v2.0 (2026)  *** MASTER ***
+scrapers/anti_ban.py — ترسانة ضد الحظر v2.1 (2026)  *** MASTER ***
 ═══════════════════════════════════════════════════════════════════════
-هذا الملف هو المصدر الوحيد للحقيقة (Single Source of Truth).
-engines/anti_ban.py و make/anti_ban.py مجرد Shims تستورد منه.
-
-آليات متعددة الطبقات لتجاوز حماية المتاجر:
-  1. User-Agent ذكي — إصدارات 2026 من Chrome/Firefox/Safari/Edge
-  2. Headers تحاكي المتصفح الحقيقي (Sec-CH-UA + TLS fingerprint)
-  3. Adaptive Rate Limiting — يبطّئ تلقائياً عند 429/403
-  4. Exponential Backoff مع Jitter
-  5. curl_cffi كـ fallback أساسي (TLS fingerprint حقيقي — أحدث من cloudscraper)
-  6. cloudscraper كـ fallback ثانوي
-  7. Per-domain throttling + cookie persistence
+✅ تم الإصلاح: منع تسرب اتصالات Aiohttp (Memory Leaks)
+✅ تم الإصلاح: Connection Pooling لمحركات الـ Fallback لتخفيف الـ CPU
+✅ تم الإصلاح: تمرير Timeouts للسيطرة الكاملة على الـ Threads
 """
 from __future__ import annotations
 
@@ -19,11 +11,18 @@ import asyncio
 import logging
 import random
 import time
+import threading
+import warnings
 from collections import defaultdict
 from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
+
+# تجاهل تحذيرات SSL المزعجة في الـ Terminal لتنظيف الـ Logs
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 logger = logging.getLogger(__name__)
 
@@ -31,26 +30,18 @@ logger = logging.getLogger(__name__)
 #  1. User-Agents — قاعدة بيانات حقيقية من متصفحات 2026
 # ══════════════════════════════════════════════════════════════════════════
 _REAL_UA_POOL = [
-    # Chrome 134/133/132 — Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    # Chrome 134/133 — macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    # Firefox 135/134
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:134.0) Gecko/20100101 Firefox/134.0",
     "Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    # Safari 18
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
-    # Edge 134
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
-    # Mobile Chrome (Android 15)
     "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.99 Mobile Safari/537.36",
-    # Mobile Safari (iOS 18)
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1",
-    # Googlebot — يُقبل دائماً من المتاجر لأنه يُستخدم لأرشفة المنتجات
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
 ]
@@ -89,26 +80,30 @@ def get_browser_headers(referer: str = "") -> dict:
     if referer:
         headers["Referer"] = referer
         headers["Sec-Fetch-Site"] = "cross-site"
-    # Chrome-style sec-ch-ua
-    if "Chrome" in ua and "Edg" not in ua:
-        major = ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in ua else "134"
-        headers.update({
-            "sec-ch-ua":          f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile":   "?0" if "Mobile" not in ua else "?1",
-            "sec-ch-ua-platform": '"Windows"' if "Windows" in ua else ('"macOS"' if "Mac" in ua else '"Android"'),
-        })
-    elif "Edg" in ua:
-        major = ua.split("Edg/")[1].split(".")[0] if "Edg/" in ua else "134"
-        headers.update({
-            "sec-ch-ua":          f'"Chromium";v="{major}", "Microsoft Edge";v="{major}", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile":   "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        })
+        
+    try:
+        if "Chrome" in ua and "Edg" not in ua:
+            major = ua.split("Chrome/")[1].split(".")[0] if "Chrome/" in ua else "134"
+            headers.update({
+                "sec-ch-ua":          f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile":   "?0" if "Mobile" not in ua else "?1",
+                "sec-ch-ua-platform": '"Windows"' if "Windows" in ua else ('"macOS"' if "Mac" in ua else '"Android"'),
+            })
+        elif "Edg" in ua:
+            major = ua.split("Edg/")[1].split(".")[0] if "Edg/" in ua else "134"
+            headers.update({
+                "sec-ch-ua":          f'"Chromium";v="{major}", "Microsoft Edge";v="{major}", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile":   "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            })
+    except IndexError:
+        pass # تجاوز آمن في حال تغيير صيغة User-Agent
+
     return headers
 
 
 def get_xml_headers() -> dict:
-    """رؤوس خاصة بطلبات Sitemap XML — تطلب XML صراحة وتحاكي Googlebot."""
+    """رؤوس خاصة بطلبات Sitemap XML."""
     ua = random.choice([
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -124,16 +119,9 @@ def get_xml_headers() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  2. Adaptive Rate Limiter — يتكيف مع ردود الخادم
+#  2. Adaptive Rate Limiter
 # ══════════════════════════════════════════════════════════════════════════
 class AdaptiveRateLimiter:
-    """
-    يتتبع معدل الطلبات لكل domain ويضبطه تلقائياً:
-    - 429 Too Many Requests  → تضاعف وقت الانتظار (Exponential Backoff)
-    - 403 Forbidden          → توقف مؤقت طويل + تغيير UA
-    - 200 متواصلة            → تقليص الانتظار تدريجياً (Speed Up)
-    """
-
     def __init__(self):
         self._state: dict[str, dict] = defaultdict(lambda: {
             "delay":          random.uniform(0.5, 1.5),
@@ -180,13 +168,12 @@ class AdaptiveRateLimiter:
 
 _rate_limiter = AdaptiveRateLimiter()
 
-
 def get_rate_limiter() -> AdaptiveRateLimiter:
     return _rate_limiter
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  3. Retry مع Exponential Backoff
+#  3. Retry مع Exponential Backoff (Fixed Memory Leaks)
 # ══════════════════════════════════════════════════════════════════════════
 async def fetch_with_retry(
     session: aiohttp.ClientSession,
@@ -196,7 +183,7 @@ async def fetch_with_retry(
     base_delay:  float = 2.0,
     referer:     str = "",
 ) -> Optional[aiohttp.ClientResponse]:
-    """يجلب URL مع إعادة محاولة + تغيير headers في كل محاولة."""
+    """يجلب URL مع إعادة محاولة + حماية الذاكرة من تسرب الاتصالات (resp.close)."""
     domain = urlparse(url).netloc
     rl = get_rate_limiter()
 
@@ -208,24 +195,27 @@ async def fetch_with_retry(
 
             if resp.status == 200:
                 rl.record_success(domain)
-                return resp
+                return resp  # الاتصال يبقى مفتوحاً لأن المستدعي سيقرأه
 
             rl.record_error(domain, resp.status)
 
             if resp.status in (404, 410):
+                resp.close()  # ✅ إغلاق الاتصال المرفوض لمنع تسرب الذاكرة
                 return None
+                
             if resp.status in (429, 403, 500, 502, 503):
+                resp.close()  # ✅ إغلاق الاتصال قبل الانتظار والمحاولة مجدداً
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 3)
-                logger.debug("attempt %d/%d → %d, سينتظر %.1fs",
-                             attempt + 1, max_retries, resp.status, delay)
+                logger.debug("attempt %d/%d → %d, سينتظر %.1fs", attempt + 1, max_retries, resp.status, delay)
                 await asyncio.sleep(delay)
                 continue
 
+            resp.close() # ✅ إغلاق الاتصال للحالات الأخرى
             return None
 
         except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
             delay = base_delay * (2 ** attempt) + random.uniform(0, 2)
-            logger.debug("attempt %d: %s — انتظار %.1fs", attempt + 1, exc, delay)
+            logger.debug("attempt %d: %s — انتظار %.1fs", attempt + 1, type(exc).__name__, delay)
             await asyncio.sleep(delay)
         except Exception as exc:
             logger.debug("fetch_with_retry unexpected: %s", exc)
@@ -235,81 +225,112 @@ async def fetch_with_retry(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  4. curl_cffi — TLS Fingerprint حقيقي (يتجاوز Cloudflare/Akamai)
+#  Global Fallback Sessions (Thread-Safe) لمنع احتراق الـ CPU
+# ══════════════════════════════════════════════════════════════════════════
+_SESSION_LOCK = threading.Lock()
+_CFFI_SESSION = None
+_CLOUD_SCRAPER = None
+_REQ_SESSION = None
+
+def _get_cffi_session():
+    global _CFFI_SESSION
+    if _CFFI_SESSION is None:
+        with _SESSION_LOCK:
+            if _CFFI_SESSION is None:
+                try:
+                    from curl_cffi import requests as cffi_requests
+                    _CFFI_SESSION = cffi_requests.Session(impersonate="chrome110")
+                except ImportError:
+                    pass
+    return _CFFI_SESSION
+
+def _get_cloudscraper():
+    global _CLOUD_SCRAPER
+    if _CLOUD_SCRAPER is None:
+        with _SESSION_LOCK:
+            if _CLOUD_SCRAPER is None:
+                try:
+                    import cloudscraper
+                    _CLOUD_SCRAPER = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                    )
+                except ImportError:
+                    pass
+    return _CLOUD_SCRAPER
+
+def _get_req_session():
+    global _REQ_SESSION
+    if _REQ_SESSION is None:
+        with _SESSION_LOCK:
+            if _REQ_SESSION is None:
+                import requests
+                _REQ_SESSION = requests.Session()
+    return _REQ_SESSION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  4. curl_cffi — TLS Fingerprint حقيقي 
 # ══════════════════════════════════════════════════════════════════════════
 def try_curl_cffi(url: str, timeout: int = 25) -> Optional[str]:
-    """
-    يحاول جلب الصفحة عبر curl_cffi الذي ينتحل بصمة TLS لـ Chrome الحقيقي.
-    هذا أحدث وأنجح من cloudscraper لأنه يستخدم libcurl مع impersonation.
-    """
+    session = _get_cffi_session()
+    if session is None:
+        return None
     try:
-        from curl_cffi import requests as cffi_requests
-        resp = cffi_requests.get(
-            url,
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
-        )
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
         if resp.status_code == 200:
             return resp.text
-    except ImportError:
-        logger.debug("curl_cffi غير مثبّت — تخطّى")
     except Exception as exc:
-        logger.debug("curl_cffi %s: %s", url, exc)
+        logger.debug("curl_cffi %s: %s", url, type(exc).__name__)
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  5. cloudscraper — Fallback ثانوي لـ Cloudflare JS Challenge
+#  5. cloudscraper — Fallback ثانوي 
 # ══════════════════════════════════════════════════════════════════════════
-def try_cloudscraper(url: str) -> Optional[str]:
-    """يحاول جلب الصفحة عبر cloudscraper (يتجاوز JS Challenge)."""
+def try_cloudscraper(url: str, timeout: int = 25) -> Optional[str]:
+    scraper = _get_cloudscraper()
+    if scraper is None:
+        return None
     try:
-        import cloudscraper
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        resp = scraper.get(url, timeout=20)
+        resp = scraper.get(url, timeout=timeout)
         if resp.status_code == 200:
             return resp.text
-    except ImportError:
-        pass
     except Exception as exc:
-        logger.debug("cloudscraper %s: %s", url, exc)
+        logger.debug("cloudscraper %s: %s", url, type(exc).__name__)
     return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  6. سلسلة الـ Fallback الكاملة (مزامن — يُستدعى من executor)
 # ══════════════════════════════════════════════════════════════════════════
-def try_all_sync_fallbacks(url: str) -> Optional[str]:
-    """يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests بسيط مع معالجة أفضل لـ Cloudflare."""
+def try_all_sync_fallbacks(url: str, timeout: int = 25) -> Optional[str]:
+    """
+    يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests.
+    ✅ يستقبل timeout لمنع الـ Threads من التعلق إلى الأبد.
+    """
     # المحاولة 1: curl_cffi مع انتحال شخصية Chrome (الأقوى حالياً)
-    html = try_curl_cffi(url)
+    html = try_curl_cffi(url, timeout=timeout)
     if html and not looks_like_bot_challenge(html):
         return html
 
     # المحاولة 2: cloudscraper (حل كلاسيكي لـ Cloudflare JS Challenge)
-    html_cs = try_cloudscraper(url)
+    html_cs = try_cloudscraper(url, timeout=timeout)
     if html_cs and not looks_like_bot_challenge(html_cs):
         return html_cs
 
     # المحاولة 3: requests مع رؤوس متصفح حقيقية (Fallback نهائي)
     try:
-        import requests as _req
         headers = get_browser_headers(referer=f"https://{urlparse(url).netloc}/")
-        # استخدام Session للحفاظ على الكوكيز في حال وجود تحويلات
-        with _req.Session() as session:
-            resp = session.get(url, headers=headers, timeout=25, allow_redirects=True, verify=False)
-            if resp.status_code == 200:
-                if not looks_like_bot_challenge(resp.text):
-                    return resp.text
-                # إذا كانت صفحة تحدي، نحتفظ بها لعلنا نستخرج منها Meta tags لاحقاً
+        session = _get_req_session()
+        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True, verify=False)
+        
+        if resp.status_code == 200:
+            if not looks_like_bot_challenge(resp.text):
                 return resp.text
+            return resp.text
     except Exception as exc:
-        logger.debug("requests fallback %s: %s", url, exc)
+        logger.debug("requests fallback %s: %s", url, type(exc).__name__)
 
-    # إذا وصلنا هنا وفشلنا في الحصول على HTML نظيف، نرجع آخر محاولة حصلنا عليها (حتى لو كانت تحدي)
     return html or html_cs or None
 
 def looks_like_bot_challenge(html: str) -> bool:
