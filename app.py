@@ -1621,6 +1621,7 @@ with st.sidebar:
                 st.rerun()
             elif job["status"].startswith("error"):
                 st.error(f"❌ فشل: {job['status'][7:80]}")
+    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed", key="main_nav")
     st.markdown("---")
     if st.session_state.results:
         r = st.session_state.results
