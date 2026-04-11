@@ -108,10 +108,28 @@ try:
 except Exception as _mf_import_err:
     _magic_factory_mod = None
 
-try:
-    import pages.scraper_advanced as _scraper_advanced_mod
-except Exception as _sa_import_err:
-    _scraper_advanced_mod = None
+_scraper_advanced_mod = None
+_scraper_advanced_import_error = None
+
+
+def _get_scraper_advanced_module():
+    """
+    تحميل كسول لأدوات الكشط المتقدمة.
+    مهم جداً لنسخة Streamlit Cloud لأن تنفيذ أوامر واجهة عند الاستيراد المبكر
+    قد يؤدي إلى رندر جزئي أو شاشة فارغة قبل اكتمال الصفحة الرئيسية.
+    """
+    global _scraper_advanced_mod, _scraper_advanced_import_error
+    if _scraper_advanced_mod is not None:
+        return _scraper_advanced_mod
+    if _scraper_advanced_import_error is not None:
+        return None
+    try:
+        import importlib
+        _scraper_advanced_mod = importlib.import_module("pages.scraper_advanced")
+        return _scraper_advanced_mod
+    except Exception as _sa_import_err:
+        _scraper_advanced_import_error = _sa_import_err
+        return None
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1603,39 +1621,41 @@ with st.sidebar:
                 st.rerun()
             elif job["status"].startswith("error"):
                 st.error(f"❌ فشل: {job['status'][7:80]}")
-                st.session_state.job_running = False
-
-    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed", key="main_nav")
-
     st.markdown("---")
     if st.session_state.results:
         r = st.session_state.results
         _all_df_summary = r.get("all", pd.DataFrame())
         _analysis_total = len(_all_df_summary) if isinstance(_all_df_summary, pd.DataFrame) else 0
-        st.markdown("**📊 ملخص آخر تحليل:**")
-        if _analysis_total:
-            st.caption(f"يعرض توزيع **{_analysis_total:,}** من منتجاتنا المحللة، وليس عدد صفوف ملف المنافس.")
-        for key, icon, label in [
-            ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
-            ("approved","✅","موافق"), ("missing","🔍","مفقود"),
-            ("review","⚠️","مراجعة"), ("excluded","⚪","مستبعد"),
-        ]:
-            cnt = len(r.get(key, pd.DataFrame()))
-            st.caption(f"{icon} {label}: **{cnt}**")
-        # ملخص الثقة للمفقودات
-        _miss_df = r.get("missing", pd.DataFrame())
-        if not _miss_df.empty and "مستوى_الثقة" in _miss_df.columns:
-            _gc = len(_miss_df[_miss_df["مستوى_الثقة"] == "green"])
-            _yc = len(_miss_df[_miss_df["مستوى_الثقة"] == "yellow"])
-            _rc = len(_miss_df[_miss_df["مستوى_الثقة"] == "red"])
-            st.markdown(
-                f'<div style="background:#1a1a2e;border-radius:6px;padding:6px;margin-top:4px;font-size:.75rem">'
-                f'🟢 مؤكد: <b>{_gc}</b> &nbsp; '
-                f'🟡 محتمل: <b>{_yc}</b> &nbsp; '
-                f'🔴 مشكوك: <b>{_rc}</b></div>',
-                unsafe_allow_html=True)
+        _is_scraper_page = page == "🕷️ كشط المنافسين"
 
-    # قرارات معلقة
+        if _is_scraper_page:
+            st.info(
+                "📊 توجد نتائج تحليل محفوظة، لكن تم إخفاء ملخصها هنا حتى لا يختلط مع أرقام الكشط الحالية. "
+                "يمكنك مراجعة الملخص الكامل من صفحة «📊 لوحة التحكم»."
+            )
+        else:
+            st.markdown("**📊 ملخص آخر تحليل:**")
+            if _analysis_total:
+                st.caption(f"يعرض توزيع **{_analysis_total:,}** من منتجاتنا المحللة، وليس عدد صفوف ملف المنافس.")
+            for key, icon, label in [
+                ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
+                ("approved","✅","موافق"), ("missing","🔍","مفقود"),
+                ("review","⚠️","مراجعة"), ("excluded","⚪","مستبعد"),
+            ]:
+                cnt = len(r.get(key, pd.DataFrame()))
+                st.caption(f"{icon} {label}: **{cnt}**")
+
+            _miss_df = r.get("missing", pd.DataFrame())
+            if not _miss_df.empty and "مستوى_الثقة" in _miss_df.columns:
+                _gc = len(_miss_df[_miss_df["مستوى_الثقة"] == "green"])
+                _yc = len(_miss_df[_miss_df["مستوى_الثقة"] == "yellow"])
+                _rc = len(_miss_df[_miss_df["مستوى_الثقة"] == "red"])
+                st.markdown(
+                    f'<div style="background:#1a1a2e;border-radius:6px;padding:6px;margin-top:4px;font-size:.75rem">'
+                    f'🟢 مؤكد: <b>{_gc}</b> &nbsp; '
+                    f'🟡 محتمل: <b>{_yc}</b> &nbsp; '
+                    f'🔴 مشكوك: <b>{_rc}</b></div>',
+                    unsafe_allow_html=True)
     pending_cnt = len(st.session_state.decisions_pending)
     if pending_cnt:
         st.markdown(f'<div style="background:#FF174422;border:1px solid #FF1744;'
@@ -3405,6 +3425,41 @@ elif page == "🕷️ كشط المنافسين":
             with open(_COMPETITORS_FILE, "w", encoding="utf-8") as fh:
                 fh.write(content)
 
+    def _load_scraper_state_map() -> dict:
+        _state_file = _os_scraper.path.join(_DATA_SC, "scraper_state.json")
+        try:
+            if not _os_scraper.path.exists(_state_file):
+                return {}
+            with open(_state_file, "r", encoding="utf-8") as sf:
+                data = _json_sc.loads(sf.read() or "{}")
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @st.cache_data(ttl=5, show_spinner=False)
+    def _load_csv_rows_by_store(_csv_path: str) -> dict:
+        try:
+            if not _os_scraper.path.exists(_csv_path):
+                return {}
+            _df_store = pd.read_csv(_csv_path, usecols=["store"], encoding="utf-8-sig", low_memory=False)
+            if "store" not in _df_store.columns:
+                return {}
+            _counts = _df_store["store"].astype(str).value_counts(dropna=False)
+            return {str(k): int(v) for k, v in _counts.to_dict().items()}
+        except Exception:
+            return {}
+
+    def _read_live_store_progress(domain: str) -> dict:
+        _live_file = _os_scraper.path.join(_DATA_SC, f"_sc_live_{domain}.json")
+        try:
+            if not _os_scraper.path.exists(_live_file):
+                return {}
+            with open(_live_file, "r", encoding="utf-8") as lf:
+                data = _json_sc.loads(lf.read() or "{}")
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
     # ════════════════════════════════════════════════════════════════════════
     #  الحصول على الحالة الحقيقية — مرة واحدة فقط لكل render cycle
     # ════════════════════════════════════════════════════════════════════════
@@ -3894,6 +3949,8 @@ elif page == "🕷️ كشط المنافسين":
 
         # ── قائمة المتاجر التفصيلية ──────────────────────────────────────
         _all_stores_list = _load_stores()
+        _state_map = _load_scraper_state_map()
+        _csv_counts = _load_csv_rows_by_store(_OUTPUT_CSV)
         if _all_stores_list:
             st.markdown("**📋 تفاصيل المتاجر:**")
             _html_items = []
@@ -3902,22 +3959,39 @@ elif page == "🕷️ كشط المنافسين":
                     _surl.replace("https://", "").replace("http://", "")
                     .rstrip("/").split("/")[0]
                 )
-                _cnt = _stores_res.get(_d)
+                _cp = _state_map.get(_d, {}) if isinstance(_state_map, dict) else {}
+                _live = _read_live_store_progress(_d)
+                _cnt_candidates = [
+                    _stores_res.get(_d),
+                    _cp.get("rows_saved"),
+                    _live.get("rows_saved"),
+                    _csv_counts.get(_d),
+                ]
+                _cnt = None
+                for _candidate in _cnt_candidates:
+                    try:
+                        if _candidate is not None:
+                            _candidate_int = int(_candidate)
+                            _cnt = max(_cnt or 0, _candidate_int)
+                    except Exception:
+                        continue
 
                 if _d == _current and _is_alive:
-                    # المتجر الجاري كشطه الآن
-                    _cbar = int(min(_s_urls_done / _s_urls_tot, 1.0) * 100) if _s_urls_tot > 1 else 0
+                    _live_urls_done = int(_live.get("urls_done", _s_urls_done) or 0)
+                    _live_urls_total = max(int(_live.get("urls_total", _s_urls_tot) or 1), 1)
+                    _live_rows = max(int(_live.get("rows_saved", 0) or 0), int(_cnt or 0))
+                    _cbar = int(min(_live_urls_done / _live_urls_total, 1.0) * 100) if _live_urls_total > 1 else 0
                     _item = (
                         f'<div style="background:#0a1a2a;border:1px solid #4fc3f7;'
                         f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
                         f'🔄 <b style="color:#4fc3f7">{_si+1}. {_d}</b>'
-                        f'<span style="color:#9e9e9e"> — {_s_urls_done:,}/{_s_urls_tot:,} رابط</span>'
+                        f'<span style="color:#9e9e9e"> — {_live_urls_done:,}/{_live_urls_total:,} رابط</span>'
+                        f'<span style="color:#4fc3f7"> — {_live_rows:,} منتج محفوظ</span>'
                         f'<div style="margin-top:4px;height:4px;background:#1a2a3a;border-radius:2px">'
                         f'<div style="width:{_cbar}%;height:100%;background:#4fc3f7;border-radius:2px"></div>'
                         f'</div></div>'
                     )
                 elif _cnt is not None:
-                    # متجر اكتمل مع عدد منتجاته
                     _item = (
                         f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
                         f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
@@ -3925,17 +3999,22 @@ elif page == "🕷️ كشط المنافسين":
                         f'<span style="color:#00C853"> — {_cnt:,} منتج</span>'
                         f'</div>'
                     )
-                elif _si < _stores_done:
-                    # اكتمل لكن 0 منتجات
+                elif _cp.get("status") == "done" or _si < _stores_done:
                     _item = (
                         f'<div style="background:#0a1a0a;border:1px solid #1e3a1e;'
                         f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
                         f'✅ <span style="color:#777">{_si+1}. {_d}</span>'
-                        f'<span style="color:#555"> — 0 منتج</span>'
+                        f'<span style="color:#90a4ae"> — اكتمل، جارِ مزامنة العدد</span>'
+                        f'</div>'
+                    )
+                elif _cp.get("status") == "error":
+                    _item = (
+                        f'<div style="background:#2a0a0a;border:1px solid #7f1d1d;'
+                        f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
+                        f'❌ <span style="color:#ef9a9a">{_si+1}. {_d}</span>'
                         f'</div>'
                     )
                 elif _is_alive:
-                    # في الانتظار
                     _item = (
                         f'<div style="background:#111;border:1px dashed #333;'
                         f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
@@ -3943,7 +4022,6 @@ elif page == "🕷️ كشط المنافسين":
                         f'</div>'
                     )
                 else:
-                    # لم يُكشط بعد
                     _item = (
                         f'<div style="background:#111;border:1px solid #222;'
                         f'border-radius:6px;padding:7px 12px;font-size:.82rem">'
@@ -4029,16 +4107,19 @@ elif page == "🕷️ كشط المنافسين":
     # ════════════════════════════════════════════════════════════════════════
     #  القسم 6 — أدوات الكشط المتقدمة (مدمجة في expander بدل tab منفصل)
     # ════════════════════════════════════════════════════════════════════════
-    if _scraper_advanced_mod is not None:
+    _scraper_advanced_runtime_mod = _get_scraper_advanced_module()
+    if _scraper_advanced_runtime_mod is not None:
         st.markdown("---")
         with st.expander("🚀 أدوات الكشط المتقدمة", expanded=False):
-            if hasattr(_scraper_advanced_mod, "show"):
+            if hasattr(_scraper_advanced_runtime_mod, "show"):
                 try:
-                    _scraper_advanced_mod.show()
+                    _scraper_advanced_runtime_mod.show()
                 except Exception as _sa_render_err:
                     st.error(f"❌ خطأ في الأدوات المتقدمة: {_sa_render_err}")
             else:
                 st.error("⚠️ دالة show() غير موجودة في pages/scraper_advanced.py")
+    elif _scraper_advanced_import_error is not None:
+        st.warning(f"⚠️ تعذر تحميل الأدوات المتقدمة حالياً: {_scraper_advanced_import_error}")
 
 elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")

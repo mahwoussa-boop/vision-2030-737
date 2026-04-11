@@ -35,7 +35,7 @@ if __name__ == "__main__":
 # ══════════════════════════════════════════════════════════════════════════════
 #  CSS الاحترافي
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
+_PAGE_STYLES = """
 <style>
 body, .stApp { direction: rtl; }
 [data-testid="stSidebar"] { direction: rtl; }
@@ -88,7 +88,11 @@ body, .stApp { direction: rtl; }
 .store-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:4px;}
 .store-name{font-weight:700;font-size:1rem;color:#e0e0e0;}
 </style>
-""", unsafe_allow_html=True)
+"""
+
+
+def _inject_page_styles() -> None:
+    st.markdown(_PAGE_STYLES, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ثوابت ومسارات
@@ -466,6 +470,7 @@ def _render_stats_bar(state_data: dict, stores_count: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def show() -> None:
+    _inject_page_styles()
     st.title("🕷️ كاشط المنافسين — لوحة التحكم المتقدمة")
     st.caption("كشط مستقل لكل منافس مع استئناف ذكي، تخطي Cloudflare، وتحديث حي")
 
@@ -675,4 +680,5 @@ def show() -> None:
 
 
 if __name__ == "__main__":
+    _inject_page_styles()
     show()
