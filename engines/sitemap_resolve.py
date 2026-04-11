@@ -355,6 +355,21 @@ async def resolve_product_urls(
     return [e.url for e in entries]
 
 
+async def resolve_store_product_urls(
+    session: aiohttp.ClientSession,
+    store_url: str,
+    *,
+    max_products: int = 0,
+) -> List[SitemapEntry]:
+    """
+    غلاف توافق رجعي للاسم/التوقيع القديمين اللذين يستخدمهما engines.async_scraper.
+
+    يعيد قائمة SitemapEntry نفسها، مع ترتيب المعاملات المتوقع:
+    (session, store_url) بدلاً من (store_url, session).
+    """
+    return await resolve_product_entries(store_url, session, max_products=max_products)
+
+
 async def resolve_product_entries(
     store_url: str,
     session: aiohttp.ClientSession,
