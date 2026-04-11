@@ -10,13 +10,64 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
-import requests, json, re, time, traceback
+import requests, json, re, time, traceback, random
+from urllib.parse import urljoin
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
 _GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
 _CO  = "https://api.cohere.ai/v1/generate"
+
+
+def _build_resilient_session(total_retries: int = 0, pool_connections: int = 4, pool_maxsize: int = 10) -> requests.Session:
+    """
+    Session مشتركة مع Connection Pooling وRetry محدود وآمن.
+    نُبقي retries التلقائية معطلة افتراضياً لأن منطق إعادة المحاولة
+    يُدار يدوياً داخل الدوال حتى لا تتكرر طلبات POST دون قصد.
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        redirect=0,
+        backoff_factor=0,
+        status_forcelist=[],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_GEMINI_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=6)
+_OPENROUTER_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=4)
+_COHERE_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=4)
+_OG_SESSION = _build_resilient_session(pool_connections=4, pool_maxsize=8)
+
+_OG_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+]
+
+_OG_PATTERNS = [
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+]
 
 # ── سجل الأخطاء الأخيرة (يُعرض في صفحة التشخيص) ─────────────────────────
 _LAST_ERRORS: list = []
@@ -277,36 +328,42 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
         if not key:
             continue
         try:
-            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
+            r = _GEMINI_SESSION.post(f"{_GU}?key={key}", json=payload, timeout=(5, 45))
             if r.status_code == 200:
                 data = r.json()
                 if data.get("candidates"):
                     parts = data["candidates"][0]["content"]["parts"]
                     return "".join(p.get("text","") for p in parts)
-                else:
-                    # blocked / safety filter
-                    reason = data.get("promptFeedback",{}).get("blockReason","")
-                    _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
+                reason = data.get("promptFeedback", {}).get("blockReason", "")
+                _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
             elif r.status_code == 429:
-                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — تخطي للمفتاح التالي")
                 continue
             elif r.status_code == 403:
                 _log_err("Gemini", f"مفتاح {i+1}: IP محظور أو مفتاح غير مصرح (403)")
+                continue
+            elif r.status_code in (400, 401):
+                _log_err("Gemini", f"مفتاح {i+1}: خطأ دائم {r.status_code} — إيقاف المحاولة لهذا المفتاح")
+                break
             elif r.status_code == 404:
                 _log_err("Gemini", f"مفتاح {i+1}: نموذج غير متاح {_GM} (404)")
+                continue
             else:
                 try:
                     msg = r.json().get("error",{}).get("message","")
                 except Exception:
                     msg = r.text[:100]
                 _log_err("Gemini", f"مفتاح {i+1}: {r.status_code} — {msg[:80]}")
+                continue
+        except requests.exceptions.Timeout:
+            _log_err("Gemini", f"مفتاح {i+1}: Timeout")
+            continue
         except requests.exceptions.ConnectionError as e:
             _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
-        except requests.exceptions.Timeout:
-            _log_err("Gemini", f"مفتاح {i+1}: Timeout (45s)")
+            continue
         except Exception as e:
             _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
+            continue
     return None
 
 def _call_openrouter(prompt, system=""):
@@ -330,7 +387,7 @@ def _call_openrouter(prompt, system=""):
 
     for model in FREE_MODELS:
         try:
-            r = requests.post(_OR, json={
+            r = _OPENROUTER_SESSION.post(_OR, json={
                 "model": model,
                 "messages": msgs,
                 "temperature": 0.3,
@@ -339,22 +396,21 @@ def _call_openrouter(prompt, system=""):
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://mahwous.com",
                 "X-Title": "Mahwous"
-            }, timeout=45)
+            }, timeout=(5, 45))
 
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"]
                 if content and content.strip():
                     return content
             elif r.status_code == 429:
-                _log_err("OpenRouter", f"{model}: Rate Limit (429) — انتظار 2 ثانية")
-                time.sleep(2)  # ← 2 ثانية للـ 429
+                _log_err("OpenRouter", f"{model}: Rate Limit (429) — تخطي للنموذج التالي")
                 continue
             elif r.status_code == 402:
                 _log_err("OpenRouter", f"{model}: رصيد منتهٍ (402) — جرب النموذج التالي")
                 continue
             elif r.status_code == 401:
                 _log_err("OpenRouter", "مفتاح غير صحيح (401)")
-                return None  # لا فائدة من تجربة نماذج أخرى
+                return None
             else:
                 try:
                     msg = r.json().get("error", {}).get("message", "")
@@ -365,9 +421,9 @@ def _call_openrouter(prompt, system=""):
 
         except requests.exceptions.ConnectionError as e:
             _log_err("OpenRouter", f"لا اتصال — {str(e)[:80]}")
-            return None  # إذا لا اتصال، لا فائدة من تجربة نماذج أخرى
+            return None
         except requests.exceptions.Timeout:
-            _log_err("OpenRouter", f"{model}: Timeout (45s)")
+            _log_err("OpenRouter", f"{model}: Timeout")
             continue
         except Exception as e:
             _log_err("OpenRouter", f"{model}: {str(e)[:80]}")
@@ -388,29 +444,30 @@ def _call_cohere(prompt, system=""):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        r = requests.post(
+        r = _COHERE_SESSION.post(
             "https://api.cohere.com/v2/chat",
             json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
             headers={"Authorization": f"Bearer {COHERE_API_KEY}",
                      "Content-Type": "application/json"},
-            timeout=30
+            timeout=(5, 30)
         )
         if r.status_code == 200:
             data = r.json()
             return data.get("message", {}).get("content", [{}])[0].get("text", "")
         elif r.status_code == 401:
             _log_err("Cohere", "مفتاح غير صحيح (401) — تجاوز Cohere")
-            return None  # ← لا يوقف العمل، يمرر للـ fallback التالي
+            return None
         elif r.status_code in (402, 403):
             _log_err("Cohere", f"غير مصرح ({r.status_code}) — تجاوز")
             return None
         elif r.status_code == 429:
-            _log_err("Cohere", "Rate Limit (429) — انتظار 2 ثانية")
-            time.sleep(2)
+            _log_err("Cohere", "Rate Limit (429) — تخطي Cohere")
             return None
         else:
-            try:   msg = r.json().get("message", "")
-            except Exception: msg = r.text[:100]
+            try:
+                msg = r.json().get("message", "")
+            except Exception:
+                msg = r.text[:100]
             _log_err("Cohere", f"{r.status_code} — {msg[:80]}")
     except Exception as e:
         _log_err("Cohere", f"Fallback صامت — {str(e)[:60]}")
@@ -444,7 +501,7 @@ def _search_ddg(query, num_results=5):
     except: pass
     return []
 
-def call_ai(prompt, page="general"):
+def call_ai(prompt, page="general", json_mode=False):
     sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
     for fn, src in [
         (lambda: _call_gemini(prompt, sys), "Gemini"),
@@ -452,7 +509,14 @@ def call_ai(prompt, page="general"):
         (lambda: _call_cohere(prompt, sys), "Cohere")
     ]:
         r = fn()
-        if r: return {"success":True,"response":r,"source":src}
+        if r:
+            if json_mode:
+                data = _parse_json(r)
+                if data: return data
+                # إذا فشل التحليل كـ JSON، نعيد الاستجابة الأصلية في حقل response
+            return {"success":True,"response":r,"source":src}
+    
+    if json_mode: return {} # لضمان عدم تعطل الواجهة عند توقع dict
     return {"success":False,"response":"فشل الاتصال بجميع مزودي AI","source":"none"}
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
@@ -482,7 +546,8 @@ def gemini_chat(message, history=None, system_extra=""):
                     return {"success":True,"response":text,
                             "source":"Gemini Flash" + (" + بحث ويب" if needs_web else "")}
             elif r.status_code == 429:
-                time.sleep(1); continue
+                # ✅ إصلاح: لا sleep في main thread
+                continue
         except: continue
     r = _call_openrouter(message, sys)
     if r: return {"success":True,"response":r,"source":"OpenRouter"}
@@ -609,29 +674,75 @@ def fetch_fragrantica_info(product_name):
 
 
 # ══ هوية مهووس + سلة — وصف شاعري سعودي (Gemini) ═══════════════════════════
-MAHWOUS_SALLA_PROMPT = """أنت الآن خبير عطور سعودي محترف تعمل في متجر (مهووس - Mahwous).
-أسلوبك: شاعري، واثق، دقيق تقنياً، ومقنع تسويقياً. لغتك العربية فصيحة بلمسة خليجية راقية.
-المهمة: توليد وصف تفصيلي لمنتج عطر مفقود متوافق مع معايير SEO ومنصة سلة.
+MAHWOUS_SALLA_PROMPT = """أنت خبير آلي متخصص في كتابة أوصاف منتجات العطور لمتجر "مهووس" (Mahwous) محسّنة لـ SEO ومحركات بحث الذكاء الاصطناعي (GEO).
 
-الهيكل الإلزامي للوصف (بالترتيب):
-1. العنوان الجذاب: [اسم العطر] + [الماركة] + [الحجم] + (التركيز).
-2. المقدمة الشاعرية: وصف حسي يلامس المشاعر (مثال: رحلة تأخذك إلى غابات الأرز...).
-3. الهرم العطري: (المقدمة، القلب، القاعدة) مع وصف المكونات الحقيقية فقط إن وُجدت في المدخلات.
-4. لماذا تختار هذا العطر؟: 4 نقاط قوة (الثبات، الفوحان، التميز، القيمة).
-5. متى وأين ترتديه؟: الفصول (صيف/شتاء)، الأوقات (صباح/مساء)، والمناسبات.
-6. لمسة خبير من مهووس: تقييم الفوحان (1-10)، الثبات (1-10)، ونصيحة رش احترافية.
-7. الأسئلة الشائعة: (3-5 أسئلة تهم العميل السعودي).
+## هويتك
+- خبير عطور محترف بخبرة 15+ سنة في العطور الفاخرة
+- متخصص في SEO و Generative Engine Optimization
+- كاتب محتوى عربي بأسلوب راقٍ، ودود، عاطفي، تسويقي مقنع
+- صوت متجر "مهووس" الوجهة الأولى للعطور الفاخرة في السعودية
 
-في نهاية الوصف، أضف بيانات SEO بصيغة JSON فقط (بدون markdown fence إن أمكن) كالتالي:
+## قواعد صارمة
+- لا إيموجي إطلاقاً
+- لا تخترع مكونات لم تُذكر — استخدم فقط ما وُرد في المدخلات أو "غير متوفر"
+- الطول الإجمالي: 800-1500 كلمة
+- أكد الأصالة "أصلي 100%" مرة واحدة على الأقل
+- أسلوب مزيج: راقٍ (40%) + ودود (25%) + عاطفي (20%) + تسويقي (15%)
+
+## الهيكل الإلزامي للمخرج (بالترتيب الحرفي)
+
+**السطر الأول (إلزامي):** الاسم الكامل بالإنجليزية
+مثال: Gres Cabotine Gold Eau de Toilette 100ml for Women
+
+**المقدمة الإبداعية (100-150 كلمة):**
+جملة افتتاحية عاطفية قوية تدمج اسم العطر بالعربي والإنجليزي، سنة الإصدار، اسم العطار إن وُجد. تنتهي بحث العميل على الشراء من مهووس.
+
+**تفاصيل المنتج**
+* الماركة الفاخرة: [اسم الماركة]
+* اسم العطر: [اسم العطر]
+* المصمم: [اسم العطار أو "غير متوفر"]
+* الجنس: [للنساء / للرجال / للجنسين]
+* العائلة العطرية: [العائلة أو "غير متوفر"]
+* الحجم: [الحجم مل]
+* التركيز: [EDP / EDT / إلخ بالعربية]
+* سنة الإصدار: [السنة أو "غير متوفر"]
+
+**رحلة العطر: اكتشف الهرم العطري الفاخر**
+* النفحات العليا (Top Notes): [المكونات + وصف حسي]
+* النفحات الوسطى (Heart Notes): [المكونات + وصف حسي]
+* النفحات الأساسية (Base Notes): [المكونات + وصف حسي + معلومة ثبات]
+
+**لماذا تختار/تختارين هذا العطر؟**
+* [نقطة الرائحة والتميز]
+* [نقطة الشعور والانطباع]
+* [نقطة الثبات والفوحان بأرقام: مثلاً 6-8 ساعات]
+* [نقطة أوقات الاستخدام المثالية]
+
+**لمسة خبير من مهووس: تقييمنا الاحترافي**
+فقرة نقدية احترافية تبدأ بـ "بعد تجربتنا المعمقة لعطر [الاسم]..."
+تتضمن: تقييم الفوحان (x/10)، الثبات (x/10)، مقارنة بعطر مشابه، نصيحة رش على نقاط النبض.
+
+**الأسئلة الشائعة حول العطر**
+* سؤال 1 + إجابة (50-80 كلمة)
+* سؤال 2 + إجابة
+* سؤال 3 + إجابة
+(6-8 أسئلة إلزامية تشمل: الاستخدام اليومي، الثبات، الفصل المناسب، المناسبات الرسمية)
+
+**اكتشف المزيد من مهووس**
+* [رابط بناءً على التصنيف]
+* [رابط بناءً على الماركة]
+* [رابط للتستر أو البدائل]
+عالمك العطري يبدأ من مهووس!
+
+---
+في نهاية الوصف، أضف بيانات SEO بصيغة JSON دقيقة (بدون أي نص بعدها):
 {
-  "page_title": "...",
-  "meta_description": "...",
-  "url_slug": "...",
-  "alt_text": "...",
-  "tags": "..."
-}
-
-قواعد صارمة: أكد أن العطر "أصلي 100%"، لا تخترع مكونات، خاطب الذوق الخليجي، لا تكرر نصاً فارغاً."""
+  "page_title": "[عنوان جذاب ≤60 حرف يحتوي الكلمة المفتاحية]",
+  "meta_description": "[وصف ≤155 حرف يذكر الماركة والمكونات وأصلي 100% من مهووس]",
+  "url_slug": "[brand-perfume-concentration-size-gender-mahwous]",
+  "alt_text": "[وصف دقيق لصورة زجاجة العطر]",
+  "tags": "[10 كلمات مفتاحية مفصولة بفواصل: الماركة، الاسم، المكونات، عطور مهووس]"
+}"""
 
 
 def _parse_seo_json_block(text: str):
@@ -692,9 +803,14 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
     """
     frag_info = ""
     if fragrantica_data and fragrantica_data.get("success"):
-        top = ", ".join(fragrantica_data.get("top_notes", [])[:5])
-        mid = ", ".join(fragrantica_data.get("middle_notes", [])[:5])
-        base = ", ".join(fragrantica_data.get("base_notes", [])[:5])
+        def _to_list(v):
+            """يحوّل أي قيمة (str/list/None) إلى list بأمان."""
+            if isinstance(v, list):   return v
+            if isinstance(v, str):    return [x.strip() for x in v.split(",") if x.strip()]
+            return []
+        top  = ", ".join(_to_list(fragrantica_data.get("top_notes",    []))[:5])
+        mid  = ", ".join(_to_list(fragrantica_data.get("middle_notes", []))[:5])
+        base = ", ".join(_to_list(fragrantica_data.get("base_notes",   []))[:5])
         desc = fragrantica_data.get("description_ar", "")
         brand = fragrantica_data.get("brand", "")
         ptype = fragrantica_data.get("type", "")
@@ -796,8 +912,16 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
         return {"success":True, **data}
-    match = "true" in txt.lower() or "نعم" in txt
-    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
+    # ✅ إصلاح: لا نحكم بالتطابق من وجود كلمة "نعم"/"true" عشوائية في نص فاشل
+    # (كان يُعيد false-positive عند أي هلوسة من النموذج)
+    return {
+        "success": True,
+        "match": False,
+        "confidence": 0,
+        "reason": f"فشل تحليل JSON من الـ AI — النص الخام: {txt[:200]}",
+        "correct_section": "تحت المراجعة",
+        "suggested_price": 0,
+    }
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
 def reclassify_review_items(items):
@@ -1206,3 +1330,307 @@ def get_catalog_status() -> dict:
                                       CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
         "missing_brands": missing_stat,
     }
+
+
+# ══ الدوال المفقودة للوحدة الخامسة ═══════════════════════════════════════════
+
+# ══ مصنع المنتجات — نظام JSON + وصف HTML صارم لسلة / SEO ═══════════════════
+MAGIC_FACTORY_SALLA_SYSTEM = """أنت خبير محتوى تجارة إلكترونية وعطور لمتجر «مهووس» (mahwous.com) في السعودية.
+مهمتك: تحويل بيانات منتج مكشوطة (نص خام) إلى مخرجات **JSON صالحة فقط** — بدون ```json``` وبدون أي شرح قبل أو بعد كائن JSON.
+
+## إخراج JSON — المفاتيح الإلزامية (لا تحذف مفتاحاً)
+يجب أن يحتوي JSON على هذه المفاتيح بالضبط:
+cleaned_title, description_html, brand, category, seo_title, seo_description,
+top_notes, heart_notes, base_notes, gender_hint, is_perfume
+
+## 1) cleaned_title
+- اسم منتج نظيف للعنوان: عربي و/أو إنجليزي، بدون عبارات مزعجة: تخفيض، خصم، الأكثر مبيعاً، أصلي، عرض، شحن مجاني، لفترة محدودة.
+
+## 2) category — إلزامي وليس فارغاً أبداً لمنتجات العطور
+استنتج التصنيف من المدخلات (الجنس، الاسم، المنافس). استخدم **حرفياً** أحد الأشكال التالية فقط (مع الفاصل > والمسافات كما هي):
+- "العطور > عطور رجالية"
+- "العطور > عطور نسائية"
+- "العطور > عطور للجنسين"
+
+إذا كانت المدخلات لا تشير لعطر رغم أنها منتج تجميل/عناية، استخدم تصنيفاً منطقياً تحت «العناية» أو «التجميل» بصيغة مشابهة (قسم رئيسي > قسم فرعي). إن كان المنتج عطراً **لا تترك category فارغاً**.
+
+## 3) brand
+- اسم الماركة كما يُعرض للعميل (يمكن عربي | إنجليزي إن كان ذلك منطقياً من المدخلات).
+- لا تخترع ماركة إن لم تظهر في المدخلات؛ استخدم أقرب استنتاج معقول من اسم المنتج فقط إن وُجدت إشارة واضحة.
+
+## 4) gender_hint
+واحد من: "للرجال" | "للنساء" | "للجنسين" | "" (فارغ فقط إن تعذر الاستنتاج تماماً).
+
+## 5) is_perfume
+true إن كان المنتج عطراً (EDP/EDT/Parfum/Cologne… أو سياق واضح)، وإلا false.
+
+## 6) top_notes, heart_notes, base_notes
+نص عربي موجز (أو مفصول بفواصل) مستخرج من المدخلات؛ إن لم تُذكر مكونات، اكتب "غير مذكور في المصدر" أو استنتجاً حذراً من العائلة العطرية المعروفة للاسم **دون اختلاق تفاصيل كيميائية دقيقة**.
+
+## 7) seo_title و seo_description
+- seo_title: ≤ 60 حرفاً (عربي)، يضم ماركة + اسم عطر/منتج + كلمات بحثية طبيعية.
+- seo_description: ≤ 155 حرفاً، يشجع النقر ويذكر الأصالة والفئة.
+
+## 8) description_html — **الجزء الأهم**: HTML فقط، طويل، تسويقي، متوافق SEO
+قواعد صارمة:
+- **ممنوع** Markdown. **ممنوع** استخدام # للعناوين.
+- وسوم مسموحة فقط: h2, h3, p, ul, ol, li, strong, em, br, a.
+- التزم **حرفياً** بالترتيب والعناوين النصية التالية (يمكنك إثراء النص داخل الفقرات والقوائم، لكن لا تحذف قسماً ولا تغيّر مستوى العناوين):
+
+(أ) ابدأ بسطر واحد: <h2>اسم العطر أو المنتج بالصيغة الجذابة</h2> (استخدم الاسم من cleaned_title أو المدخلات).
+
+(ب) فقرة افتتاحية واحدة على الأقل: <p>…</p> تسويقية، وتذكر **اسم الماركة** و**اسم العطر/المنتج** داخل <strong>…</strong>.
+
+(ج) <h3>تفاصيل المنتج</h3> ثم <ul><li>…</li></ul> ويجب أن تتضمن القائمة بنوداً واضحة للـ: الماركة، اسم المنتج، الجنس، العائلة العطرية (أو نوع المنتج)، الحجم، التركيز (EDP/EDT/إلخ). استخدم «غير محدد في المصدر» للبند الناقص.
+
+(د) <h3>رحلة العطر — الهرم العطري</h3> ثم فقرة أو قائمة توضح **القمة** و**القلب** و**القاعدة** (للمنتجات غير العطور: حوّل القسم إلى «مكونات الرائحة / الطابع العطري» بذات البنية إن كان معطوراً، أو «مميزات المنتج» بثلاث فقرات فرعية داخل h3 واحد ثم ul).
+
+(هـ) <h3>لماذا تختار هذا العطر؟</h3> ثم <ul> بنقاط تسويقية (ثبات، فوحان، تميز، مناسبة للمناسبات…) — لا تبالغ بأرقام وهمية؛ إن ذكرت أرقاماً فاجعلها نطاقات معقولة (مثلاً 6–10 ساعات) مع صيغة احترافية.
+
+(و) <h3>متى وأين ترتديه؟</h3> ثم <p>…</p> (فصول، أوقات، مناسبات).
+
+(ز) <h3>لمسة خبير من متجر مهووس</h3> ثم <p>…</p> يتضمن: تقييم **الفوحان من 10** و**الثبات من 10** (رقمان صريحان مثل 7/10)، و**نصيحة استخدام** (نقاط النبض، عدد البخات).
+
+(ح) <h3>الأسئلة الشائعة</h3> ثم <ul> تحتوي **3 عناصر li** على الأقل؛ كل li يجب أن يكون سؤالاً ثم إجابة مختصرة داخل نفس العنصر (مثال: <li><strong>السؤال؟</strong> الإجابة…</li>).
+
+(ط) <h3>اكتشف أكثر من مهووس</h3> ثم فقرة فيها **روابط حقيقية** بوسم <a>:
+- رابط التصنيف حسب جنس المنتج (استخدم أحد هذه الروابط حسب الاستنتاج):
+  • عطور رجالية: href="https://mahwous.com/categories/mens-perfumes"
+  • عطور نسائية: href="https://mahwous.com/categories/womens-perfumes"
+  • عطور للجنسين: href="https://mahwous.com/categories/unisex-perfumes"
+- رابط الماركة: href="https://mahwous.com/brands/BRAND_SLUG" حيث BRAND_SLUG هو **الاسم اللاتيني للماركة** بصيغة slug: أحرف صغيرة إنجليزية، مسافات → شرطة -، إزالة الرموز الخاصة (مثال: Dior → dior، Yves Saint Laurent → yves-saint-laurent). نص الرابط <a> يكون اسم الماركة المعروض للعميل.
+
+## الطول والجودة
+- الوصف الإجمالي في description_html يجب أن يكون **طويلاً وغنى** (استهدف ما يعادل 400–900 كلمة من النص الظاهر للمستخدم داخل HTML)، بدون حشو كلمات مفتاحية مكررة بشكل آلي.
+
+## JSON technique
+- حقل description_html يجب أن يكون **سلسلة JSON واحدة**؛ استبدل الأسطر الجديدة داخل HTML بـ \\n أو اكتب HTML في سطر متصل مع وسوم صحيحة.
+- لا تضع علامات اقتباس غير مهرّبة داخل description_html تكسر JSON؛ استخدم \\" للاقتباس الداخلي إن لزم.
+"""
+
+
+def enhance_competitor_product_for_salla(
+    scraped_summary: str,
+    url: str = "",
+    meta_fallback: str = "",
+) -> dict:
+    """
+    يحسّن بيانات منتج مكشوط من متجر منافس لتصدير سلة (شامل):
+    تنظيف العنوان، وصف HTML تسويقي بقالب صارم، ماركة، تصنيف سلة، SEO، وهرم عطري.
+
+    يُعيد dict بمفاتيح:
+    cleaned_title, description_html, brand, category, seo_title, seo_description,
+    top_notes, heart_notes, base_notes, gender_hint, is_perfume
+    """
+    defaults = {
+        "cleaned_title": "",
+        "description_html": "",
+        "brand": "",
+        "category": "",
+        "seo_title": "",
+        "seo_description": "",
+        "top_notes": "",
+        "heart_notes": "",
+        "base_notes": "",
+        "gender_hint": "",
+        "is_perfume": False,
+    }
+    blob = (scraped_summary or "").strip()
+    if not blob and not (meta_fallback or "").strip():
+        return defaults
+
+    prompt = (
+        f"رابط الصفحة الأصلية للمنافس (للسياق فقط): {url}\n\n"
+        f"=== بيانات مستخرجة من الكشط ===\n{blob[:7000]}\n"
+    )
+    if (meta_fallback or "").strip():
+        prompt += f"\n=== وسوم meta / JSON-LD إضافية ===\n{meta_fallback[:2500]}\n"
+
+    prompt += """
+=== المطلوب ===
+أعد كتابة المنتج لمتجر مهووس وسلة: JSON واحد فقط يلتزم بجميع قواعد النظام (MAGIC_FACTORY).
+تأكد من:
+1) ملء "category" بأحد مسارات العطور الثلاثة عند كون المنتج عطراً.
+2) أن "description_html" يلتزم **حرفياً** بترتيب العناوين h2 ثم h3 المحددة وبمحتوى تسويقي طويل.
+3) تضمين روابط mahwous.com للتصنيف وللماركة (slug لاتيني) في القسم الأخير.
+
+أجب بكائن JSON فقط بهذا الشكل (المفاتيح كما هي):
+{
+  "cleaned_title": "",
+  "description_html": "",
+  "brand": "",
+  "category": "",
+  "seo_title": "",
+  "seo_description": "",
+  "top_notes": "",
+  "heart_notes": "",
+  "base_notes": "",
+  "gender_hint": "",
+  "is_perfume": true
+}
+"""
+
+    raw = (
+        _call_gemini(prompt, MAGIC_FACTORY_SALLA_SYSTEM, temperature=0.3, max_tokens=8192)
+        or _call_openrouter(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
+        or _call_cohere(prompt, MAGIC_FACTORY_SALLA_SYSTEM)
+    )
+    if not raw:
+        return defaults
+
+    data = _parse_json(raw)
+    if not isinstance(data, dict):
+        return defaults
+
+    out = {**defaults}
+    for k in out:
+        if k in data:
+            v = data[k]
+            if k == "is_perfume":
+                out[k] = bool(v)
+            else:
+                out[k] = str(v).strip() if v is not None else ""
+
+    # مطابقة صارمة مع «ماركات مهووس» / «brands.csv» و«تصنيفات مهووس» (منطق التصدير)
+    from utils.salla_shamel_export import (
+        resolve_brand_for_shamel,
+        resolve_category_for_shamel,
+    )
+
+    _rb = resolve_brand_for_shamel(out["brand"])
+    if _rb:
+        out["brand"] = _rb
+
+    _rc = resolve_category_for_shamel(
+        out["category"],
+        gender_hint=out["gender_hint"],
+        product_name_fallback=out["cleaned_title"],
+    )
+    if _rc:
+        out["category"] = _rc
+    elif out["is_perfume"] and not out["category"].strip():
+        _inferred = auto_infer_category(out["cleaned_title"], out["gender_hint"])
+        _rc2 = resolve_category_for_shamel(
+            _inferred,
+            gender_hint=out["gender_hint"],
+            product_name_fallback=out["cleaned_title"],
+        )
+        out["category"] = _rc2 or _inferred
+
+    return out
+
+
+def extract_product(text: str) -> dict:
+    """
+    يستخرج بيانات العطر (اسم، ماركة، حجم، تركيز، جنس، سعر) من نص خام.
+    يستخدم _parse_json مباشرةً — لا يعتمد على json_mode.
+    مضمون العودة بـ dict حتى عند الفشل.
+    """
+    defaults = {
+        "name": str(text).strip()[:120] if text else "",
+        "brand": "", "size": "", "concentration": "",
+        "gender": "", "price": 0,
+    }
+    if not text or not str(text).strip():
+        return defaults
+
+    prompt = (
+        'استخرج بيانات العطر من النص التالي بدقة وأجب بـ JSON صالح فقط بدون أي نص آخر:\n'
+        f'النص: "{str(text).strip()[:500]}"\n\n'
+        'الصيغة المطلوبة:\n'
+        '{"name":"اسم المنتج","brand":"الماركة بالإنجليزية",'
+        '"size":"الحجم مثل 100ml","concentration":"EDP أو EDT أو Parfum",'
+        '"gender":"Men أو Women أو Unisex","price":0}'
+    )
+
+    sys_prompt = PAGE_PROMPTS.get("general", "")
+    raw = (
+        _call_gemini(prompt, sys_prompt, temperature=0.1)
+        or _call_openrouter(prompt, sys_prompt)
+        or _call_cohere(prompt, sys_prompt)
+    )
+
+    if raw:
+        parsed = _parse_json(raw)
+        if isinstance(parsed, dict) and parsed.get("name"):
+            defaults.update(parsed)
+            try:
+                defaults["price"] = float(str(defaults.get("price", 0)).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                defaults["price"] = 0.0
+            return defaults
+
+    return defaults
+
+
+def fetch_og_image_url(url: str) -> str:
+    """
+    يجلب رابط صورة Open Graph (og:image) من أي صفحة ويب.
+    يستخدم Session مشتركة مع تناوب User-Agent وتقليل الطلبات المكلفة.
+    يدعم og:image و twitter:image والروابط النسبية.
+    """
+    if not url or not str(url).strip().startswith("http"):
+        return ""
+
+    target_url = url.strip()
+    _headers = {
+        "User-Agent": random.choice(_OG_USER_AGENTS),
+        "Accept-Language": "ar,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+
+    for attempt in range(2):
+        verify_ssl = (attempt == 0)
+        try:
+            r = _OG_SESSION.get(
+                target_url,
+                headers=_headers,
+                timeout=12,
+                allow_redirects=True,
+                verify=verify_ssl,
+            )
+            if r.status_code == 403:
+                _log_err("fetch_og_image_url", f"محظور (403) من {target_url[:60]}")
+                return ""
+            if r.status_code == 429:
+                _log_err("fetch_og_image_url", f"Rate Limit (429) من {target_url[:60]}")
+                return ""
+            if r.status_code != 200:
+                _log_err("fetch_og_image_url", f"HTTP {r.status_code} من {target_url[:60]}")
+                return ""
+
+            html = r.text
+            for pat in _OG_PATTERNS:
+                m = re.search(pat, html, re.IGNORECASE)
+                if m:
+                    img = m.group(1).strip()
+                    if img.startswith("//"):
+                        return "https:" + img
+                    if img.startswith("/"):
+                        return urljoin(target_url, img)
+                    if img.startswith("http"):
+                        return img
+            return ""
+        except requests.exceptions.SSLError:
+            if attempt == 0:
+                continue
+            _log_err("fetch_og_image_url", f"SSL Error نهائي من {target_url[:60]}")
+            return ""
+        except requests.exceptions.Timeout:
+            _log_err("fetch_og_image_url", f"Timeout (12s) من {target_url[:60]}")
+            return ""
+        except requests.exceptions.ConnectionError as e:
+            _log_err("fetch_og_image_url", f"Connection Error من {target_url[:60]}: {str(e)[:60]}")
+            return ""
+        except Exception as _e:
+            _log_err("fetch_og_image_url", f"فشل جلب OG image من {target_url[:60]}: {str(_e)[:80]}")
+            return ""
+
+    return ""

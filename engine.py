@@ -11,8 +11,7 @@ engines/engine.py  v26.0 — محرك المطابقة الفائق السرعة
   3. أفضل 5 مرشحين → Gemini فقط إذا score بين 62-96%
   4. score ≥97% → تلقائي فوري  |  score <62% → مفقود
 """
-import re, io, json, os, hashlib, sqlite3, gc
-import functools as _functools
+import re, io, json, os, hashlib, sqlite3, time, gc
 from datetime import datetime
 import pandas as pd
 from utils.data_helpers import first_image_url_string, pid_from_row as _pid
@@ -73,15 +72,10 @@ except:
         "جيمي تشو","لاليك","بوليس","فيكتور رولف",
         "كلوي","بالنسياغا","ميو ميو",
     ]
-    WORD_REPLACEMENTS  = {}
-    MATCH_THRESHOLD    = 85
-    HIGH_CONFIDENCE    = 95
-    REVIEW_THRESHOLD   = 75
-    PRICE_TOLERANCE    = 5
-    TESTER_KEYWORDS    = ["tester", "تستر"]
-    SET_KEYWORDS       = ["set", "طقم", "مجموعة"]
-    GEMINI_API_KEYS    = []
-    OPENROUTER_API_KEY = ""
+WORD_REPLACEMENTS = {}
+MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
+PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
+OPENROUTER_API_KEY = ""
 
 # ─── مفاتيح Gemini: config أولاً (يدمج secrets.toml + env)؛ إن فارغ استخدم env فقط ───
 import os as _os
@@ -234,6 +228,7 @@ _SYN = {
     "سيلفر":"silver","سيلفير":"silver",
     "نايت":"night","نايث":"night",
     "داي":"day","دي":"day",
+    "او":"",  # إزالة حروف الربط الزائدة
     # ── v26.0: مرادفات إضافية لزيادة الدقة ──
     # أحجام بديلة
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
@@ -279,83 +274,44 @@ _SYN = {
 }
 
 # ─── v26.0: Fuzzy Spell Correction ────────────────
-# ✅ إصلاح #5: LRU cache لتجنب إعادة بناء قائمة الماركات مع كل استدعاء
-@_functools.lru_cache(maxsize=1)
-def _get_normalized_brands():
-    """يُحسب مرة واحدة فقط عند أول استدعاء"""
-    return [(b, b.lower()) for b in KNOWN_BRANDS]
-
-
 def _fuzzy_correct_brand(text: str, threshold: int = 82) -> str:
     """تصحيح إملائي ذكي للماركات — يُستخدم عند فشل المطابقة المباشرة"""
-    if not text or len(text) < 3:
+    if not text:
         return ""
     from rapidfuzz import fuzz as _fz
     text_norm = text.lower().strip()
     best_brand = ""
     best_score = 0
-    for b_orig, b_low in _get_normalized_brands():
-        s = _fz.ratio(text_norm, b_low)
+    for b in KNOWN_BRANDS:
+        s = _fz.ratio(text_norm, b.lower())
         if s > best_score and s >= threshold:
             best_score = s
-            best_brand = b_orig
-            if best_score >= 97:
-                break
+            best_brand = b
     return best_brand
 
-# ─── SQLite Cache — اتصال دائم مع thread safety ────────────────
-# ✅ إصلاح #6: اتصال دائم بدلاً من فتح/إغلاق لكل عملية
+# ─── SQLite Cache ───────────────────────────
 _DB = get_data_db_path("match_cache_v21.db")
-_db_conn = None
-
-
-def _get_db_conn():
-    """يُعيد اتصالاً دائماً — يُنشئه عند أول استدعاء فقط"""
-    global _db_conn
-    if _db_conn is None:
-        try:
-            _db_conn = sqlite3.connect(_DB, check_same_thread=False)
-            _db_conn.execute(
-                "CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)"
-            )
-            _db_conn.execute("PRAGMA journal_mode=WAL")
-            _db_conn.commit()
-        except Exception:
-            _db_conn = None
-    return _db_conn
-
-
 def _init_db():
     try:
-        _get_db_conn()
-    except Exception:
-        pass
-
+        cn = sqlite3.connect(_DB, check_same_thread=False)
+        cn.execute("CREATE TABLE IF NOT EXISTS cache(h TEXT PRIMARY KEY, v TEXT, ts TEXT)")
+        cn.commit(); cn.close()
+    except: pass
 
 def _cget(k):
     try:
-        conn = _get_db_conn()
-        if conn is None:
-            return None
-        r = conn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
-        return json.loads(r[0]) if r else None
-    except Exception:
-        return None
-
+        cn = sqlite3.connect(_DB, check_same_thread=False)
+        r = cn.execute("SELECT v FROM cache WHERE h=?", (k,)).fetchone()
+        cn.close(); return json.loads(r[0]) if r else None
+    except: return None
 
 def _cset(k, v):
     try:
-        conn = _get_db_conn()
-        if conn is None:
-            return
-        conn.execute(
-            "INSERT OR REPLACE INTO cache VALUES(?,?,?)",
-            (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat())
-        )
-        conn.commit()
-    except Exception:
-        pass
-
+        cn = sqlite3.connect(_DB, check_same_thread=False)
+        cn.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
+                   (k, json.dumps(v, ensure_ascii=False), datetime.now().isoformat()))
+        cn.commit(); cn.close()
+    except: pass
 
 _init_db()
 
@@ -384,6 +340,15 @@ def _is_scraper_column_name(col):
 def _drop_scraper_columns(df):
     """حذف أعمدة تبدو كمخرجات كشط وليست حقولاً حقيقية."""
     if df is None or df.empty:
+        return df
+    # لا نحذف أعمدة الكشط الخام قبل أن نضمن وجود أعمدة قياسية.
+    # بعض ملفات المنافسين تأتي برؤوس CSS فقط (text-sm-2 / abs-size href / w-full src).
+    canonical_headers = {
+        "اسم المنتج", "المنتج", "سعر المنتج", "السعر",
+        "صورة المنتج", "رابط المنتج", "الماركة",
+    }
+    has_canonical = any(str(c).strip() in canonical_headers for c in df.columns)
+    if not has_canonical:
         return df
     keep = [c for c in df.columns if not _is_scraper_column_name(c)]
     if not keep:
@@ -424,7 +389,12 @@ def _looks_like_image_url(s: str) -> bool:
         return False
     if _IMG_URL_RE.search(vl):
         return True
-    return any(x in vl for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"))
+    if any(x in vl for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+        return True
+    # CDN سلة: cdn.salla.sa/cdn-cgi/image/... — دائماً صورة
+    if "cdn.salla" in vl or "cdn-cgi/image" in vl:
+        return True
+    return False
 
 
 _EMBEDDED_HTTP_IMG = re.compile(
@@ -468,8 +438,14 @@ def _column_content_scores(series):
         vl = v.strip().lower()
         if "http://" in vl or "https://" in vl or vl.startswith("//"):
             http_n += 1
-        if _IMG_URL_RE.search(vl) or ("http" in vl and any(
-            x in vl for x in (".jpg", ".png", ".webp", ".jpeg", ".gif"))):
+        if (
+            _IMG_URL_RE.search(vl)
+            or ("http" in vl and any(x in vl for x in (".jpg", ".png", ".webp", ".jpeg", ".gif")))
+            # CDN روابط سلة (cdn.salla.sa/cdn-cgi/image/...) — قد لا تنتهي بامتداد واضح
+            or ("cdn.salla" in vl and "http" in vl)
+            or ("cdn-cgi/image" in vl and "http" in vl)
+            or ("salla.sa" in vl and any(x in vl for x in ("image", "img", "photo", "media")))
+        ):
             img_n += 1
         try:
             x = float(str(v).replace(",", "").replace("ر.س", "").replace("﷼", "").strip())
@@ -537,10 +513,19 @@ def _infer_column_roles(df):
                 rename[c] = "سعر المنتج"
                 break
 
+    # أعمدة بيانات وصفية لا يجب أن تُعامَل كأسماء منتجات
+    _META_COL_NAMES = frozenset({
+        "store", "brand", "sku", "scraped_at", "date", "timestamp",
+        "id", "source", "shop", "seller", "vendor", "merchant",
+        "متجر", "مصدر", "تاريخ",
+    })
+
     # اسم
     if not has_name:
         for c, hr, ir, pr in scored:
             if c in rename:
+                continue
+            if str(c).lower().strip() in _META_COL_NAMES:
                 continue
             if pr < 0.35 and hr < 0.25 and ir < 0.2:
                 txt = " ".join(df[c].dropna().head(5).astype(str))
@@ -551,6 +536,44 @@ def _infer_column_roles(df):
     if rename:
         df = df.rename(columns=rename)
     return df
+
+
+def _force_ingestion_cleanup(df):
+    """
+    تنظيف إلزامي لطبقة الإدخال:
+    1) كشف صف العناوين الحقيقي (بيانات المنتج/Unnamed).
+    2) توحيد أخطاء الرؤوس (أسم المنتج ...).
+    3) ترجمة أعمدة CSS/HTML إلى أعمدة مفهومة للمحرك.
+    4) تخمين الأدوار من المحتوى كـ fallback.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out.columns = out.columns.map(lambda x: str(x).strip().replace("\ufeff", ""))
+    out = out.dropna(how="all").reset_index(drop=True)
+    out = _detect_double_header(out)
+    out.columns = out.columns.map(lambda x: str(x).strip().replace("\ufeff", ""))
+    out = _normalize_header_typos(out)
+    # توحيد قسري لبعض الرؤوس الشائعة في تصدير المتجر.
+    forced = {}
+    for c in out.columns:
+        sc = str(c).strip()
+        if sc == "أسم المنتج":
+            forced[c] = "اسم المنتج"
+        elif sc in ("رمز المنتج sku", "رمز المنتج SKU"):
+            forced[c] = "رمز المنتج sku"
+    if forced:
+        out = out.rename(columns=forced)
+    if ("سعر المنتج" not in out.columns) and ("السعر" not in out.columns):
+        for alt_price in ("السعر المخفض", "السعر بعد الخصم"):
+            if alt_price in out.columns:
+                out = out.rename(columns={alt_price: "سعر المنتج"})
+                break
+    out = _smart_rename_columns(out)
+    out = _infer_column_roles(out)
+    out = _drop_scraper_columns(out)
+    out = _normalize_header_typos(out)
+    return out
 
 
 # ─── دوال أساسية ────────────────────────────
@@ -586,13 +609,7 @@ def read_file(f):
                 df = pd.read_excel(f)
         else:
             return None, "صيغة غير مدعومة"
-        df.columns = df.columns.map(lambda x: str(x).strip().replace('\ufeff', ''))
-        df = df.dropna(how='all').reset_index(drop=True)
-        df = _normalize_header_typos(df)
-        df = _drop_scraper_columns(df)
-        df = _detect_double_header(df)
-        df = _smart_rename_columns(df)
-        df = _infer_column_roles(df)
+        df = _force_ingestion_cleanup(df)
         return df, None
     except Exception as e:
         return None, str(e)
@@ -628,10 +645,22 @@ def _should_use_second_row_header(peek):
 
 def _detect_double_header(df):
     """كشف ملفات ذات صفين عناوين (مثل ملف سلة الذي يحتوي على صف مجموعة + صف عناوين)"""
+    if df is None or df.empty:
+        return df
     cols = list(df.columns)
-    unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed'))
-    # إذا أغلب الأعمدة Unnamed → الصف الأول من البيانات قد يكون العناوين الحقيقية
-    if unnamed_count >= len(cols) // 2 and len(df) > 2:
+    unnamed_count = sum(1 for c in cols if str(c).startswith("Unnamed"))
+    group_like_count = sum(
+        1 for c in cols
+        if ("بيانات" in str(c)) or str(c).lower().startswith("unnamed")
+    )
+    looks_like_group_header = (
+        unnamed_count >= max(1, len(cols) // 2)
+        or group_like_count >= max(1, len(cols) // 3)
+        or ("بيانات المنتج" in str(cols[0]) if cols else False)
+    )
+    # إذا ظهر أن الترويسة الحالية "صف مجموعات" أو Unnamed
+    # فالصف الأول غالباً يحمل العناوين الحقيقية.
+    if looks_like_group_header and len(df) >= 1:
         # تحقق: هل الصف الأول يحتوي على أسماء أعمدة معروفة؟
         first_row = df.iloc[0].astype(str).tolist()
         _known_headers = [
@@ -659,21 +688,27 @@ def _detect_double_header(df):
     return df
 
 
+_DIRTY_COL_RE = re.compile(
+    r"(__|styles?_|productcard|text-|w-full|abs-|h-\d|p-\d|gap-|grid-|flex|rounded"
+    r"|sm:|md:|lg:|truncate|min-w|max-w|hover:|focus:|justify-|items-"
+    r"|className|cls\b|src\b|href\b)",
+    re.I,
+)
+_FIRST_URL_RE = re.compile(r"(https?://[^\s\"\'<>,،]+)")
+
+
 def _smart_rename_columns(df):
-    """التعرف العميق على الأعمدة (Scraper CSS + محتوى) — أسماء موحّدة مع _fcol و resolve_catalog_columns."""
+    """التعرف العميق والترجمة القسرية لأعمدة الكشط العشوائية (CSS/HTML/Tailwind).
+
+    يغطي ملفات: عالم جيفنشي، سعيد صلاح، سلة، زد، Shopify، وأي تصدير كشط بأسماء CSS.
+    """
     if df is None or df.empty:
         return df
     cols = list(df.columns)
 
+    # ── هل الملف يحتوي على أعمدة قذرة (CSS / HTML / Unnamed)? ──
     is_dirty = any(
-        "__" in str(c)
-        or "style" in str(c).lower()
-        or "productcard" in str(c).lower()
-        or "text-" in str(c).lower()
-        or "w-full" in str(c).lower()
-        or "abs-" in str(c).lower()
-        or "href" in str(c).lower()
-        or "src" in str(c).lower()
+        _DIRTY_COL_RE.search(str(c))
         or str(c).lower().startswith("unnamed")
         for c in cols
     )
@@ -682,47 +717,102 @@ def _smart_rename_columns(df):
         blob = " ".join(str(c) for c in cols).lower()
         return ("اسم" in blob or "منتج" in blob) and ("سعر" in blob or "price" in blob)
 
-    if len(cols) == 4 and not is_dirty and _clean_arabic_headers():
+    if not is_dirty and _clean_arabic_headers():
+        return df
+    if not is_dirty:
+        # ── تسمية الأعمدة الإنجليزية النظيفة (مخرجات الكاشط التلقائي) ──
+        # مثال: ["store","name","price","image","url","brand","sku","scraped_at"]
+        _EN_TO_AR = {
+            "name": "اسم المنتج", "title": "اسم المنتج", "product": "اسم المنتج",
+            "price": "سعر المنتج", "image": "صورة المنتج",
+            "img": "صورة المنتج", "photo": "صورة المنتج", "thumbnail": "صورة المنتج",
+            "url": "رابط المنتج", "link": "رابط المنتج", "product_url": "رابط المنتج",
+            "brand": "الماركة",
+        }
+        _cols_lower = {str(c).lower().strip(): c for c in cols}
+        _has_arabic_name = any(
+            str(c).strip() in ("اسم المنتج", "المنتج", "أسم المنتج") for c in cols
+        )
+        if not _has_arabic_name:
+            _rn = {}
+            _used = set()
+            for _en, _ar in _EN_TO_AR.items():
+                if _en in _cols_lower and _ar not in _used:
+                    _rn[_cols_lower[_en]] = _ar
+                    _used.add(_ar)
+            if _rn:
+                df = df.rename(columns=_rn)
         return df
 
-    if not is_dirty and len(cols) != 4:
-        return df
-
-    # أنماط شائعة في تصديرات الكشط (الأكثر تحديداً أولاً)
-    # — تغطي: CSS class names / HTML attrs / English / Arabic keywords
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 1: الترجمة القسرية بالأنماط (CSS → اسم عمود موحّد)
+    #  الأكثر تحديداً أولاً — يمنع الأنماط العامة من سرقة أعمدة مخصصة
+    # ═══════════════════════════════════════════════════════════════════
     CSS_PATTERNS = [
-        # ── CSS class names (worldgivenchy, saeedsalah, …) ──
-        ("styles_productcard__name",  "اسم المنتج"),
-        ("productcard__name",         "اسم المنتج"),
-        ("text-sm-2",                 "سعر المنتج"),
-        ("text-sm",                   "سعر المنتج"),
-        ("abs-size href",             "رابط المنتج"),
-        ("w-full src",                "صورة المنتج"),
-        ("w-full",                    "صورة المنتج"),
-        # ── HTML attributes (standalone) ──
-        ("href",                      "رابط المنتج"),
-        ("src",                       "صورة المنتج"),
+        # ── CSS class names: عالم جيفنشي (worldgivenchy) ──
+        ("styles_productcard__name",    "اسم المنتج"),
+        ("styles_productcard__price",   "سعر المنتج"),
+        ("styles_productcard__image",   "صورة المنتج"),
+        ("styles_productcard__link",    "رابط المنتج"),
+        ("styles_productcard__url",     "رابط المنتج"),
+        ("styles_productcard__brand",   "الماركة"),
+        # ── CSS class names: سعيد صلاح وشبيهاتها ──
+        ("productcard__name",           "اسم المنتج"),
+        ("productcard__title",          "اسم المنتج"),
+        ("productcard__price",          "سعر المنتج"),
+        ("productcard__image",          "صورة المنتج"),
+        ("productcard__link",           "رابط المنتج"),
+        ("productcard__brand",          "الماركة"),
+        ("product-card__name",          "اسم المنتج"),
+        ("product-card__price",         "سعر المنتج"),
+        ("product-card__image",         "صورة المنتج"),
+        ("product-card__link",          "رابط المنتج"),
+        # ── Tailwind-ish / Salla / generic CSS ──
+        ("text-sm-2",                   "سعر المنتج"),
+        ("text-sm text-",               "سعر المنتج"),
+        ("text-sm",                     "سعر المنتج"),
+        ("text-base",                   "اسم المنتج"),
+        ("text-lg",                     "اسم المنتج"),
+        ("abs-size href",               "رابط المنتج"),
+        ("abs-size",                    "رابط المنتج"),
+        ("w-full src",                  "صورة المنتج"),
+        ("w-full h-",                   "صورة المنتج"),
+        ("w-full",                      "صورة المنتج"),
+        ("aspect-square",               "صورة المنتج"),
+        ("object-cover",                "صورة المنتج"),
+        ("object-contain",              "صورة المنتج"),
+        # ── HTML attributes (standalone) — أقل تحديداً ──
+        ("href",                        "رابط المنتج"),
+        ("src",                         "صورة المنتج"),
         # ── English keywords ──
-        ("product_name",              "اسم المنتج"),
-        ("productname",               "اسم المنتج"),
-        ("product_title",             "اسم المنتج"),
-        ("title",                     "اسم المنتج"),
-        ("price",                     "سعر المنتج"),
-        ("image_url",                 "صورة المنتج"),
-        ("image",                     "صورة المنتج"),
-        ("img",                       "صورة المنتج"),
-        ("photo",                     "صورة المنتج"),
-        ("product_url",               "رابط المنتج"),
-        ("product_link",              "رابط المنتج"),
-        ("link",                      "رابط المنتج"),
-        ("url",                       "رابط المنتج"),
-        ("name",                      "اسم المنتج"),
+        ("product_name",                "اسم المنتج"),
+        ("productname",                 "اسم المنتج"),
+        ("product_title",               "اسم المنتج"),
+        ("product_price",               "سعر المنتج"),
+        ("productprice",                "سعر المنتج"),
+        ("title",                       "اسم المنتج"),
+        ("price",                       "سعر المنتج"),
+        ("image_url",                   "صورة المنتج"),
+        ("image",                       "صورة المنتج"),
+        ("img_url",                     "صورة المنتج"),
+        ("img",                         "صورة المنتج"),
+        ("photo",                       "صورة المنتج"),
+        ("thumbnail",                   "صورة المنتج"),
+        ("product_url",                 "رابط المنتج"),
+        ("product_link",                "رابط المنتج"),
+        ("link",                        "رابط المنتج"),
+        ("url",                         "رابط المنتج"),
+        ("name",                        "اسم المنتج"),
+        ("brand",                       "الماركة"),
         # ── Arabic keywords ──
-        ("اسم",                       "اسم المنتج"),
-        ("سعر",                       "سعر المنتج"),
-        ("صورة",                      "صورة المنتج"),
-        ("صوره",                      "صورة المنتج"),
-        ("رابط",                      "رابط المنتج"),
+        ("اسم المنتج",                  "اسم المنتج"),
+        ("أسم المنتج",                  "اسم المنتج"),
+        ("اسم",                         "اسم المنتج"),
+        ("سعر",                         "سعر المنتج"),
+        ("صورة",                        "صورة المنتج"),
+        ("صوره",                        "صورة المنتج"),
+        ("رابط",                        "رابط المنتج"),
+        ("ماركة",                       "الماركة"),
     ]
 
     KNOWN_EXACT = frozenset({
@@ -740,17 +830,16 @@ def _smart_rename_columns(df):
         if s in KNOWN_EXACT:
             return True
         sl = s.lower().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-        if sl in KNOWN_EXACT_EN:
-            return True
-        return False
+        return sl in KNOWN_EXACT_EN
 
     new_cols = {}
     used = set()
 
+    # مرور أول: مطابقة أنماط CSS (الأكثر تحديداً ينتصر — الترتيب حاسم)
     for col in cols:
         if _known_header(col):
             continue
-        csl = str(col).lower()
+        csl = str(col).lower().strip()
         for needle, std in CSS_PATTERNS:
             if needle in csl:
                 if std in used:
@@ -759,18 +848,18 @@ def _smart_rename_columns(df):
                 used.add(std)
                 break
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 2: فكّ التعارضات بتحليل المحتوى
+    #  إذا عمودان تطابقا مع نفس الدور (مثلاً: src + href كلاهما URLs)
+    #  أو بقيت أعمدة Unnamed/CSS بدون تعيين → نحللها بالمحتوى
+    # ═══════════════════════════════════════════════════════════════════
     for col in cols:
         if col in new_cols or _known_header(col):
             continue
         c_str = str(col).strip()
         need_heuristic = (
             c_str.startswith("Unnamed")
-            or "__" in c_str
-            or "style" in c_str.lower()
-            or "text-" in c_str.lower()
-            or "href" in c_str.lower()
-            or "src" in c_str.lower()
-            or "w-full" in c_str.lower()
+            or _DIRTY_COL_RE.search(c_str)
         )
         if not need_heuristic:
             continue
@@ -780,7 +869,10 @@ def _smart_rename_columns(df):
             continue
         vs = [v.strip() for v in sample.tolist()]
         n = len(vs)
+        if n == 0:
+            continue
 
+        # ── أسعار: أرقام بين 0.5 و 10,000,000 ──
         numeric_count = 0
         for v in vs:
             try:
@@ -791,30 +883,27 @@ def _smart_rename_columns(df):
                     .replace("SAR", "")
                     .strip()
                 )
-                if 0 <= x <= 10_000_000:
+                if 0 < x <= 10_000_000:
                     numeric_count += 1
             except (ValueError, TypeError):
                 pass
-        if numeric_count >= n * 0.6 and "سعر المنتج" not in used:
+        if numeric_count >= n * 0.55 and "سعر المنتج" not in used:
             new_cols[col] = "سعر المنتج"
             used.add("سعر المنتج")
             continue
 
-        url_count = sum(1 for v in vs if v.startswith("http"))
-        if url_count >= n * 0.5:
+        # ── روابط: http(s)://... ──
+        url_count = sum(1 for v in vs if "http://" in v.lower() or "https://" in v.lower())
+        if url_count >= n * 0.4:
             img_count = sum(
-                1
-                for v in vs
+                1 for v in vs
                 if (
-                    ("cdn.salla" in v or "cdn." in v.lower())
-                    or ".jpg" in v.lower()
-                    or ".png" in v.lower()
-                    or ".webp" in v.lower()
-                    or ".jpeg" in v.lower()
-                    or _IMG_URL_RE.search(v.lower())
+                    _IMG_URL_RE.search(v.lower())
+                    or "cdn.salla" in v
+                    or "cdn." in v.lower()
                 )
             )
-            if img_count >= max(1, n * 0.4) and "صورة المنتج" not in used:
+            if img_count >= max(1, n * 0.35) and "صورة المنتج" not in used:
                 new_cols[col] = "صورة المنتج"
                 used.add("صورة المنتج")
             elif "رابط المنتج" not in used:
@@ -822,34 +911,39 @@ def _smart_rename_columns(df):
                 used.add("رابط المنتج")
             continue
 
-        if "اسم المنتج" not in used:
+        # ── نصوص: اسم المنتج (أكثر من 5 أحرف في العينة) ──
+        avg_len = sum(len(v) for v in vs) / max(n, 1)
+        if avg_len >= 5 and "اسم المنتج" not in used:
             new_cols[col] = "اسم المنتج"
             used.add("اسم المنتج")
-        else:
-            new_cols[col] = col
 
     if new_cols:
         df = df.rename(columns=new_cols)
 
-    # تنظيف إلزامي للأعمدة الأساسية الأربعة — يمنع NaN من كسر المحرك لاحقاً
-    for _req_col, _is_url in [
-        ("اسم المنتج",  False),
-        ("سعر المنتج",  False),
-        ("صورة المنتج", True),
-        ("رابط المنتج", True),
-    ]:
-        if _req_col in df.columns:
-            df[_req_col] = (
-                df[_req_col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                # تنظيف حرف الاقتباس والفراغات الملتصقة بالروابط
-                .str.strip('"\'') if _is_url
-                else df[_req_col].fillna("").astype(str).str.strip()
-            )
+    # ═══════════════════════════════════════════════════════════════════
+    #  المرحلة 3: تنظيف إلزامي — NaN + استخراج URLs نظيفة
+    # ═══════════════════════════════════════════════════════════════════
+    for _req_col in ("اسم المنتج", "سعر المنتج", "صورة المنتج", "رابط المنتج", "الماركة"):
+        if _req_col not in df.columns:
+            continue
+        df[_req_col] = df[_req_col].fillna("").astype(str).str.strip()
+
+    for _url_col in ("صورة المنتج", "رابط المنتج"):
+        if _url_col not in df.columns:
+            continue
+        df[_url_col] = (
+            df[_url_col]
+            .str.strip("\"'` \t\n\r")
+            .apply(lambda v: _extract_first_url(v) if v and "http" in v.lower() else v)
+        )
 
     return df
+
+
+def _extract_first_url(text: str) -> str:
+    """يستخرج أول رابط http(s) نظيف من نص قد يحتوي فوضى ملتصقة."""
+    m = _FIRST_URL_RE.search(text)
+    return m.group(1).rstrip(".,;)>]") if m else text.strip()
 
 # ── كلمات الضجيج التي تُشوّش المطابقة ──────────────────────────────
 _NOISE_RE = re.compile(
@@ -870,17 +964,16 @@ def normalize(text):
     """تطبيع قياسي: يوحّد الحروف والمرادفات مع الحفاظ على كامل النص"""
     if not isinstance(text, str): return ""
     t = text.strip().lower()
-    # ✅ إصلاح #4: المرادفات أولاً — يجب أن تسبق توحيد الهمزات
-    # (كانت مفاتيح _SYN بهمزات لا تُطابَق بعد توحيد الهمزات في الخطوة الأولى)
-    for k, v in _SYN.items():
-        t = t.replace(k, v)
-    # 2. توحيد الهمزات بعد المرادفات (لمعالجة ما تبقى من نصوص)
+    # 1. توحيد الهمزات أولاً (قبل أي استبدال)
     for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
                      ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
         t = t.replace(src, dst)
-    # 3. المرادفات المخصصة (من config.py)
+    # 2. المرادفات المخصصة
     for k, v in WORD_REPLACEMENTS.items():
         t = t.replace(k.lower(), v)
+    # 3. قاموس المرادفات الشامل
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
     t = re.sub(r'[^\w\s\u0600-\u06FF.]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
 
@@ -894,13 +987,13 @@ def normalize_name(text):
     """
     if not isinstance(text, str): return ""
     t = text.strip().lower()
-    # ✅ إصلاح #4: المرادفات أولاً — يجب أن تسبق توحيد الهمزات
-    for k, v in _SYN.items():
-        t = t.replace(k, v)
-    # 2. توحيد الهمزات بعد المرادفات
+    # 1. توحيد الهمزات أولاً
     for src, dst in [('أ','ا'),('إ','ا'),('آ','ا'),('ة','ه'),
                      ('ى','ي'),('ؤ','و'),('ئ','ي'),('ـ','')]:
         t = t.replace(src, dst)
+    # 2. قاموس المرادفات (ترجمة التهجئات البديلة)
+    for k, v in _SYN.items():
+        t = t.replace(k, v)
     # 3. حذف كلمات الضجيج
     t = _NOISE_RE.sub(' ', t)
     # 4. حذف الأرقام المتبقية + الرموز
@@ -932,19 +1025,14 @@ def extract_brand(text):
         if normalize(b) in n or b.lower() in tl: return b
     # 2. v26.0: تصحيح إملائي ذكي (fallback)
     words = text.split()
-    # ✅ إصلاح #5: حد أقصى 12 مجموعة كلمات لتجنب O(N×W×B) التكرار المفرط
-    candidates_checked = 0
     for i in range(len(words)):
-        for length in [3, 2, 1]:
+        for length in [3, 2, 1]:  # محاولة مجموعات من 3، 2، 1 كلمة
             if i + length <= len(words):
                 candidate = " ".join(words[i:i+length])
-                if len(candidate) >= 4:
+                if len(candidate) >= 4:  # تجنب الكلمات القصيرة جداً
                     corrected = _fuzzy_correct_brand(candidate, threshold=85)
                     if corrected:
                         return corrected
-                    candidates_checked += 1
-                    if candidates_checked >= 12:
-                        return ""
     return ""
 
 def extract_type(text):
@@ -1107,7 +1195,7 @@ def _price(row):
     return 0.0
 
 def _fcol(df, cands):
-    """بحث مرن عن العمود — يعيد None إذا لم يجد تطابقاً."""
+    """بحث مرن عن العمود — يدعم الهمزات والبحث الجزئي"""
     cols = list(df.columns)
     # بحث 1: تطابق تام
     for c in cands:
@@ -1124,7 +1212,7 @@ def _fcol(df, cands):
         for col in cols:
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
-    return None
+    return cols[0] if cols else ""
 
 
 def _fcol_optional(df, cands):
@@ -1156,7 +1244,8 @@ def _fcol_optional(df, cands):
 
 
 def _find_image_column(df):
-    """عمود صورة المنتج — يشمل تصدير سلة ([n] الصورة / اللون) ومرادفات."""
+    """عمود صورة المنتج — يشمل تصدير سلة ([n] الصورة / اللون) ومرادفات.
+    Fallback: فحص المحتوى لروابط CDN من سلة (cdn.salla.sa / cdn-cgi/image)."""
     if df is None or df.empty:
         return None
     c = _fcol_optional(df, [
@@ -1166,6 +1255,7 @@ def _find_image_column(df):
     ])
     if c:
         return c
+    # بحث جزئي في اسم العمود
     for col in df.columns:
         sc = str(col)
         if "وصف صورة" in sc or "وصف صوره" in sc:
@@ -1173,6 +1263,25 @@ def _find_image_column(df):
         if "صورة" in sc or "image" in sc.lower():
             return col
         if "thumb" in sc.lower() and "url" not in sc.lower():
+            return col
+    # Fallback: فحص المحتوى — يكتشف عمود صور سلة حتى لو كان اسمه CSS غريب
+    for col in df.columns:
+        sc = str(col)
+        if "وصف صورة" in sc or "وصف صوره" in sc or "رابط" in sc:
+            continue
+        sample = df[col].dropna().astype(str).head(20)
+        img_hits = sum(
+            1 for v in sample
+            if (
+                "cdn.salla" in v
+                or "cdn-cgi/image" in v
+                or (v.startswith("http") and _IMG_URL_RE.search(v.lower()))
+                or (v.startswith("http") and any(
+                    x in v for x in (".jpg", ".png", ".webp", ".jpeg", ".gif")
+                ))
+            )
+        )
+        if img_hits >= max(1, len(sample) * 0.3):
             return col
     return None
 
@@ -1280,7 +1389,16 @@ def _name_col_for_analysis(df):
         return ""
     if "المنتج" in df.columns:
         return "المنتج"
-    return _find_product_name_column(df)
+    result = _find_product_name_column(df)
+    # #region agent log H2/H3
+    try:
+        import json, time
+        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+            _lf.write(json.dumps({"sessionId":"89f8c7","hypothesisId":"H2","location":"engine.py:_name_col_for_analysis","message":"name_col_detected","data":{"cols":list(df.columns)[:10],"detected":result},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    return result
 
 
 def _first_product_page_url_from_row(row):
@@ -1396,7 +1514,12 @@ def apply_user_column_map(df, name=None, price=None, id_col=None, img=None, url=
 class CompIndex:
     """فهرس المنافس المطبَّع مسبقاً"""
     def __init__(self, df, name_col, id_col, comp_name, img_col=None, url_col=None):
-        self.comp_name = comp_name
+        # ── Phase 1: حل اسم المنافس عبر جدول aliases لمنع التكرار ──────────
+        try:
+            from utils.db_manager import resolve_competitor as _resolve_comp
+            self.comp_name = _resolve_comp(comp_name)
+        except Exception:
+            self.comp_name = comp_name  # fallback آمن بدون كسر التوافقية
         self.name_col  = name_col
         self.id_col    = id_col
         self.img_col   = (img_col or "") or ""
@@ -1459,7 +1582,14 @@ class CompIndex:
 
             # ═══ فلاتر سريعة ═══
             if our_br and c_br and normalize(our_br) != normalize(c_br): continue
-            if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 30: continue
+
+            # ── Phase 1: Zero Tolerance للحجم ──────────────────────────────
+            # ① استبعاد المنافس مجهول الحجم (c_sz == 0) تماماً عند معرفة حجمنا
+            if our_sz > 0 and c_sz == 0: continue
+            # ② مطابقة تامة للحجم — صفر تسامح (our_sz != c_sz بدل > 30)
+            if our_sz > 0 and c_sz > 0 and our_sz != c_sz: continue
+            # ── نهاية Zero Tolerance ────────────────────────────────────────
+
             if our_tp and c_tp and our_tp != c_tp:
                 if our_sz > 0 and c_sz > 0 and abs(our_sz - c_sz) > 3: continue
             if our_gd and c_gd and our_gd != c_gd: continue
@@ -1683,19 +1813,17 @@ def _ai_batch(batch):
             raw = json.loads(clean[s:e]).get("results", [])
             out = []
             for j, it in enumerate(batch):
-                # ✅ إصلاح #3: JSON مقتطع → 0 يُترجم لـ -1 (لا تطابق)
-                n = raw[j] if j < len(raw) else 0
+                n = raw[j] if j < len(raw) else 1
                 try:
                     n = int(float(str(n)))
                 except Exception:
-                    n = 0
+                    n = 1
                 if 1 <= n <= len(it["candidates"]):
                     out.append(n - 1)
                 elif n == 0:
                     out.append(-1)
                 else:
-                    # ✅ إصلاح #3: رقم خارج النطاق → -1 لا index 0
-                    out.append(-1)
+                    out.append(0)
             return out if len(out) == len(batch) else None
         except Exception:
             return None
@@ -1717,8 +1845,18 @@ def _ai_batch(batch):
                     _cset(ck, out)
                     return out
             elif r.status_code == 429:
-                # ✅ إصلاح #2: Rate limit → تخطّ هذا المفتاح مباشرة (لا sleep في main thread)
-                continue
+                # rate limit → انتظر أطول ثم جرب نفس المفتاح مرة أخرى
+                time.sleep(3)
+                try:
+                    r2 = _req.post(f"{_GURL}?key={key}", json=g_payload, timeout=25)
+                    if r2.status_code == 200:
+                        txt = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        out = _parse(txt)
+                        if out:
+                            _cset(ck, out)
+                            return out
+                except Exception:
+                    pass
             # 403/400 → جرب المفتاح التالي فوراً
         except Exception:
             continue
@@ -1810,6 +1948,7 @@ def _excluded_match_row(
         تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
         صورة_منتجنا=our_img or "",
         رابط_منتجنا=our_url or "",
+        صورة_المنافس="",
         رابط_المنافس="",
     )
 
@@ -1835,6 +1974,13 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
 
     cp    = float(best.get("price") or 0)
     score = float(best.get("score") or 0)
+    comp_img = str(
+        best.get("صورة_المنافس")
+        or best.get("image_url")
+        or best.get("thumb")
+        or best.get("صورة_المنتج")
+        or ""
+    ).strip()
     diff  = round(our_price - cp, 2) if (our_price>0 and cp>0) else 0
     # نظام الخطورة حسب AI_COMPARISON_INSTRUCTIONS (نسبة مئوية + ثقة)
     diff_pct = abs((diff / cp) * 100) if cp > 0 else 0
@@ -1888,6 +2034,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
                 جميع_المنافسين=ac, مصدر_المطابقة=src or "fuzzy",
                 تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
                 صورة_منتجنا=our_img or "", رابط_منتجنا=our_url or "",
+                صورة_المنافس=comp_img,
                 رابط_المنافس=str(best.get("product_url") or best.get("url") or "").strip())
 
 
@@ -1910,14 +2057,32 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
         "skipped_samples": 0,
         "no_competitor_found": 0,
     }
+    our_df = _force_ingestion_cleanup(our_df)
+    comp_dfs = {
+        str(cname): _force_ingestion_cleanup(cdf)
+        for cname, cdf in (comp_dfs or {}).items()
+        if cdf is not None
+    }
+    if our_df is None or our_df.empty or not comp_dfs:
+        return pd.DataFrame(results), audit_stats
+
     our_col       = _name_col_for_analysis(our_df)
     our_price_col = _fcol(our_df, ["سعر المنتج","السعر","سعر","Price","price","PRICE"])
     our_id_col    = _fcol_optional(our_df, [
         "رقم المنتج","معرف المنتج","المعرف","معرف","رقم_المنتج","معرف_المنتج",
         "product_id","Product ID","Product_ID","ID","id","Id",
-        "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku",
+        "No.","no.","No","no","#",
+        "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku","رمز المنتج SKU",
         "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
     ]) or ""
+    # #region agent log H3
+    try:
+        import json as _jl, time as _tl
+        with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf:
+            _lf.write(_jl.dumps({"sessionId":"89f8c7","hypothesisId":"H3","location":"engine.py:run_full_analysis","message":"our_cols_and_id","data":{"our_cols":list(our_df.columns)[:15],"our_col":our_col,"our_id_col":our_id_col,"our_price_col":our_price_col,"comp_keys":list(comp_dfs.keys())},"timestamp":int(_tl.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
     our_img_col = _fcol_optional(our_df, [
         "صورة المنتج", "صوره المنتج", "image", "Image", "product_image", "الصورة",
     ])
@@ -1936,12 +2101,31 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             "SKU","sku","Sku","رمز المنتج","رمز_المنتج","رمز المنتج sku",
             "الكود","كود","Code","code","الرقم","رقم","Barcode","barcode","الباركود"
         ]) or ""
-        c_img = _fcol_optional(cdf, [
-            "صورة المنتج", "صوره المنتج", "image", "Image", "product_image", "الصورة",
-        ])
-        c_url = _fcol_optional(cdf, [
-            "رابط المنتج", "الرابط", "رابط", "product_url", "link", "url", "URL",
-        ])
+        # _find_image_column أشمل من _fcol_optional — يغطي تصدير سلة وكل المرادفات
+        c_img = _find_image_column(cdf)
+        c_url = _find_url_column(cdf)
+        # #region agent log H_IMG
+        try:
+            import time as _tim_img
+            _sample_img_vals = []
+            if c_img and c_img in cdf.columns:
+                _sample_img_vals = cdf[c_img].dropna().astype(str).head(3).tolist()
+            with open("debug-89f8c7.log", "a", encoding="utf-8") as _lf_img:
+                _lf_img.write(json.dumps({
+                    "sessionId": "89f8c7", "hypothesisId": "H_IMG",
+                    "location": "engine.py:CompIndex_build",
+                    "message": "img_col detection",
+                    "data": {
+                        "cname": str(cname),
+                        "img_col": str(c_img),
+                        "all_cols": [str(c) for c in cdf.columns.tolist()[:15]],
+                        "sample_img_vals": _sample_img_vals,
+                    },
+                    "timestamp": int(_tim_img.time() * 1000)
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         indices[cname] = CompIndex(cdf, ccol, icol, cname, img_col=c_img, url_col=c_url)
 
     total   = len(our_df)
@@ -1965,8 +2149,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                     idxs.append(-1)
         for j, it in enumerate(pending):
             try:
-                # ✅ إصلاح: idxs أقصر → -1 (لا تطابق) لا index 0
-                ci = idxs[j] if j < len(idxs) else -1
+                ci = idxs[j] if j < len(idxs) else 0
                 if ci < 0:
                     # AI غير متأكد → أعطِ أفضل مرشح كمراجعة
                     best_fallback = it["candidates"][0] if it["candidates"] else None
@@ -1987,7 +2170,11 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                 # خطأ في منتج واحد → تخطيه وأكمل
                 continue
         pending.clear()
-        # ✅ إصلاح #2: حذف time.sleep(0.5) — مخالف لقواعد Streamlit Main Thread
+        # تأخير صغير بين الباتشات لمنع rate limit
+        try:
+            time.sleep(0.5)
+        except Exception:
+            pass
 
     def _cell_clean(r, col):
         if not col or col not in r.index:
@@ -2123,6 +2310,15 @@ def find_missing_products(our_df, comp_dfs):
     ✅ حد ثقة مزدوج: موجود(82%) / مشابه(68%)
     ✅ منع التكرار من منافسين مختلفين
     """
+    our_df = _force_ingestion_cleanup(our_df)
+    comp_dfs = {
+        str(cname): _force_ingestion_cleanup(cdf)
+        for cname, cdf in (comp_dfs or {}).items()
+        if cdf is not None
+    }
+    if our_df is None or our_df.empty or not comp_dfs:
+        return pd.DataFrame([])
+
     our_col = _name_col_for_analysis(our_df)
 
     # ── بناء فهرس منتجاتنا الكامل ─────────────────────────────────────
