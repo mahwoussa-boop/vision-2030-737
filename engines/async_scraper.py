@@ -81,6 +81,7 @@ OUTPUT_CSV       = os.path.join(_DATA_DIR, "competitors_latest.csv")
 PROGRESS_FILE    = os.path.join(_DATA_DIR, "scraper_progress.json")
 LASTMOD_FILE     = os.path.join(_DATA_DIR, "scraper_lastmod.json")
 STATE_FILE       = os.path.join(_DATA_DIR, "scraper_state.json")   # نقاط الاستئناف
+PID_FILE         = os.path.join(_DATA_DIR, "scraper.pid")
 
 CSV_COLS = [
     "store", "name", "price", "original_price",
@@ -99,6 +100,9 @@ class Progress:
     running: bool = False
     started_at: str = ""
     finished_at: str = ""
+    last_updated: str = ""
+    phase: str = "discovering"
+    pid: int = 0
     stores_total: int = 0
     stores_done: int = 0
     urls_total: int = 0
@@ -115,6 +119,8 @@ class Progress:
 
     def save(self, path: str = PROGRESS_FILE) -> None:
         try:
+            self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.pid = os.getpid()
             with _PROGRESS_WRITE_LOCK:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(asdict(self), f, ensure_ascii=False, indent=2)
@@ -128,6 +134,34 @@ class Progress:
                 return cls(**json.load(f))
         except Exception:
             return cls()
+
+
+def _write_pid_file() -> None:
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        logger.warning(f"تعذّر حفظ PID: {e}")
+
+
+def _cleanup_pid_file() -> None:
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except Exception as e:
+        logger.warning(f"تعذّر حذف PID file: {e}")
+
+
+def _mark_progress_failed(message: str) -> None:
+    try:
+        progress = Progress.load()
+        progress.running = False
+        progress.phase = "failed"
+        progress.finished_at = datetime.now().isoformat()
+        progress.last_error = (message or "")[:300]
+        progress.save()
+    except Exception as e:
+        logger.warning(f"تعذّر تحديث حالة الفشل: {e}")
 
 
 @dataclass
@@ -673,10 +707,13 @@ def run_single_store(
         started_at=datetime.now().isoformat(),
         stores_total=1,
         current_store=domain,
+        phase="discovering",
     )
     progress.save()
 
     try:
+        progress.phase = "scraping"
+        progress.save()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         rows = loop.run_until_complete(
@@ -690,6 +727,9 @@ def run_single_store(
         )
     except Exception as e:
         progress.running = False
+        progress.phase = "failed"
+        progress.finished_at = datetime.now().isoformat()
+        progress.last_error = str(e)[:300]
         progress.save()
         state.mark_error(domain, str(e))
         return {"success": False, "rows": 0, "message": str(e), "domain": domain}
@@ -701,6 +741,7 @@ def run_single_store(
 
     n = _merge_rows_to_csv(rows, domain)
     progress.running     = False
+    progress.phase       = "completed"
     progress.finished_at = datetime.now().isoformat()
     progress.stores_done = 1
     progress.rows_in_csv = n
@@ -765,6 +806,7 @@ async def run_scraper(
         running=True,
         started_at=datetime.now().isoformat(),
         stores_total=len(stores),
+        phase="discovering",
     )
     progress.save()
 
@@ -773,6 +815,7 @@ async def run_scraper(
         logger.info(f"\n{'═'*60}\n🏪 [{i}/{len(stores)}] {domain}\n{'═'*60}")
         progress.stores_done   = i - 1
         progress.current_store = domain
+        progress.phase         = "scraping"
         progress.save()
 
         rows = await scrape_one_store(
@@ -788,6 +831,7 @@ async def run_scraper(
         progress.save()
 
     progress.running     = False
+    progress.phase       = "completed"
     progress.finished_at = datetime.now().isoformat()
     progress.save()
 
@@ -818,27 +862,36 @@ def main():
     args = parser.parse_args()
 
     resume = not args.no_resume
+    _write_pid_file()
 
-    if args.reset_state:
-        ScraperState().reset()
-        logger.info("🗑️ تم مسح نقاط الاستئناف")
+    try:
+        if args.reset_state:
+            ScraperState().reset()
+            logger.info("🗑️ تم مسح نقاط الاستئناف")
 
-    if args.store:
-        result = run_single_store(
-            args.store,
-            concurrency=args.concurrency,
-            max_products=args.max_products,
-            force=not resume,
-        )
-        logger.info(result["message"])
-    else:
-        asyncio.run(
-            run_scraper(
+        if args.store:
+            result = run_single_store(
+                args.store,
                 concurrency=args.concurrency,
                 max_products=args.max_products,
-                resume=resume,
+                force=not resume,
             )
-        )
+            logger.info(result["message"])
+            if not result.get("success", False):
+                _mark_progress_failed(result.get("message", "فشل تشغيل الكاشط"))
+        else:
+            asyncio.run(
+                run_scraper(
+                    concurrency=args.concurrency,
+                    max_products=args.max_products,
+                    resume=resume,
+                )
+            )
+    except Exception as e:
+        _mark_progress_failed(str(e))
+        raise
+    finally:
+        _cleanup_pid_file()
 
 
 if __name__ == "__main__":
