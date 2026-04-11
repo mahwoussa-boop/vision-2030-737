@@ -740,11 +740,12 @@ def run_single_store(
             pass
 
     n = _merge_rows_to_csv(rows, domain)
-    progress.running     = False
-    progress.phase       = "completed"
-    progress.finished_at = datetime.now().isoformat()
-    progress.stores_done = 1
-    progress.rows_in_csv = n
+    progress.running      = False
+    progress.phase        = "completed"
+    progress.finished_at  = datetime.now().isoformat()
+    progress.stores_done  = 1
+    progress.stores_results[domain] = len(rows)
+    progress.rows_in_csv  = n
     progress.save()
 
     return {

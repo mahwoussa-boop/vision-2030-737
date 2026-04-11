@@ -1610,7 +1610,11 @@ with st.sidebar:
     st.markdown("---")
     if st.session_state.results:
         r = st.session_state.results
-        st.markdown("**📊 ملخص:**")
+        _all_df_summary = r.get("all", pd.DataFrame())
+        _analysis_total = len(_all_df_summary) if isinstance(_all_df_summary, pd.DataFrame) else 0
+        st.markdown("**📊 ملخص آخر تحليل:**")
+        if _analysis_total:
+            st.caption(f"يعرض توزيع **{_analysis_total:,}** من منتجاتنا المحللة، وليس عدد صفوف ملف المنافس.")
         for key, icon, label in [
             ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
             ("approved","✅","موافق"), ("missing","🔍","مفقود"),
@@ -1714,6 +1718,9 @@ if page == "📊 لوحة التحكم":
 
     if st.session_state.results:
         r = st.session_state.results
+        _analysis_total_dash = len(r.get("all", pd.DataFrame())) if isinstance(r.get("all", pd.DataFrame()), pd.DataFrame) else 0
+        if _analysis_total_dash:
+            st.caption(f"ملخص هذه الصفحة يخص آخر تحليل محفوظ لعدد **{_analysis_total_dash:,}** من منتجاتنا.")
         _dash_nav = [
             ("🔴 سعر أعلى", "🔴", "سعر أعلى", "price_raise"),
             ("🟢 سعر أقل", "🟢", "سعر أقل", "price_lower"),
@@ -1939,11 +1946,46 @@ if page == "📊 لوحة التحكم":
 
                     comp_dfs = {}
                     if _auto_mode:
-                        # ── وضع الكشط التلقائي: تحميل CSV من القرص ────────
+                        # ── وضع الكشط التلقائي: تحميل CSV من القرص مع فصل كل متجر كمنافس مستقل ────────
                         try:
                             _auto_df = pd.read_csv(_AUTO_CSV, encoding="utf-8-sig")
-                            comp_dfs["competitors_latest.csv"] = _auto_df
-                            st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج")
+                            _auto_store_col = next(
+                                (
+                                    _c for _c in _auto_df.columns
+                                    if str(_c).strip().lower() in ("store", "domain", "المتجر", "المنافس")
+                                ),
+                                None,
+                            )
+
+                            if _auto_store_col:
+                                _auto_df[_auto_store_col] = _auto_df[_auto_store_col].fillna("").astype(str).str.strip()
+                                _grouped_auto = _auto_df[_auto_df[_auto_store_col] != ""].groupby(_auto_store_col, sort=False)
+                                for _store_name, _store_df in _grouped_auto:
+                                    _store_key = str(_store_name).strip()
+                                    _store_key = _store_key.replace("https://", "").replace("http://", "").strip("/")
+                                    _store_key = _store_key.split("/")[0] or "competitors_latest.csv"
+                                    if _store_key in comp_dfs:
+                                        comp_dfs[_store_key] = pd.concat(
+                                            [comp_dfs[_store_key], _store_df.copy()],
+                                            ignore_index=True,
+                                        )
+                                    else:
+                                        comp_dfs[_store_key] = _store_df.reset_index(drop=True).copy()
+
+                                _unassigned_auto = _auto_df[_auto_df[_auto_store_col] == ""]
+                                if not _unassigned_auto.empty:
+                                    comp_dfs["competitors_latest.csv"] = _unassigned_auto.reset_index(drop=True).copy()
+
+                                if comp_dfs:
+                                    st.caption(
+                                        f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} صف من {len(comp_dfs):,} متجر منافس"
+                                    )
+                                else:
+                                    comp_dfs["competitors_latest.csv"] = _auto_df
+                                    st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج")
+                            else:
+                                comp_dfs["competitors_latest.csv"] = _auto_df
+                                st.caption(f"✅ تم تحميل البيانات الآلية: {len(_auto_df):,} منتج")
                         except Exception as _ae:
                             st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
                     else:
@@ -3978,7 +4020,10 @@ elif page == "🕷️ كشط المنافسين":
             ):
                 st.session_state._nav_pending    = "📊 لوحة التحكم"
                 st.session_state["_use_auto_scraper"] = True
-                st.session_state.nav_flash       = "🤖 تم تفعيل البيانات الآلية"
+                st.session_state.results         = None
+                st.session_state.analysis_df     = None
+                st.session_state.last_audit_stats = None
+                st.session_state.nav_flash       = "🤖 تم تفعيل البيانات الآلية وتمت تهيئة الشاشة لتحليل جديد"
                 st.rerun()
 
     # ════════════════════════════════════════════════════════════════════════
