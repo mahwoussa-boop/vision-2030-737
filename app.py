@@ -1626,7 +1626,8 @@ with st.sidebar:
         r = st.session_state.results
         _all_df_summary = r.get("all", pd.DataFrame())
         _analysis_total = len(_all_df_summary) if isinstance(_all_df_summary, pd.DataFrame) else 0
-        _is_scraper_page = page == "🕷️ كشط المنافسين"
+        _selected_page = st.session_state.get("main_nav", "")
+        _is_scraper_page = _selected_page == "🕷️ كشط المنافسين"
 
         if _is_scraper_page:
             st.info(
