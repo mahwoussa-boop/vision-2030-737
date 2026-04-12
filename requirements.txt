@@ -1,5 +1,6 @@
 streamlit==1.55.0
 pandas==2.3.3
+# مطلوب لـ utils/salla_shamel_export.py (تصدير سلة الشامل .xlsx)
 openpyxl==3.1.5
 rapidfuzz==3.14.3
 requests==2.33.0
