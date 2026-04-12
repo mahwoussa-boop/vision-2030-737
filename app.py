@@ -72,6 +72,11 @@ from engines.ai_engine import (call_ai, verify_match, analyze_product,
                                 reclassify_review_items, ai_deep_analysis,
                                 generate_seo_description)
 from engines.analysis_job_runner import run_analysis_background_job as _run_analysis_background
+from engines.reconciliation_engine import (
+    failed_rows_to_csv_bytes,
+    merge_reconciliation_into_audit,
+    reconcile_competitor_upload,
+)
 from engines.file_reader import load_competitor_csv_for_matching
 from engines.automation import (AutomationEngine, ScheduledSearchManager,
                                  auto_push_decisions, auto_process_review_items,
@@ -248,6 +253,8 @@ _defaults = {
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
     "nav_flash": None,    # رسالة انتقال سريعة من أزرار لوحة التحكم
     "last_audit_stats": None,  # عدادات تدقيق من run_full_analysis
+    "reconciliation_report": None,
+    "reconciliation_failed_csv": None,
     "_action_toast": None, # رسالة نجاح/فشل Callback تُعرض كـ toast
 }
 for k, v in _defaults.items():
@@ -580,6 +587,52 @@ def _render_audit_bar(audit_stats: dict):
             f"🚨 تحذير تدقيق: المدخلات ({ti}) لا تساوي مجموع الحالات ({tot}) — "
             f"معالج={pr} + بدون منافس={nc} + فارغ={se} + عينة/صغير={sk}."
         )
+
+
+def _render_reconciliation_dashboard(audit_stats: dict):
+    """لوحة محاسبة صفوف ملفات المنافسين (مدخلات = متطابق + جديد + تالف)."""
+    if not audit_stats:
+        return
+    rec = audit_stats.get("reconciliation")
+    if not rec:
+        return
+    x = int(rec.get("total_read") or 0)
+    y = int(rec.get("matched") or 0)
+    z = int(rec.get("new_ready") or 0)
+    w = int(rec.get("corrupted") or 0)
+    st.markdown("##### 📊 محاسبة رفع المنافسين (Reconciliation)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🟢 إجمالي تمت قراءته", x)
+    c2.metric("🔵 متطابق وتمت معالجته", y)
+    c3.metric("🟡 منتجات جديدة (جاهزة للتصدير لسلة)", z)
+    c4.metric("🔴 سجلات تالفة", w)
+    if not rec.get("balance_ok", True) and rec.get("warning_message"):
+        st.warning(rec["warning_message"])
+    _fb = st.session_state.get("reconciliation_failed_csv")
+    if not _fb:
+        from pathlib import Path
+
+        _fp = audit_stats.get("reconciliation_failed_csv_path")
+        if _fp:
+            p = Path(str(_fp))
+            if p.is_file():
+                try:
+                    _fb = p.read_bytes()
+                    st.session_state.reconciliation_failed_csv = _fb
+                except OSError:
+                    _fb = None
+    if _fb:
+        st.download_button(
+            label="⬇️ تنزيل failed_rows_log.csv (الصفوف التالفة)",
+            data=_fb,
+            file_name="failed_rows_log.csv",
+            mime="text/csv",
+            key="dl_failed_rows_log",
+        )
+    st.caption(
+        "الأرقام تعكس **صفوف ملفات المنافس** في آخر تشغيل؛ إن فعّلت الدمج التراكمي قد يزيد عدد "
+        "صفوف «منتجات مفقودة» في الجداول دون أن يغيّر إجمالي المدخلات أعلاه."
+    )
 
 
 def _find_analysis_row_for_processed(product_name: str):
@@ -1715,6 +1768,7 @@ if page == "📊 لوحة التحكم":
     db_log("dashboard", "view")
     if st.session_state.get("last_audit_stats"):
         _render_audit_bar(st.session_state.last_audit_stats)
+        _render_reconciliation_dashboard(st.session_state.last_audit_stats)
 
     # تغييرات الأسعار
     changes = get_price_changes(7)
@@ -2148,8 +2202,40 @@ if page == "📊 لوحة التحكم":
                             st.caption("📎 وُدمت نتائج التحليل مع الجلسة السابقة.")
                     st.session_state.last_audit_stats = audit_stats
                     _render_audit_bar(audit_stats)
-                    raw_missing_df = find_missing_products(our_df, comp_dfs)
-                    missing_df = smart_missing_barrier(raw_missing_df, our_df)
+                    try:
+                        _rec = reconcile_competitor_upload(our_df, comp_dfs)
+                        missing_df = smart_missing_barrier(_rec.new_products_df, our_df)
+                        _rec.apply_smart_barrier_adjustment(missing_df)
+                        audit_stats = merge_reconciliation_into_audit(audit_stats, _rec)
+                        st.session_state.last_audit_stats = audit_stats
+                        st.session_state.reconciliation_report = _rec.to_dict()
+                        st.session_state.reconciliation_failed_csv = (
+                            failed_rows_to_csv_bytes(_rec.failed_df)
+                            if _rec.failed_df is not None and not _rec.failed_df.empty
+                            else None
+                        )
+                        if _rec.failed_df is not None and not _rec.failed_df.empty:
+                            import os
+
+                            _dd = os.environ.get("DATA_DIR", "data")
+                            os.makedirs(_dd, exist_ok=True)
+                            _fj = os.path.join(
+                                _dd,
+                                f"failed_rows_{st.session_state.get('job_id') or 'local'}.csv",
+                            )
+                            try:
+                                _rec.failed_df.to_csv(_fj, index=False, encoding="utf-8-sig")
+                                audit_stats["reconciliation_failed_csv_path"] = _fj
+                                st.session_state.last_audit_stats = audit_stats
+                            except OSError:
+                                pass
+                    except Exception as _rec_err:
+                        st.warning(f"⚠️ محرك المحاسبة: {_rec_err} — يُستخدم مسار المفقودات السابق.")
+                        raw_missing_df = find_missing_products(our_df, comp_dfs)
+                        missing_df = smart_missing_barrier(raw_missing_df, our_df)
+                        st.session_state.reconciliation_report = None
+                        st.session_state.reconciliation_failed_csv = None
+                    _render_reconciliation_dashboard(st.session_state.get("last_audit_stats") or {})
                     if st.session_state.get("dash_accumulate_results", True):
                         _prev_miss_df = None
                         if st.session_state.get("results") and isinstance(
