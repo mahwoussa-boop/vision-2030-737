@@ -4203,7 +4203,7 @@ elif page == "🕷️ كشط المنافسين":
         with st.expander("🚀 أدوات الكشط المتقدمة", expanded=False):
             if hasattr(_scraper_advanced_runtime_mod, "show"):
                 try:
-                    _scraper_advanced_runtime_mod.show()
+                    _scraper_advanced_runtime_mod.show(embedded=True)
                 except Exception as _sa_render_err:
                     st.error(f"❌ خطأ في الأدوات المتقدمة: {_sa_render_err}")
             else:

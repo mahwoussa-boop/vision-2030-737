@@ -186,7 +186,7 @@ def get_main_css():
 .trust-green{background:rgba(0,200,83,.15);color:#00C853;border:1px solid #00C85366}
 .trust-yellow{background:rgba(255,214,0,.15);color:#FFD600;border:1px solid #FFD60066}
 .trust-red{background:rgba(255,23,68,.15);color:#FF1744;border:1px solid #FF174466}
-section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0E1117,#1A1A2E);transition:all .3s ease}
+section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0E1117,#1A1A2E);transition:background-color .25s ease,box-shadow .25s ease}
 #MainMenu,footer{visibility:hidden}
 /* header يبقى ظاهراً لأنه يحتوي على زر إظهار القائمة الجانبية */
 header[data-testid="stHeader"] {
