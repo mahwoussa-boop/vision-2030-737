@@ -37,8 +37,7 @@ if __name__ == "__main__":
 # ══════════════════════════════════════════════════════════════════════════════
 _PAGE_STYLES = """
 <style>
-body, .stApp { direction: rtl; }
-[data-testid="stSidebar"] { direction: rtl; }
+/* لا تُضبط direction على body/.stApp — يعكس ترتيب الشريط الجانبي/المحتوى في Streamlit */
 .comp-card {
     background: linear-gradient(135deg,#0d1b2a,#0a1520);
     border:1.5px solid #1e3a5f; border-radius:12px;
@@ -469,7 +468,7 @@ def _render_stats_bar(state_data: dict, stores_count: int) -> None:
 #  نقطة الدخول الرئيسية
 # ══════════════════════════════════════════════════════════════════════════════
 
-def show() -> None:
+def show(*, embedded: bool = False) -> None:
     _inject_page_styles()
     st.title("🕷️ كاشط المنافسين — لوحة التحكم المتقدمة")
     st.caption("كشط مستقل لكل منافس مع استئناف ذكي، تخطي Cloudflare، وتحديث حي")
@@ -479,73 +478,80 @@ def show() -> None:
         getattr(st, msg[0])(msg[1])
 
     # ════════════════════════════════════════════════════════════════════
-    #  Sidebar
+    #  Sidebar (صفحة مستقلة فقط — التضمين في app.py يفسد ترتيب الشريط الجانبي)
     # ════════════════════════════════════════════════════════════════════
-    with st.sidebar:
-        st.subheader("⚙️ إعدادات الكشط")
-        concurrency = st.number_input(
-            "طلبات متزامنة", 2, 30, 8, step=1, key="adv_concurrency",
-            help="عدد الطلبات المتزامنة لكل متجر",
-        )
-        all_flag = st.checkbox("جميع المنتجات (بلا سقف)", value=True, key="adv_all")
-        max_prod = st.number_input(
-            "أقصى منتجات / متجر", 0, 50000,
-            value=0 if all_flag else 1000, step=500,
-            disabled=all_flag, key="adv_max",
-        )
-        max_products = 0 if all_flag else max_prod
-
-        st.divider()
-        st.subheader("📊 ملخص الاستئناف")
-        state_data = _load_state()
-        ca, cb = st.columns(2)
-        ca.metric("✅ مكتمل", sum(1 for c in state_data.values() if c.get("status") == "done"))
-        cb.metric("❌ أخطاء", sum(1 for c in state_data.values() if c.get("status") == "error"))
-        st.metric("📋 مسجّل", len(state_data))
-
-        if st.button("🗑️ مسح كل نقاط الاستئناف", use_container_width=True):
-            _save_state({})
-            st.session_state["_sc_msg"] = ("success", "✅ تم مسح جميع نقاط الاستئناف")
-            st.rerun()
-
-        st.divider()
-        prog_now   = _load_progress()
-        is_running = bool(prog_now.get("running", False))
-
-        st.subheader("🚀 الكشط الشامل")
-        if is_running:
-            st.info(
-                f"🔄 **يعمل الآن**\n"
-                f"المتجر: `{prog_now.get('current_store','…')}`\n"
-                f"متاجر: {prog_now.get('stores_done',0)}/{prog_now.get('stores_total',1)}"
+    if embedded:
+        # إعدادات الكشط من شاشة «كشط المنافسين» الرئيسية (لا ودجات adv_* في الشريط)
+        concurrency = int(st.session_state.get("sc_concurrency", 8) or 8)
+        _all_emb = bool(st.session_state.get("sc_all_products", True))
+        _max_emb = int(st.session_state.get("sc_max_prod", 0) or 0)
+        max_products = 0 if _all_emb else _max_emb
+    else:
+        with st.sidebar:
+            st.subheader("⚙️ إعدادات الكشط")
+            concurrency = st.number_input(
+                "طلبات متزامنة", 2, 30, 8, step=1, key="adv_concurrency",
+                help="عدد الطلبات المتزامنة لكل متجر",
             )
-        else:
-            if st.button(
-                "🚀 كشط جميع المتاجر",
-                type="primary", use_container_width=True, key="adv_run_all",
-            ):
-                try:
-                    subprocess.Popen(
-                        [sys.executable, _SCRAPER_SCRIPT,
-                         "--max-products", str(max_products),
-                         "--concurrency", str(int(concurrency))],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                    st.session_state["_sc_msg"] = ("success", "🚀 الكشط الكلي بدأ في الخلفية")
-                except Exception as e:
-                    st.session_state["_sc_msg"] = ("error", str(e))
+            all_flag = st.checkbox("جميع المنتجات (بلا سقف)", value=True, key="adv_all")
+            max_prod = st.number_input(
+                "أقصى منتجات / متجر", 0, 50000,
+                value=0 if all_flag else 1000, step=500,
+                disabled=all_flag, key="adv_max",
+            )
+            max_products = 0 if all_flag else max_prod
+
+            st.divider()
+            st.subheader("📊 ملخص الاستئناف")
+            state_data = _load_state()
+            ca, cb = st.columns(2)
+            ca.metric("✅ مكتمل", sum(1 for c in state_data.values() if c.get("status") == "done"))
+            cb.metric("❌ أخطاء", sum(1 for c in state_data.values() if c.get("status") == "error"))
+            st.metric("📋 مسجّل", len(state_data))
+
+            if st.button("🗑️ مسح كل نقاط الاستئناف", use_container_width=True):
+                _save_state({})
+                st.session_state["_sc_msg"] = ("success", "✅ تم مسح جميع نقاط الاستئناف")
                 st.rerun()
 
-        st.divider()
-        with st.expander("🛡️ تقنيات ضد الحظر"):
-            st.markdown("""
+            st.divider()
+            prog_now   = _load_progress()
+            is_running = bool(prog_now.get("running", False))
+
+            st.subheader("🚀 الكشط الشامل")
+            if is_running:
+                st.info(
+                    f"🔄 **يعمل الآن**\n"
+                    f"المتجر: `{prog_now.get('current_store','…')}`\n"
+                    f"متاجر: {prog_now.get('stores_done',0)}/{prog_now.get('stores_total',1)}"
+                )
+            else:
+                if st.button(
+                    "🚀 كشط جميع المتاجر",
+                    type="primary", use_container_width=True, key="adv_run_all",
+                ):
+                    try:
+                        subprocess.Popen(
+                            [sys.executable, _SCRAPER_SCRIPT,
+                             "--max-products", str(max_products),
+                             "--concurrency", str(int(concurrency))],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                        st.session_state["_sc_msg"] = ("success", "🚀 الكشط الكلي بدأ في الخلفية")
+                    except Exception as e:
+                        st.session_state["_sc_msg"] = ("error", str(e))
+                    st.rerun()
+
+            st.divider()
+            with st.expander("🛡️ تقنيات ضد الحظر"):
+                st.markdown("""
 - 🔐 **curl_cffi** — TLS fingerprint (يتخطى Cloudflare)
 - 🕵️ **cloudscraper** — JS Challenge fallback
 - 🔄 **User-Agents 2026** حقيقية
 - ⏱️ **Rate Limiter تكيّفي** عند 429/403
 - 🔁 **Exponential Backoff** مع Jitter
-            """)
+                """)
 
     # ════════════════════════════════════════════════════════════════════
     #  Auto-Refresh ذكي — فقط عند وجود كشط نشط
