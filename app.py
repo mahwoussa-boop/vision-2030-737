@@ -2653,11 +2653,8 @@ elif page == "🔍 منتجات مفقودة":
                                 if frag_info.get("success"):
                                     raw_data += f", المكونات: {', '.join(frag_info.get('top_notes', []))}"
 
-                                # ── توليد الوصف بصيغة HTML (لا Markdown) ──────────────────────
-                                # generate_mahwous_description ترجع نصاً Markdown ثم نحوّله لـ HTML
-                                # عبر _markdown_to_salla_html في وقت التصدير (salla_shamel_export).
-                                # لكن الأفضل: نمرر بيانات Fragrantica لـ generate_mahwous_description
-                                # فتولّد وصفاً أكثر دقةً وأطول من generate_seo_description.
+                                # ── وصف تسويقي طويل (Markdown) لـ وصف_AI فقط — ليس عمود «الوصف» في CSV سلة ──
+                                # ملف سلة الجاهز يبني عمود «الوصف» من القالب الثابت داخل export_to_salla_shamel.
                                 html_body = generate_mahwous_description(
                                     product_name=p_name,
                                     price=p_price,
