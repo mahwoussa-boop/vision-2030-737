@@ -589,9 +589,10 @@ def read_file(f):
         df.columns = df.columns.map(lambda x: str(x).strip().replace('\ufeff', ''))
         df = df.dropna(how='all').reset_index(drop=True)
         df = _normalize_header_typos(df)
-        df = _drop_scraper_columns(df)
+        # إعادة تسمية أعمدة الكشط/سلة *قبل* حذف الأعمدة المشبوهة — وإلا تُفقد الحقول الأساسية
         df = _detect_double_header(df)
         df = _smart_rename_columns(df)
+        df = _drop_scraper_columns(df)
         df = _infer_column_roles(df)
         return df, None
     except Exception as e:
