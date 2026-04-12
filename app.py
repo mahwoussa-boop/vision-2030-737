@@ -1556,6 +1556,10 @@ def _auto_route_to_processed(our_name, our_id, comp_src, status, old_price=0, ne
 # ════════════════════════════════════════════════
 #  الشريط الجانبي
 # ════════════════════════════════════════════════
+# تهيئة آمنة للتنقّل قبل رسم الشريط الجانبي.
+# هذا يمنع NameError في أسفل الملف إذا تعذر تعيين قيمة `page`
+# لأي سبب أثناء بناء عناصر الشريط الجانبي في بعض البيئات.
+page = st.session_state.get("main_nav", SECTIONS[0] if SECTIONS else "📊 لوحة التحكم")
 with st.sidebar:
     st.markdown(f"## {APP_ICON} {APP_TITLE}")
     st.caption(f"الإصدار {APP_VERSION}")
@@ -1780,6 +1784,11 @@ if _at:
     else:
         st.error(_at_msg)
 
+
+# تأكيد احتياطي أخير قبل بدء توجيه الصفحات.
+# حتى لو تغيّر ترتيب التنفيذ مستقبلاً أو تعثر بناء عنصر التنقل،
+# تبقى قيمة `page` معرفة دائماً ولا ينهار التطبيق بسبب NameError.
+page = locals().get("page", st.session_state.get("main_nav", SECTIONS[0] if SECTIONS else "📊 لوحة التحكم"))
 
 # ════════════════════════════════════════════════
 #  0. مصنع المنتجات (Magic Factory) — مدمج من pages/magic_factory.py
