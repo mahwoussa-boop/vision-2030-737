@@ -25,6 +25,7 @@ import pandas as pd
 import threading
 import time
 import uuid
+from functools import partial
 from datetime import datetime
 
 try:
@@ -91,6 +92,8 @@ from utils.product_analyzer import analyze_product_inline, render_analysis_resul
 from utils.filter_ui import (render_sidebar_filters, apply_global_filters,
                               get_active_filter_summary)
 from utils.data_helpers import (safe_results_for_json, restore_results_from_json,
+                                merge_missing_products_dataframes,
+                                merge_price_analysis_dataframes,
                                 ts_badge, decision_badge,
                                 row_media_urls_from_analysis,
                                 our_product_url_from_row,
@@ -1951,6 +1954,22 @@ if page == "📊 لوحة التحكم":
             "حد الصفوف للمعالجة (0=كل)", 0, step=500, key="dash_max_rows"
         )
 
+    _copt3a, _copt3b = st.columns(2)
+    with _copt3a:
+        st.checkbox(
+            "📎 دمج نتائج التحليل مع النتائج الحالية في الجلسة (تراكمي)",
+            value=True,
+            key="dash_accumulate_results",
+            help="يُبقي صفوف التحليل السابقة؛ عند تكرار نفس المنتج/المنافس يُعتمد آخر تشغيل.",
+        )
+    with _copt3b:
+        st.checkbox(
+            "📚 تحديث كتالوج قاعدة البيانات من الملفات المرفوعة",
+            value=True,
+            key="dash_update_db_catalog",
+            help="عطّلها لتشغيل المقارنة فقط دون تعديل جداول كتالوجنا والمنافسين في SQLite.",
+        )
+
     if st.button("🚀 بدء التحليل", type="primary", key="dash_btn_start_analysis"):
         # ── حارس المدخلات (يدعم الوضعين: يدوي وتلقائي) ──────────────────
         _auto_mode = bool(st.session_state.get("dash_use_auto_scraper")) and _auto_available
@@ -1964,7 +1983,13 @@ if page == "📊 لوحة التحكم":
             comp_dfs = {}
             job_id = None
             comp_names = ""
-            with st.spinner("⏳ جاري قراءة الملفات وتحديث الكتالوج..."):
+            _dash_upd_db_cat = bool(st.session_state.get("dash_update_db_catalog", True))
+            _spin_read = (
+                "⏳ جاري قراءة الملفات وتحديث كتالوج قاعدة البيانات..."
+                if _dash_upd_db_cat
+                else "⏳ جاري قراءة الملفات (بدون تحديث كتالوج قاعدة البيانات)..."
+            )
+            with st.spinner(_spin_read):
                 try:
                     our_file.seek(0)
                 except Exception:
@@ -2053,17 +2078,22 @@ if page == "📊 لوحة التحكم":
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
                     else:
                         _catc = resolve_catalog_columns(our_df)
-                        r_our = upsert_our_catalog(
-                            our_df,
-                            name_col=_catc["name"] or "اسم المنتج",
-                            id_col=_catc["id"] or "رقم المنتج",
-                            price_col=_catc["price"] or "سعر المنتج",
-                        )
-                        r_comp = upsert_comp_catalog(comp_dfs)
-                        st.caption(
-                            f"✅ كتالوجنا: {r_our['inserted']} جديد / {r_our['updated']} تحديث | "
-                            f"المنافسين: {r_comp['new_products']} جديد / {r_comp.get('updated', 0)} تحديث"
-                        )
+                        if _dash_upd_db_cat:
+                            r_our = upsert_our_catalog(
+                                our_df,
+                                name_col=_catc["name"] or "اسم المنتج",
+                                id_col=_catc["id"] or "رقم المنتج",
+                                price_col=_catc["price"] or "سعر المنتج",
+                            )
+                            r_comp = upsert_comp_catalog(comp_dfs)
+                            st.caption(
+                                f"✅ كتالوجنا: {r_our['inserted']} جديد / {r_our['updated']} تحديث | "
+                                f"المنافسين: {r_comp['new_products']} جديد / {r_comp.get('updated', 0)} تحديث"
+                            )
+                        else:
+                            st.caption(
+                                "⏭️ تم تخطي تحديث كتالوج قاعدة البيانات — يُحفظ التحليل في الجلسة فقط."
+                            )
                         st.session_state.our_df = our_df
                         st.session_state.comp_dfs = comp_dfs
                         job_id = str(uuid.uuid4())[:8]
@@ -2076,11 +2106,29 @@ if page == "📊 لوحة التحكم":
                 for _cfn, _cdf in comp_dfs.items():
                     _validate_uploaded_catalog(_cdf, f"ملف منافس: {_cfn}")
                 if bg_mode:
-                    t = threading.Thread(
-                        target=_run_analysis_background,
-                        args=(job_id, our_df, comp_dfs, our_file.name, comp_names),
-                        daemon=True,
+                    _dash_acc = bool(st.session_state.get("dash_accumulate_results", True))
+                    _prev_ar = None
+                    _prev_mr = None
+                    if _dash_acc:
+                        _adf_prev = st.session_state.get("analysis_df")
+                        if _adf_prev is not None and not getattr(_adf_prev, "empty", True):
+                            _prev_ar = safe_results_for_json(_adf_prev.to_dict("records"))
+                        _res_prev = st.session_state.get("results") or {}
+                        _miss_prev = _res_prev.get("missing")
+                        if isinstance(_miss_prev, pd.DataFrame) and not _miss_prev.empty:
+                            _prev_mr = _miss_prev.to_dict("records")
+                    _bg_target = partial(
+                        _run_analysis_background,
+                        job_id,
+                        our_df,
+                        comp_dfs,
+                        our_file.name,
+                        comp_names,
+                        merge_previous=_dash_acc,
+                        prev_analysis_records=_prev_ar,
+                        prev_missing_records=_prev_mr,
                     )
+                    t = threading.Thread(target=_bg_target, daemon=True)
                     add_script_run_ctx(t)
                     t.start()
                     st.session_state.job_running = True
@@ -2093,10 +2141,28 @@ if page == "📊 لوحة التحكم":
                         prog.progress(min(float(p), 0.99), f"{float(p)*100:.0f}%")
 
                     df_all, audit_stats = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
+                    if st.session_state.get("dash_accumulate_results", True):
+                        _prev_adf = st.session_state.get("analysis_df")
+                        if _prev_adf is not None and not getattr(_prev_adf, "empty", True):
+                            df_all = merge_price_analysis_dataframes(_prev_adf, df_all)
+                            st.caption("📎 وُدمت نتائج التحليل مع الجلسة السابقة.")
                     st.session_state.last_audit_stats = audit_stats
                     _render_audit_bar(audit_stats)
                     raw_missing_df = find_missing_products(our_df, comp_dfs)
                     missing_df = smart_missing_barrier(raw_missing_df, our_df)
+                    if st.session_state.get("dash_accumulate_results", True):
+                        _prev_miss_df = None
+                        if st.session_state.get("results") and isinstance(
+                            st.session_state["results"], dict
+                        ):
+                            _prev_miss_df = st.session_state["results"].get("missing")
+                        if (
+                            isinstance(_prev_miss_df, pd.DataFrame)
+                            and not _prev_miss_df.empty
+                        ):
+                            missing_df = merge_missing_products_dataframes(
+                                _prev_miss_df, missing_df
+                            )
 
                     for _, row in df_all.iterrows():
                         if row.get("نسبة_التطابق", 0) > 0:
