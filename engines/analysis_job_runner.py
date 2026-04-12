@@ -9,7 +9,12 @@ import traceback
 import pandas as pd
 
 from engines.engine import find_missing_products, run_full_analysis, smart_missing_barrier
-from utils.data_helpers import safe_results_for_json
+from utils.data_helpers import (
+    merge_missing_products_dataframes,
+    merge_price_analysis_dataframes,
+    restore_results_from_json,
+    safe_results_for_json,
+)
 from utils.helpers import safe_float
 from utils.db_manager import log_analysis, save_job_progress, upsert_price_history
 
@@ -20,6 +25,9 @@ def run_analysis_background_job(
     comp_dfs: dict,
     our_file_name: str,
     comp_names: str,
+    merge_previous: bool = False,
+    prev_analysis_records: list | None = None,
+    prev_missing_records: list | None = None,
 ) -> None:
     """تعمل في thread منفصل — تحفظ النتائج كل 25 منتجاً مع حماية من الأخطاء."""
     total = len(our_df)
@@ -81,6 +89,21 @@ def run_analysis_background_job(
     except Exception:
         traceback.print_exc()
         missing_df = pd.DataFrame()
+
+    if merge_previous and prev_analysis_records:
+        try:
+            prev_adf = pd.DataFrame(restore_results_from_json(prev_analysis_records))
+            if not prev_adf.empty:
+                analysis_df = merge_price_analysis_dataframes(prev_adf, analysis_df)
+        except Exception:
+            traceback.print_exc()
+    if merge_previous and prev_missing_records:
+        try:
+            prev_m = pd.DataFrame(prev_missing_records)
+            if not prev_m.empty:
+                missing_df = merge_missing_products_dataframes(prev_m, missing_df)
+        except Exception:
+            traceback.print_exc()
 
     try:
         safe_records = safe_results_for_json(analysis_df.to_dict("records"))
