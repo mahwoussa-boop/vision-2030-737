@@ -1,18 +1,21 @@
 """
-تصدير منتجات مفقودة إلى CSV متوافق مع قالب استيراد منصة سلة (40 عموداً بالترتيب الحرفي).
+تصدير منتجات مفقودة إلى Excel (.xlsx) متوافق مع قالب استيراد منصة سلة (40 عموداً بالترتيب الحرفي).
 
 - عمود «النوع » يحتفظ بالمسافة الزائدة كما في قالب سلة الرسمي.
-- التصدير عبر pandas.to_csv مع encoding=utf-8-sig و quoting=csv.QUOTE_ALL.
+- التصدير عبر pandas.to_excel مع محرك openpyxl (index=False إلزامياً).
+
+يتطلب الحزمة: openpyxl — مذكورة في requirements.txt؛ عند غيابها: pip install openpyxl
 """
 from __future__ import annotations
 
-import csv
 import difflib
 import html
-import io
+import os
 import re
+import tempfile
 from typing import Any
 
+import openpyxl  # مطلوب صراحةً مع engine="openpyxl" في to_excel
 import pandas as pd
 
 from engines.ai_engine import auto_infer_category
@@ -73,7 +76,7 @@ SALLA_SHAMEL_COLUMNS: list[str] = [
     "[3] الصورة / اللون",
 ]
 
-# أول وسم HTML مسموح به داخل عمود «الوصف» في CSV سلة (إزالة أي نص حواري يسبق النموذج)
+# أول وسم HTML مسموح به داخل عمود «الوصف» في استيراد سلة (إزالة أي نص حواري يسبق النموذج)
 _HTML_DESCRIPTION_START = re.compile(r"(?is)<\s*(?:h2|div)\b")
 
 
@@ -312,25 +315,47 @@ def build_salla_shamel_dataframe(missing_df: pd.DataFrame) -> pd.DataFrame:
 
 def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool = True) -> bytes:
     """
-    يصدّر جدول المنتجات المفقودة إلى بايتات CSV (utf-8-sig + اقتباس جميع الحقول).
+    يصدّر جدول المنتجات المفقودة إلى بايتات ملف Excel أصلي (.xlsx) عبر محرك openpyxl.
 
     المعامل generate_descriptions يُحتفظ للتوافق مع الاستدعاءات القديمة فقط؛
     عمود «الوصف» يُبنى دائماً من القالب الثابت (generate_salla_html_description)
     مع حقن الاسم والماركة وتمرير sanitize_salla_description_html — لا يُحقن نص LLM أو وصف_AI.
+
+    ملاحظة: يتطلب تثبيت openpyxl (انظر requirements.txt أو pip install openpyxl).
     """
     _ = generate_descriptions
     df = build_salla_shamel_dataframe(missing_df)
     if not df.empty:
         df = df.reindex(columns=SALLA_SHAMEL_COLUMNS)
-    buf = io.BytesIO()
-    df.to_csv(
-        buf,
-        index=False,
-        encoding="utf-8-sig",
-        quoting=csv.QUOTE_ALL,
-        lineterminator="\n",
-    )
-    return buf.getvalue()
+
+    # استدعاء to_excel بالمسار الحرفي المطلوب من منصة سلة (ملف .xlsx فقط — لا CSV).
+    # العمل داخل مجلد مؤقت لتفادي التعارض مع ملفات بنفس الاسم في cwd.
+    cwd_prev = os.getcwd()
+    td = tempfile.mkdtemp(prefix="salla_shamel_xlsx_")
+    xlsx_abs = os.path.join(td, "mahwous_missing_products.xlsx")
+    try:
+        os.chdir(td)
+        try:
+            df.to_excel("mahwous_missing_products.xlsx", index=False, engine="openpyxl")
+        except ImportError as exc:
+            raise ImportError(
+                "تصدير سلة الشامل يتطلب الحزمة openpyxl. نفّذ: pip install openpyxl"
+            ) from exc
+        with open("mahwous_missing_products.xlsx", "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.chdir(cwd_prev)
+        except OSError:
+            pass
+        try:
+            os.unlink(xlsx_abs)
+        except OSError:
+            pass
+        try:
+            os.rmdir(td)
+        except OSError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
