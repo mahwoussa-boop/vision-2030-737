@@ -1,7 +1,7 @@
 """
 pages/magic_factory.py — مصنع المنتجات (✨ Magic Factory)
 ══════════════════════════════════════════════════════════
-كشط رابط منتج منافس → تحسين بالذكاء الاصطناعي → معاينة وتعديل → تصدير CSV سلة شامل.
+كشط رابط منتج منافس → تحسين بالذكاء الاصطناعي → معاينة وتعديل → تصدير Excel (.xlsx) سلة شامل.
 """
 from __future__ import annotations
 
@@ -163,7 +163,7 @@ def show() -> None:
     st.title("✨ مصنع المنتجات")
     st.caption(
         "أدخل رابط منتج من أي متجر منافس — نكشط البيانات، نحسّنها بالذكاء الاصطناعي، "
-        "ثم نصدّر ملف CSV جاهز لاستيراد سلة الشامل."
+        "ثم نصدّر ملف Excel (.xlsx) جاهز لاستيراد سلة الشامل."
     )
 
     progress_ph = st.empty()
@@ -246,7 +246,7 @@ def show() -> None:
     bundle: Optional[Dict[str, Any]] = st.session_state.get(_SS_READY)
     if not bundle:
         st.info(
-            "بعد التشغيل ستظهر هنا معاينة الصور والحقول القابلة للتعديل، ثم زر تحميل CSV سلة الشامل."
+            "بعد التشغيل ستظهر هنا معاينة الصور والحقول القابلة للتعديل، ثم زر تحميل ملف Excel سلة الشامل."
         )
         return
 
@@ -341,13 +341,13 @@ def show() -> None:
 
     row = _bundle_to_export_row(bundle)
     df = pd.DataFrame([row])
-    csv_bytes = export_to_salla_shamel(df, generate_descriptions=False)
+    xlsx_bytes = export_to_salla_shamel(df, generate_descriptions=False)
 
     st.download_button(
-        label="📥 تحميل ملف سلة (CSV)",
-        data=csv_bytes,
-        file_name="salla_shamel_magic_factory.csv",
-        mime="text/csv; charset=utf-8",
+        label="📥 تحميل ملف سلة (Excel)",
+        data=xlsx_bytes,
+        file_name="salla_shamel_magic_factory.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
     )
