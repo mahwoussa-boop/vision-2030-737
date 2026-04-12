@@ -4,6 +4,7 @@
 import json
 import re
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 
@@ -283,3 +284,75 @@ def pid_from_row(row, col):
     except (ValueError, TypeError):
         pass
     return str(v).strip()
+
+
+def _analysis_dedupe_columns(df: pd.DataFrame) -> list[str]:
+    """أعمدة تمييز صف مطابقة واحد — الأحدث يبقى عند الدمج (keep=last)."""
+    if df is None or df.empty:
+        return []
+    prefer = ["معرف_المنتج", "معرف_المنافس", "المنافس"]
+    if all(c in df.columns for c in prefer):
+        return prefer
+    fb = ["المنتج", "منتج_المنافس", "المنافس"]
+    if all(c in df.columns for c in fb):
+        return fb
+    if "المنتج" in df.columns and "المنافس" in df.columns:
+        return ["المنتج", "المنافس"]
+    return []
+
+
+def merge_price_analysis_dataframes(
+    prev: Optional[pd.DataFrame],
+    new: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """
+    يدمج جدول نتائج تحليل جديد مع جدول سابق: نفس المفتاح → يُبقى الصف من التشغيل الأحدث.
+    """
+    if new is None or (isinstance(new, pd.DataFrame) and new.empty):
+        return prev.copy() if prev is not None and not prev.empty else pd.DataFrame()
+    if prev is None or prev.empty:
+        return new.copy()
+
+    all_cols: list[str] = list(dict.fromkeys(list(prev.columns) + list(new.columns)))
+    prev2 = prev.reindex(columns=all_cols)
+    new2 = new.reindex(columns=all_cols)
+    out = pd.concat([prev2, new2], ignore_index=True)
+    subset = _analysis_dedupe_columns(out)
+    if subset:
+        out = out.drop_duplicates(subset=subset, keep="last")
+    else:
+        out = out.drop_duplicates(keep="last")
+    return out.reset_index(drop=True)
+
+
+def _missing_dedupe_columns(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty:
+        return []
+    cols = [c for c in ("المنافس", "معرف_المنافس", "منتج_المنافس") if c in df.columns]
+    if len(cols) >= 2:
+        return cols
+    if "منتج_المنافس" in df.columns and "المنافس" in df.columns:
+        return ["المنافس", "منتج_المنافس"]
+    return []
+
+
+def merge_missing_products_dataframes(
+    prev: Optional[pd.DataFrame],
+    new: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """دمج جداول المنتجات المفقودة بين تشغيلين."""
+    if new is None or (isinstance(new, pd.DataFrame) and new.empty):
+        return prev.copy() if prev is not None and not prev.empty else pd.DataFrame()
+    if prev is None or prev.empty:
+        return new.copy()
+
+    all_cols = list(dict.fromkeys(list(prev.columns) + list(new.columns)))
+    p2 = prev.reindex(columns=all_cols)
+    n2 = new.reindex(columns=all_cols)
+    out = pd.concat([p2, n2], ignore_index=True)
+    subset = _missing_dedupe_columns(out)
+    if subset:
+        out = out.drop_duplicates(subset=subset, keep="last")
+    else:
+        out = out.drop_duplicates(keep="last")
+    return out.reset_index(drop=True)
