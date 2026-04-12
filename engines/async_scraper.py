@@ -44,10 +44,6 @@ logger = logging.getLogger("AsyncScraper")
 import re as _re
 import concurrent.futures as _futures
 
-_RE_JSONLD = _re.compile(
-    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-    _re.S | _re.I,
-)
 _RE_OG_TITLE    = _re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
 _RE_OG_IMAGE    = _re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
 _RE_OG_URL      = _re.compile(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']',   _re.I)
@@ -344,6 +340,47 @@ def extract_product(data: dict, store_url: str) -> dict | None:
     }
 
 
+def _url_looks_like_product_page(url: str) -> bool:
+    """
+    يمنح og:title / h1 معنى «منتج» فقط على مسارات تبدو صفحة منتج،
+    حتى لا يُسجَّل اسم المتجر من Organization كمنتج على كل الصفحات.
+    """
+    try:
+        from engines.sitemap_resolve import _is_product_url, _is_salla_product
+
+        return bool(_is_salla_product(url) or _is_product_url(url))
+    except Exception:
+        p = (urlparse(url).path or "").lower()
+        return bool(
+            _re.search(r"/p\d{5,}(?:/|\?|$)", p)
+            or "/products/" in p
+            or "/product/" in p
+        )
+
+
+def _product_fields_from_all_json_ld(html: str) -> dict:
+    """يجمع حقول Product من كل بلوكات JSON-LD (@graph، قوائم، …)."""
+    try:
+        from utils.competitor_product_scraper import _walk_json_ld
+    except Exception:
+        return {}
+    acc: dict = {}
+    for m in _re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',
+        html,
+        _re.I,
+    ):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        _walk_json_ld(data, acc)
+    return acc
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  جلب منتج واحد من URL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -446,51 +483,74 @@ async def fetch_product(
         if not html:
             return None
 
-        # ── JSON-LD ──────────────────────────────────────────────────────
-        ld_match = _RE_JSONLD.search(html)
-        if ld_match:
-            try:
-                import json as _json
-                ld_data = _json.loads(ld_match.group(1).strip())
-                if isinstance(ld_data, list):
-                    ld_data = ld_data[0]
-                if isinstance(ld_data, dict) and ld_data.get("name"):
-                    offers = ld_data.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    return extract_product(
-                        {
-                            "name":  ld_data.get("name", ""),
-                            "price": offers.get("price", 0),
-                            "sku":   ld_data.get("sku", ""),
-                            "image": (ld_data.get("image") or [""])[0]
-                                     if isinstance(ld_data.get("image"), list)
-                                     else ld_data.get("image", ""),
-                            "url":   ld_data.get("url", url),
-                            "brand": ld_data.get("brand", {}).get("name", "")
-                                     if isinstance(ld_data.get("brand"), dict)
-                                     else str(ld_data.get("brand", "")),
-                        },
-                        store_url,
-                    )
-            except Exception:
-                pass
+        # ── JSON-LD + meta (كل البلوكات — سلة وShopify وغيرها) ───────────
+        try:
+            from utils.competitor_product_scraper import extract_meta_bundle
 
-        # ── og:meta fallback ─────────────────────────────────────────────
+            bundle = extract_meta_bundle(html, url)
+            schema_name = (bundle.get("name") or "").strip()
+            og_title = (bundle.get("title") or "").strip()
+            label = schema_name or og_title
+            if label and (schema_name or _url_looks_like_product_page(url)):
+                imgs = bundle.get("images") or []
+                img0 = str(imgs[0]).strip() if imgs else ""
+                p_raw = bundle.get("price")
+                try:
+                    p_val = float(p_raw) if p_raw not in (None, "") else 0.0
+                except Exception:
+                    p_val = 0.0
+                row = extract_product(
+                    {
+                        "name": label,
+                        "price": p_val,
+                        "sku": bundle.get("sku") or "",
+                        "image": img0,
+                        "url": url,
+                        "brand": bundle.get("brand") or "",
+                    },
+                    store_url,
+                )
+                if row:
+                    return row
+        except Exception as exc:
+            logger.debug("extract_meta_bundle: %s — %s", url, exc)
+
+        ld_acc = _product_fields_from_all_json_ld(html)
+        if ld_acc.get("name"):
+            imgs = ld_acc.get("images") or []
+            im0 = str(imgs[0]).strip() if imgs else ""
+            try:
+                p_ld = float(ld_acc.get("price") or 0)
+            except Exception:
+                p_ld = 0.0
+            row = extract_product(
+                {
+                    "name": str(ld_acc.get("name", "")).strip(),
+                    "price": p_ld,
+                    "sku": ld_acc.get("sku") or "",
+                    "image": im0,
+                    "url": url,
+                    "brand": ld_acc.get("brand") or "",
+                },
+                store_url,
+            )
+            if row:
+                return row
+
+        # ── og:meta + h1 (احتياط عند فشل المسارات أعلاه) ─────────────────
         def _meta(pattern: _re.Pattern) -> str:
             m = pattern.search(html)
             return m.group(1).strip() if m else ""
 
         pname = _meta(_RE_OG_TITLE)
-        pimg  = _meta(_RE_OG_IMAGE)
-        purl  = _meta(_RE_OG_URL) or url
+        pimg = _meta(_RE_OG_IMAGE)
+        purl = _meta(_RE_OG_URL) or url
         pprice_raw = _meta(_RE_OG_PRICE)
         try:
             pprice = float(pprice_raw.replace(",", "").strip()) if pprice_raw else 0.0
         except Exception:
             pprice = 0.0
 
-        # استخراج السعر من span إذا لم يوجد في og
         if pprice == 0.0:
             price_match = _RE_PRICE_SPAN.search(html)
             if price_match:
@@ -499,13 +559,12 @@ async def fetch_product(
                 except Exception:
                     pprice = 0.0
 
-        # استخراج الاسم من h1 إذا لم يوجد في og
         if not pname:
             h1_match = _RE_H1_PRODUCT.search(html)
             if h1_match:
                 pname = h1_match.group(1).strip()
 
-        if pname:
+        if pname and _url_looks_like_product_page(url):
             return extract_product(
                 {"name": pname, "image": pimg, "url": purl, "price": pprice},
                 store_url,
