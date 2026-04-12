@@ -4,11 +4,16 @@
 """
 from __future__ import annotations
 
+import os
 import traceback
 
 import pandas as pd
 
-from engines.engine import find_missing_products, run_full_analysis, smart_missing_barrier
+from engines.engine import run_full_analysis, smart_missing_barrier
+from engines.reconciliation_engine import (
+    merge_reconciliation_into_audit,
+    reconcile_competitor_upload,
+)
 from utils.data_helpers import (
     merge_missing_products_dataframes,
     merge_price_analysis_dataframes,
@@ -83,12 +88,32 @@ def run_analysis_background_job(
     except Exception:
         pass
 
+    rec = None
+    missing_df = pd.DataFrame()
     try:
-        raw_missing_df = find_missing_products(our_df, comp_dfs)
-        missing_df = smart_missing_barrier(raw_missing_df, our_df)
+        rec = reconcile_competitor_upload(our_df, comp_dfs)
+        missing_df = smart_missing_barrier(rec.new_products_df, our_df)
+        rec.apply_smart_barrier_adjustment(missing_df)
+        audit_stats = merge_reconciliation_into_audit(audit_stats, rec)
+        if rec.failed_df is not None and not rec.failed_df.empty:
+            data_dir = os.environ.get("DATA_DIR", "data")
+            os.makedirs(data_dir, exist_ok=True)
+            fp = os.path.join(data_dir, f"failed_rows_{job_id}.csv")
+            try:
+                rec.failed_df.to_csv(fp, index=False, encoding="utf-8-sig")
+                audit_stats["reconciliation_failed_csv_path"] = fp
+            except Exception:
+                traceback.print_exc()
     except Exception:
         traceback.print_exc()
         missing_df = pd.DataFrame()
+        try:
+            from engines.engine import find_missing_products
+
+            raw_missing_df = find_missing_products(our_df, comp_dfs)
+            missing_df = smart_missing_barrier(raw_missing_df, our_df)
+        except Exception:
+            traceback.print_exc()
 
     if merge_previous and prev_analysis_records:
         try:
