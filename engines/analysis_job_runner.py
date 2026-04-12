@@ -9,7 +9,8 @@ import traceback
 import pandas as pd
 
 from engines.engine import find_missing_products, run_full_analysis, smart_missing_barrier
-from utils.data_helpers import safe_float, safe_results_for_json
+from utils.data_helpers import safe_results_for_json
+from utils.helpers import safe_float
 from utils.db_manager import log_analysis, save_job_progress, upsert_price_history
 
 
