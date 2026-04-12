@@ -594,6 +594,40 @@ def generate_brand_record(
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# أسعار ملفات المنافسين (نصوص عربية / ر.س / فواصل آلاف)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
+
+
+def sanitize_competitor_price_to_float(val) -> float:
+    """
+    يستخرج أول سعر رقمي معقول من خلية قد تحتوي «1,234.50 ر.س» أو «٣٥٠ ريال» أو HTML.
+    يُستخدم مع تصديرات سلة / الكشط (عمود مثل text-sm-2).
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return 0.0
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "-", "—", "null"):
+        return 0.0
+    s = s.translate(_AR_DIGITS)
+    s = re.sub(r"ر\.?\s*س|ريال|SAR|SR|﷼|\uFDFC|ر\s*س", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    candidates = re.findall(r"\d[\d,\.]*", s)
+    if not candidates:
+        return 0.0
+    raw = candidates[-1].replace(",", "")
+    try:
+        x = float(raw)
+    except ValueError:
+        return 0.0
+    if x < 0 or x > 10_000_000:
+        return 0.0
+    return float(x)
+
+
 def append_brand_to_csv(brand_record: dict, csv_path: str) -> bool:
     """
     يُضيف سجل ماركة جديد إلى brands.csv إذا لم يكن موجوداً.
