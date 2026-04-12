@@ -70,6 +70,8 @@ from engines.ai_engine import (call_ai, verify_match, analyze_product,
                                 generate_mahwous_description, _parse_seo_json_block,
                                 reclassify_review_items, ai_deep_analysis,
                                 generate_seo_description)
+from engines.analysis_job_runner import run_analysis_background_job as _run_analysis_background
+from engines.file_reader import load_competitor_csv_for_matching
 from engines.automation import (AutomationEngine, ScheduledSearchManager,
                                  auto_push_decisions, auto_process_review_items,
                                  log_automation_decision, get_automation_log,
@@ -454,6 +456,14 @@ def _effective_column_map(df: pd.DataFrame, key_prefix: str):
     }
 
 
+def _dashboard_competitor_label(upload_name: str) -> str:
+    """اسم عرض للمنافس من اسم الملف (بدون .csv)."""
+    n = (upload_name or "").strip()
+    if not n:
+        return "منافس"
+    return n.rsplit(".", 1)[0] if n.lower().endswith(".csv") else n
+
+
 def _render_column_mapping_expander(df: pd.DataFrame, key_prefix: str):
     """
     تحديد الأعمدة بقوائم منسدلة + معاينة صفوف قابلة للضبط + 5 قيم من عمود واحد.
@@ -567,116 +577,6 @@ def _render_audit_bar(audit_stats: dict):
             f"🚨 تحذير تدقيق: المدخلات ({ti}) لا تساوي مجموع الحالات ({tot}) — "
             f"معالج={pr} + بدون منافس={nc} + فارغ={se} + عينة/صغير={sk}."
         )
-
-
-def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
-    """تعمل في thread منفصل — تحفظ النتائج كل 10 منتجات مع حماية شاملة من الأخطاء"""
-    total     = len(our_df)
-    processed = 0
-    _last_save = [0]  # آخر عدد تم حفظه (mutable لـ closure)
-
-    def progress_cb(pct, current_results):
-        nonlocal processed
-        processed = int(pct * total)
-        # حفظ كل 25 منتجاً أو عند الاكتمال (تقليل ضغط SQLite)
-        if processed - _last_save[0] >= 25 or processed >= total:
-            _last_save[0] = processed
-            try:
-                safe_res = safe_results_for_json(current_results)
-                save_job_progress(
-                    job_id, total, processed,
-                    safe_res,
-                    "running",
-                    our_file_name, comp_names
-                )
-            except Exception as _save_err:
-                # لا نوقف المعالجة بسبب خطأ حفظ جزئي
-                import traceback
-                traceback.print_exc()
-
-    analysis_df = pd.DataFrame()
-    missing_df  = pd.DataFrame()
-    audit_stats = {}
-
-    # ── المرحلة 1: التحليل الرئيسي ──────────────────────────────────
-    try:
-        analysis_df, audit_stats = run_full_analysis(
-            our_df, comp_dfs,
-            progress_callback=progress_cb
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # حفظ ما تم تحليله حتى الآن كنتائج جزئية
-        save_job_progress(
-            job_id, total, processed,
-            [], f"error: تحليل المقارنة فشل — {str(e)[:200]}",
-            our_file_name, comp_names
-        )
-        return
-
-    # ── المرحلة 2: حفظ تاريخ الأسعار (لا يوقف المعالجة إذا فشل) ────
-    try:
-        for _, row in analysis_df.iterrows():
-            if safe_float(row.get("نسبة_التطابق", 0)) > 0:
-                upsert_price_history(
-                    str(row.get("المنتج",       "")),
-                    str(row.get("المنافس",       "")),
-                    safe_float(row.get("سعر_المنافس", 0)),
-                    safe_float(row.get("السعر",       0)),
-                    safe_float(row.get("الفرق",        0)),
-                    safe_float(row.get("نسبة_التطابق", 0)),
-                    str(row.get("القرار",         ""))
-                )
-    except Exception:
-        pass  # تاريخ الأسعار ثانوي — لا نوقف المعالجة
-
-    # ── المرحلة 3: المنتجات المفقودة (منفصلة عن التحليل) ────────────
-    try:
-        raw_missing_df = find_missing_products(our_df, comp_dfs)
-        missing_df = smart_missing_barrier(raw_missing_df, our_df)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        missing_df = pd.DataFrame()  # فشلت المفقودة لكن النتائج الرئيسية محفوظة
-
-    # ── المرحلة 4: الحفظ النهائي ────────────────────────────────────
-    try:
-        safe_records = safe_results_for_json(analysis_df.to_dict("records"))
-        safe_missing = missing_df.to_dict("records") if not missing_df.empty else []
-
-        save_job_progress(
-            job_id, total, total,
-            safe_records,
-            "done",
-            our_file_name, comp_names,
-            missing=safe_missing,
-            audit_stats=audit_stats,
-        )
-        log_analysis(
-            our_file_name, comp_names, total,
-            int((analysis_df.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
-            len(missing_df)
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # محاولة أخيرة — حفظ بدون missing
-        try:
-            save_job_progress(
-                job_id, total, total,
-                safe_results_for_json(analysis_df.to_dict("records")),
-                "done",
-                our_file_name, comp_names,
-                missing=[],
-                audit_stats=audit_stats,
-            )
-        except Exception:
-            save_job_progress(
-                job_id, total, processed,
-                [], f"error: فشل الحفظ النهائي — {str(e)[:200]}",
-                our_file_name, comp_names
-            )
 
 
 def _find_analysis_row_for_processed(product_name: str):
@@ -1977,10 +1877,11 @@ if page == "📊 لوحة التحكم":
 
     if not _use_auto:
         comp_files = st.file_uploader(
-            "🏪 ملفات المنافسين (متعدد)",
+            "🏪 ملفات المنافسين (متعدد — CSV/Excel)",
             type=["csv", "xlsx", "xls"],
             accept_multiple_files=True,
             key="dash_comp_files",
+            help="ملفات CSV بتصدير سلة/كشط (أعمدة مثل text-sm-2 وstyles_productCard__name__…) تُعرَف تلقائياً هنا.",
         )
     else:
         comp_files = None  # غير مستخدم عند التحميل التلقائي
@@ -2003,16 +1904,38 @@ if page == "📊 لوحة التحكم":
                 _render_column_mapping_expander(_odf, "dash_map_our")
     if comp_files:
         for _ci, cf in enumerate(comp_files):
+            _salla_err = None
             try:
                 cf.seek(0)
             except Exception:
                 pass
+            _cfn = getattr(cf, "name", "") or ""
+            if _cfn.lower().endswith(".csv"):
+                _cdf_salla, _salla_err, _enc_used = load_competitor_csv_for_matching(
+                    cf, competitor_label=_dashboard_competitor_label(_cfn)
+                )
+                if _cdf_salla is not None and not _salla_err:
+                    st.caption(
+                        f"✅ **{_cfn}** — تعريف تلقائي لتصدير سلة ({_enc_used}) · **{len(_cdf_salla):,}** صف"
+                    )
+                    with st.expander(f"📋 معاينة منظّفة — {_cfn}", expanded=False):
+                        st.dataframe(_cdf_salla.head(8), use_container_width=True, height=260)
+                    continue
+                try:
+                    cf.seek(0)
+                except Exception:
+                    pass
             _cdf, _ce = read_file(cf)
             try:
                 cf.seek(0)
             except Exception:
                 pass
             if not _ce and _cdf is not None:
+                if _cfn.lower().endswith(".csv") and _salla_err:
+                    st.caption(
+                        f"⚠️ **{_cfn}**: تعيين سلة تلقائي: {_salla_err} — "
+                        "يُستخدم التعرف العام؛ اضبط الأعمدة في المُوسّع إن لزم."
+                    )
                 with st.expander(f"📋 تعرف تلقائي — {cf.name}", expanded=False):
                     _render_column_mapping_expander(_cdf, f"dash_map_comp_{_ci}")
 
@@ -2099,20 +2022,32 @@ if page == "📊 لوحة التحكم":
                         except Exception as _ae:
                             st.error(f"❌ فشل تحميل الملف الآلي: {_ae}")
                     else:
-                        # ── وضع الرفع اليدوي ─────────────────────────────
+                        # ── وضع الرفع اليدوي (CSV سلة/كشط → تعريف تلقائي ثم read_file احتياطاً) ──
                         for _ci, cf in enumerate(comp_files):
                             try:
                                 cf.seek(0)
                             except Exception:
                                 pass
+                            _fn = getattr(cf, "name", "") or ""
+                            if _fn.lower().endswith(".csv"):
+                                cdf_norm, salla_err, _enc = load_competitor_csv_for_matching(
+                                    cf, competitor_label=_dashboard_competitor_label(_fn)
+                                )
+                                if cdf_norm is not None and not salla_err:
+                                    comp_dfs[_fn] = cdf_norm
+                                    continue
+                                try:
+                                    cf.seek(0)
+                                except Exception:
+                                    pass
                             cdf, cerr = read_file(cf)
                             if cerr:
-                                st.warning(f"⚠️ {cf.name}: {cerr}")
+                                st.warning(f"⚠️ {_fn or cf.name}: {cerr}")
                             else:
                                 cdf = apply_user_column_map(
                                     cdf, **_effective_column_map(cdf, f"dash_map_comp_{_ci}")
                                 )
-                                comp_dfs[cf.name] = cdf
+                                comp_dfs[_fn or cf.name] = cdf
 
                     if not comp_dfs:
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
