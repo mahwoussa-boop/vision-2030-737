@@ -19,6 +19,7 @@ app.py - نظام التسعير الذكي مهووس v26.0
 import html
 import json
 import re
+from urllib.parse import urlparse
 import streamlit as st
 import pandas as pd
 import threading
@@ -262,19 +263,36 @@ if _nav_apply and _nav_apply in SECTIONS:
 #  دوال المعالجة — يجب تعريفها قبل استخدامها
 # ════════════════════════════════════════════════
 def _split_results(df):
-    """تقسيم نتائج التحليل على الأقسام بأمان تام"""
-    def _contains(col, txt):
+    """تقسيم نتائج التحليل على الأقسام بأمان تام."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        empty = pd.DataFrame()
+        return {
+            "price_raise": empty.copy(),
+            "price_lower": empty.copy(),
+            "approved": empty.copy(),
+            "review": empty.copy(),
+            "excluded": empty.copy(),
+            "all": empty.copy(),
+        }
+
+    work = df.copy()
+    if "القرار" not in work.columns:
+        work["القرار"] = ""
+    work["القرار"] = work["القرار"].fillna("").astype(str).str.strip()
+
+    def _contains(txt):
         try:
-            return df[col].str.contains(txt, na=False, regex=False)
+            return work["القرار"].str.contains(txt, na=False, regex=False)
         except Exception:
-            return pd.Series([False] * len(df))
+            return pd.Series([False] * len(work), index=work.index)
+
     return {
-        "price_raise": df[_contains("القرار", "أعلى")].reset_index(drop=True),
-        "price_lower": df[_contains("القرار", "أقل")].reset_index(drop=True),
-        "approved":    df[_contains("القرار", "موافق")].reset_index(drop=True),
-        "review":      df[_contains("القرار", "مراجعة")].reset_index(drop=True),
-        "excluded":    df[_contains("القرار", "مستبعد")].reset_index(drop=True),
-        "all":         df,
+        "price_raise": work[_contains("أعلى")].reset_index(drop=True),
+        "price_lower": work[_contains("أقل")].reset_index(drop=True),
+        "approved": work[_contains("موافق")].reset_index(drop=True),
+        "review": work[_contains("مراجعة")].reset_index(drop=True),
+        "excluded": work[_contains("مستبعد")].reset_index(drop=True),
+        "all": work.reset_index(drop=True),
     }
 
 
@@ -752,15 +770,63 @@ def _is_http_url_text(s) -> bool:
 
 
 def _humanize_competitor_upload(comp: str) -> str:
-    """اسم ملف CSV/Excel → اسم متجر مقروء للعرض (بدون الامتداد)."""
+    """تطبيع اسم المنافس ليظهر كاسم متجر مقروء بدلاً من رابط أو اسم ملف خام."""
     c = str(comp or "").strip()
     if not c:
         return "—"
+
+    parsed = urlparse(c if re.match(r"^https?://", c, flags=re.I) else f"https://{c}")
+    host = (parsed.netloc or parsed.path or "").strip().lower()
+    if host and ("." in host or "/" in c):
+        host = host.split("/")[0].strip()
+        host = re.sub(r"^www\.", "", host, flags=re.I)
+        if host:
+            c = host
+
     low = c.lower()
     for ext in (".csv", ".xlsx", ".xls", ".tsv", ".ods"):
         if low.endswith(ext):
-            return c[: -len(ext)].strip() or c
-    return c
+            c = c[: -len(ext)].strip() or c
+            break
+
+    c = re.sub(r"[_\-]+", " ", c).strip()
+    c = re.sub(r"\s+", " ", c).strip()
+    return c or "—"
+
+
+def _normalize_all_competitors(raw_comps) -> list:
+    """إزالة التكرار من قائمة جميع المنافسين مع تطبيع أسماء المتاجر دون فقدان أي منافس فعلي."""
+    if not isinstance(raw_comps, list):
+        return []
+
+    cleaned = []
+    seen = set()
+    for comp in raw_comps:
+        if not isinstance(comp, dict):
+            continue
+        comp_copy = dict(comp)
+        comp_name = _humanize_competitor_upload(comp_copy.get("competitor", ""))
+        prod_name = str(comp_copy.get("name", "") or "").strip()
+        prod_id = str(comp_copy.get("product_id", "") or "").strip()
+        prod_url = str(comp_copy.get("product_url") or comp_copy.get("url") or "").strip().lower()
+        key = (comp_name.lower(), prod_id or prod_url or prod_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        comp_copy["competitor"] = comp_name
+        cleaned.append(comp_copy)
+    return cleaned
+
+
+def _display_competitor_name(row) -> str:
+    """اسم المنافس الأساسي في البطاقة مع fallback من قائمة جميع المنافسين عند الحاجة."""
+    direct = _humanize_competitor_upload(row.get("المنافس", ""))
+    if direct and direct != "—":
+        return direct
+    normalized = _normalize_all_competitors(row.get("جميع_المنافسين", row.get("جميع المنافسين", [])))
+    if normalized:
+        return _humanize_competitor_upload(normalized[0].get("competitor", ""))
+    return "—"
 
 
 def _display_name_for_missing_row(row) -> str:
@@ -1078,7 +1144,8 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
         comp_price = safe_float(row.get("سعر_المنافس", 0))
         diff       = safe_float(row.get("الفرق", our_price - comp_price))
         match_pct  = safe_float(row.get("نسبة_التطابق", 0))
-        comp_src   = str(row.get("المنافس", ""))
+        all_comps  = _normalize_all_competitors(row.get("جميع_المنافسين", row.get("جميع المنافسين", [])))
+        comp_src   = _display_competitor_name(row)
         brand      = str(row.get("الماركة", ""))
         size       = row.get("الحجم", "")
         ptype      = str(row.get("النوع", ""))
@@ -1148,9 +1215,8 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
           {ts_badge(ts_now)}
         </div>""", unsafe_allow_html=True)
 
-        # شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم
-        all_comps = row.get("جميع_المنافسين", row.get("جميع المنافسين", []))
-        if isinstance(all_comps, list) and len(all_comps) > 0:
+        # شريط المنافسين المصغر — يعرض كل المنافسين بأسعارهم بعد التطبيع وإزالة التكرار
+        if all_comps:
             st.markdown(comp_strip(all_comps), unsafe_allow_html=True)
 
         # ── شريط الإجراءات التفاعلي (Event-Driven via on_click) ─────────
@@ -1639,12 +1705,26 @@ with st.sidebar:
             st.markdown("**📊 ملخص آخر تحليل:**")
             if _analysis_total:
                 st.caption(f"يعرض توزيع **{_analysis_total:,}** من منتجاتنا المحللة، وليس عدد صفوف ملف المنافس.")
+            _audit = st.session_state.get("last_audit_stats") or {}
             for key, icon, label in [
                 ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
                 ("approved","✅","موافق"), ("missing","🔍","مفقود"),
                 ("review","⚠️","مراجعة"), ("excluded","⚪","مستبعد"),
             ]:
                 cnt = len(r.get(key, pd.DataFrame()))
+                audit_key = {
+                    "price_raise": "price_raise",
+                    "price_lower": "price_lower",
+                    "approved": "approved",
+                    "missing": "missing",
+                    "review": "review",
+                    "excluded": "excluded",
+                }.get(key)
+                if audit_key and isinstance(_audit, dict):
+                    try:
+                        cnt = int(_audit.get(audit_key, cnt) or cnt)
+                    except Exception:
+                        pass
                 st.caption(f"{icon} {label}: **{cnt}**")
 
             _miss_df = r.get("missing", pd.DataFrame())

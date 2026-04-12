@@ -1878,13 +1878,48 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
               "auto":f"🎯({score:.0f}%)",
               "gemini_no_match":"🤖❌"}.get(src, f"{score:.0f}%")
 
-    ac = (all_cands or [best])[:5]
+    raw_cands = all_cands or [best]
+    unique_competitors = []
+    seen_competitors = set()
+    seen_candidates = set()
+    for cand in raw_cands:
+        if not isinstance(cand, dict):
+            continue
+        comp_name = str(cand.get("competitor", "") or "").strip()
+        prod_name = str(cand.get("name", "") or "").strip()
+        prod_id = str(cand.get("product_id", "") or "").strip()
+        prod_url = str(cand.get("product_url") or cand.get("url") or "").strip()
+        candidate_key = (
+            comp_name.lower(),
+            prod_id or prod_url or normalize(prod_name),
+        )
+        if candidate_key in seen_candidates:
+            continue
+        seen_candidates.add(candidate_key)
+
+        comp_key = comp_name.lower()
+        if comp_key and comp_key not in seen_competitors:
+            unique_competitors.append(cand)
+            seen_competitors.add(comp_key)
+        elif not comp_name and not unique_competitors:
+            unique_competitors.append(cand)
+
+    ac = unique_competitors[:10] or [best]
+    competitor_names = sorted({
+        str(c.get("competitor", "") or "").strip()
+        for c in ac
+        if str(c.get("competitor", "") or "").strip()
+    })
+    best_competitor = str(best.get("competitor", "") or "").strip()
+    if not best_competitor and competitor_names:
+        best_competitor = competitor_names[0]
+
     return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
                 الماركة=brand, الحجم=sz_str, النوع=ptype, الجنس=gender,
                 منتج_المنافس=best["name"], معرف_المنافس=best.get("product_id",""),
                 سعر_المنافس=cp, الفرق=diff, نسبة_التطابق=score, ثقة_AI=ai_lbl,
-                القرار=dec, الخطورة=risk, المنافس=best.get("competitor",""),
-                عدد_المنافسين=len({c.get("competitor","") for c in ac}),
+                القرار=dec, الخطورة=risk, المنافس=best_competitor,
+                عدد_المنافسين=len(competitor_names),
                 جميع_المنافسين=ac, مصدر_المطابقة=src or "fuzzy",
                 تاريخ_المطابقة=datetime.now().strftime("%Y-%m-%d"),
                 صورة_منتجنا=our_img or "", رابط_منتجنا=our_url or "",
@@ -2273,7 +2308,7 @@ def find_missing_products(our_df, comp_dfs):
 
     # ── البحث الرئيسي ─────────────────────────────────────────────────
     missing  = []
-    seen_bare = set()   # مفاتيح إزالة التكرار بين المنافسين
+    seen_bare = set()   # مفاتيح إزالة التكرار داخل نفس المنافس فقط
 
     def _cell_str(r, col):
         if not col or col not in r.index:
@@ -2306,10 +2341,20 @@ def find_missing_products(our_df, comp_dfs):
             c_agg = normalize_name(cp)        # ← normalize_name
             if not cn or not c_agg: continue
 
-            # ── مفتاح التكرار: normalize_aggressive بدون تستر ──────
+            # ── مفتاح التكرار: يبقى داخل نفس المنافس فقط حتى لا نفقد نفس المنتج عند منافسين مختلفين ──────
             bare_ck = re.sub(r"\btester\b|تستر|tester", "", c_agg).strip()
-            if not bare_ck or len(bare_ck) < 3: continue
-            if bare_ck in seen_bare: continue
+            if not bare_ck or len(bare_ck) < 3:
+                continue
+            comp_sku_raw = _pid(row, icol)
+            comp_sku_key = _norm_sku_barrier(comp_sku_raw)
+            comp_url_key = (_cell_str(row, url_col).strip().lower() if url_col else "")
+            dedupe_key = (
+                str(cname or "").strip().lower(),
+                comp_sku_key or bare_ck,
+                comp_url_key or bare_ck,
+            )
+            if dedupe_key in seen_bare:
+                continue
 
             c_brand   = extract_brand(cp)
             c_pline   = extract_product_line(cp, c_brand)
@@ -2337,7 +2382,7 @@ def find_missing_products(our_df, comp_dfs):
             if found:
                 continue
 
-            seen_bare.add(bare_ck)
+            seen_bare.add(dedupe_key)
 
             # ── حساب درجة الثقة ──────────────────────────────
             # score = أعلى نسبة تشابه مع منتجاتنا (كلما انخفضت = مفقود مؤكد أكثر)
