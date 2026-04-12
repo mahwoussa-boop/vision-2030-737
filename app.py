@@ -1785,10 +1785,9 @@ if _at:
         st.error(_at_msg)
 
 
-# تأكيد احتياطي أخير قبل بدء توجيه الصفحات.
-# حتى لو تغيّر ترتيب التنفيذ مستقبلاً أو تعثر بناء عنصر التنقل،
-# تبقى قيمة `page` معرفة دائماً ولا ينهار التطبيق بسبب NameError.
-page = locals().get("page", st.session_state.get("main_nav", SECTIONS[0] if SECTIONS else "📊 لوحة التحكم"))
+# ── الاعتماد النهائي والمتين لقيمة الصفحة الحالية ──
+_fallback_page = SECTIONS[0] if SECTIONS else "📊 لوحة التحكم"
+page = st.session_state.get("main_nav", _fallback_page)
 
 # ════════════════════════════════════════════════
 #  0. مصنع المنتجات (Magic Factory) — مدمج من pages/magic_factory.py
